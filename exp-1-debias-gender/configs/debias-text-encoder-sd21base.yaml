@@ -1,0 +1,19 @@
+proj_name: gender-debias-text-encoder-sd21base
+# HF에서 stabilityai/stable-diffusion-2-1-base 가 내려갔으므로 ModelScope에서 받은 로컬 경로 사용.
+# 다운로드:  python3 -c "from modelscope.hub.snapshot_download import snapshot_download; \
+#            print(snapshot_download('AI-ModelScope/stable-diffusion-2-1-base', \
+#                  ignore_file_pattern=['*.ckpt','v2-1_512-*.safetensors']))"
+pretrained_model_name_or_path: /root/.cache/modelscope/hub/models/AI-ModelScope/stable-diffusion-2-1-base
+train_text_encoder: True
+train_unet: False
+weight_loss_img: 2
+weight_loss_face: 0
+factor1: 0.2
+factor2: 0.2
+uncertainty_threshold: 0.2
+train_images_per_prompt_GPU: 16
+train_GPU_batch_size: 4
+val_images_per_prompt_GPU: 30
+val_GPU_batch_size: 8
+learning_rate: 5e-5
+max_train_steps: 10000

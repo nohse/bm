@@ -1,0 +1,17 @@
+proj_name: gender_aaai_600_rep3
+train_text_encoder: true
+train_unet: false
+weight_loss_img: 2.0
+weight_loss_face: 0
+factor1: 0.2
+factor2: 0.2
+uncertainty_threshold: 0.2
+train_images_per_prompt_GPU: 8
+train_GPU_batch_size: 4
+val_images_per_prompt_GPU: 20
+val_GPU_batch_size: 8
+learning_rate: 5e-5
+max_train_steps: 600
+region_mask_mode: attn
+skip_final_steps_pct: 50.0
+weight_loss_face_realistic: 4.0

@@ -8,12 +8,14 @@
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
 #
+
+
+
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
 
-import os, sys
+import os
 import time
 from pathlib import Path
 from contextlib import contextmanager
@@ -29,9 +31,7 @@ import random
 from datetime import datetime
 from tqdm.auto import tqdm
 import copy
-import pickle as pkl
 import yaml
-from packaging import version
 from PIL import Image, ImageOps, ImageDraw, ImageFont
 
 import torch
@@ -43,22 +43,22 @@ from torchvision import transforms
 
 import numpy as np
 import scipy
-from skimage import transform
-import kornia
 import open_clip
-from sentence_transformers import SentenceTransformer, util
 
 import transformers
 from transformers import CLIPTextModel, CLIPTokenizer, CLIPImageProcessor, CLIPVisionModelWithProjection
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import ProjectConfiguration, set_seed, GradScalerKwargs
-
+from transformers import CLIPModel, CLIPProcessor
+import torch.nn.functional as F
+import torchvision.transforms as T  # PIL 변환용 (없으면 추가)
 import diffusers
 from diffusers import (
     AutoencoderKL,
     DPMSolverMultistepScheduler,
     UNet2DConditionModel,
+    DDPMScheduler,   # <-- [ADDED] for forward noising in SDS classifier
 )
 from diffusers.loaders import (
     LoraLoaderMixin,
@@ -68,56 +68,340 @@ from diffusers.models.attention_processor import (
 )
 from diffusers.optimization import get_scheduler
 from diffusers.utils import is_wandb_available
-from diffusers.utils.import_utils import is_xformers_available
 from diffusers.loaders import AttnProcsLayers
 from diffusers.training_utils import EMAModel
 
 # you MUST import torch before insightface
 # otherwise onnxruntime, used by FaceAnalysis, can only use CPU
 from insightface.app import FaceAnalysis
-
+from typing import List, Optional
 
 
 my_timezone = pytz.timezone("Asia/Singapore")
 
 os.environ["WANDB__SERVICE_WAIT"] = "300"  # set to DETAIL for runtime logging.
 
-class FaceFeatsModel(torch.nn.Module):
-    def __init__(self, face_feats_path):
-        super().__init__()
-        
-        with open(face_feats_path, "rb") as f:
-            face_feats, face_genders, face_logits = pkl.load(f)
-        
-        face_feats = torch.nn.functional.normalize(face_feats, dim=-1)
-        self.face_feats = nn.Parameter(face_feats)   
-        self.face_feats.requires_grad_(False)               
-        
-    def forward(self, x):
-        """no forward function
-        """
-        return None
-        
-    @torch.no_grad()
-    def semantic_search(self, query_embeddings, selector=None, return_similarity=False):
-        """search the closest face embedding from vector database.
-        """
-        target_embeddings = torch.ones_like(query_embeddings) * (-1)
-        if return_similarity:
-            similarities = torch.ones([query_embeddings.shape[0]], device=query_embeddings.device, dtype=query_embeddings.dtype) * (-1)
-            
-        if selector.sum()>0:
-            hits = util.semantic_search(query_embeddings[selector], self.face_feats, score_function=util.dot_score, top_k=1)
-            target_embeddings_ = torch.cat([self.face_feats[hit[0]["corpus_id"]].unsqueeze(dim=0) for hit in hits])
-            target_embeddings[selector] = target_embeddings_
-            if return_similarity:
-                similarities_ = torch.tensor([hit[0]["score"] for hit in hits], device=query_embeddings.device, dtype=query_embeddings.dtype)
-                similarities[selector] = similarities_
 
-        if return_similarity:
-            return target_embeddings.data.detach().clone(), similarities
-        else:
-            return target_embeddings.data.detach().clone()
+class CrossAttnCapture:
+    """
+    UNet의 cross-attention 모듈 내부 선형층 to_q, to_k에 forward_hook을 걸어
+    각 호출마다 Q, K를 가로채고 즉시 attn = softmax(QK^T / sqrt(d))를 계산.
+    지정된 텍스트 토큰 인덱스들에 대한 주의만 모아 저장합니다.
+    maps는 각 훅 호출마다 배치 크기(B_cond) 만큼의 (h,w) 맵을 담는 텐서들을 저장합니다.
+    """
+    def __init__(self, token_indices: List[int], use_cpu: bool = False, expect_cfg_pair: bool = True):
+        # use_cpu: if True (legacy), move tensors to CPU for attention math (safe but slow).
+        # if False, perform attention math on the same device as Q/K (typically GPU).
+        self.token_indices = token_indices
+        self.handles = [] 
+        self.maps = []   # list of tensors shape (B_cond, h, w)
+        self.use_cpu = use_cpu
+        self._q_cache = {}  # parent_id -> q (b, nq, h*d)
+        self._parent_map = {}  # submodule_id -> parent module (avoid setting Module attrs)
+        self.use_cpu = use_cpu
+        self.expect_cfg_pair = expect_cfg_pair
+
+    def _q_hook(self, module, inputs, output):
+        # Detach and stash Q early to avoid interacting with autograd/checkpointing.
+        parent = self._parent_map.get(id(module))
+        if parent is None:
+            return
+        parent_id = id(parent)
+        # stash a detached clone under torch.no_grad() to avoid autograd/ckpt interference
+        try:
+            with torch.no_grad():
+                self._q_cache[parent_id] = output.detach().clone()
+        except Exception:
+            # fallback: keep raw output (best-effort)
+            self._q_cache[parent_id] = output.detach()
+
+    def _k_hook(self, module, inputs, output):
+        # Perform all attention computations under no_grad on the same device
+        # (GPU by default) to avoid expensive CPU<->GPU transfers. If `use_cpu` is True,
+        # fall back to CPU (legacy behavior).
+        parent = self._parent_map.get(id(module))
+        if parent is None:
+            return
+        parent_id = id(parent)
+
+        if parent_id not in self._q_cache:
+            return
+
+        q = self._q_cache.pop(parent_id)
+        k = output
+        # compute on same device unless use_cpu True
+        device = q.device if not self.use_cpu else torch.device("cpu")
+        with torch.no_grad():
+            try:
+                q = q.detach().float().to(device)
+            except Exception:
+                q = q.float().to(device)
+            try:
+                k = k.detach().float().to(device)
+            except Exception:
+                k = k.float().to(device)
+
+            # ---- infer head count / dimensions ----
+            heads = getattr(parent, "heads", None)
+            if heads is None:
+                heads = getattr(parent, "num_heads", None)
+
+            B, Nq, inner_q = q.shape
+            _, Nk, inner_k = k.shape
+            try:
+                assert inner_q == inner_k
+            except Exception:
+                return
+
+            if heads is None:
+                for h in (8, 12, 16, 4, 6, 24, 32):
+                    if inner_q % h == 0:
+                        heads = h
+                        break
+                if heads is None:
+                    heads = 8
+
+            head_dim = inner_q // heads
+
+            q = q.view(B, Nq, heads, head_dim).permute(0, 2, 1, 3).contiguous()
+            k = k.view(B, Nk, heads, head_dim).permute(0, 2, 1, 3).contiguous()
+
+            attn_scores = torch.matmul(q, k.transpose(-1, -2)) / math.sqrt(head_dim)
+            attn_scores = attn_scores - attn_scores.amax(dim=-1, keepdim=True)
+            attn = attn_scores.softmax(dim=-1)
+
+            if not self.token_indices:
+                return
+
+            tok_idx = torch.tensor(self.token_indices, device=device, dtype=torch.long)
+
+            # attn: (B, H, Nq, Nk) -> select token indices along Nk -> (B, H, Nq, T)
+            attn_tok = attn.index_select(-1, tok_idx).mean(dim=-1)  # (B, H, Nq)
+
+            if self.expect_cfg_pair and B >= 2:
+                b_half = B // 2
+                cond = attn_tok[B - b_half : B]  # (b_half, H, Nq)
+            else:
+                cond = attn_tok  # (B, H, Nq)
+
+            # per-image head-averaged maps: (B_sel, Nq)
+            per_image = cond.mean(dim=1)  # (B_sel, Nq)
+
+            hw = int(math.sqrt(per_image.shape[1]))
+            if hw * hw != per_image.shape[1]:
+                return
+
+            b_sel = per_image.shape[0]
+            per_image = per_image.view(b_sel, hw, hw)
+            # optionally move to cpu for storage to reduce peak GPU memory
+            if self.use_cpu:
+                per_image = per_image.cpu()
+
+            # store a single tensor per hook-call: (B_sel, h, w)
+            self.maps.append(per_image)
+
+    def add_hooks(self, unet: torch.nn.Module):
+        installed = 0
+        for name, module in unet.named_modules(): 
+            has_qk = hasattr(module, "to_q") and hasattr(module, "to_k") 
+            if not has_qk: 
+                continue
+
+            is_cross = getattr(module, "is_cross_attention", None) 
+            if is_cross is None: 
+                is_cross = ("attn2" in name) or ("Cross" in module.__class__.__name__) 
+            if not is_cross: 
+                continue
+
+            # Avoid assigning Module instances as attributes on submodules (would register cyclic
+            # children). Keep mapping in this object instead.
+            try:
+                self._parent_map[id(module.to_q)] = module
+            except Exception:
+                pass
+            try:
+                self._parent_map[id(module.to_k)] = module
+            except Exception:
+                pass
+            self.handles.append(module.to_q.register_forward_hook(self._q_hook))
+            self.handles.append(module.to_k.register_forward_hook(self._k_hook))
+            installed += 1
+
+        return self
+
+    def clear(self):
+        for h in self.handles:
+            h.remove()
+        self.handles = []
+        self._q_cache = {}
+        self.maps = []
+
+    def aggregated_map(self) -> Optional[torch.Tensor]:
+        """
+        수집된 모든 맵을 배치 차원(B_images)별로 평균하여 반환.
+        반환: (B_images, H, W) torch.Tensor (정규화하지 않음)
+        """
+        if not self.maps:
+            return None
+        # find max hw across stored maps
+        max_hw = max(m.shape[-1] for m in self.maps)
+        upsampled = []
+        for m in self.maps:
+            # m: (B_images, h, w)
+            Bm, hm, wm = m.shape
+            ten = m.unsqueeze(1).float()   # (Bm,1,h,w)
+            if hm != max_hw or wm != max_hw:
+                ten = F.interpolate(ten, size=(max_hw, max_hw), mode="bilinear", align_corners=False)
+            upsampled.append(ten.squeeze(1))  # (Bm, max_hw, max_hw)
+
+        # stack across hooks: (num_calls, B_images, H, W)
+        S = torch.stack(upsampled, dim=0)
+        # mean over calls -> (B_images, H, W)
+        M = S.mean(dim=0)
+        return M  # [B_images, H, W]
+
+
+def sanitize_filename(s: str) -> str:
+    """Make a filesystem-safe short filename from prompt text."""
+    return "".join(c if c.isalnum() else "_" for c in s)[:200]
+
+
+def _normalize_attmap_for_vis(att: torch.Tensor) -> torch.Tensor:
+    """Normalize a single attention map for visualization only.
+
+    The underlying attention tensor is left untouched; this just stretches contrast
+    so low-magnitude maps remain visible in saved PNGs and overlays.
+    """
+    if not isinstance(att, torch.Tensor):
+        att = torch.tensor(att)
+
+    a = att.detach().float().cpu()
+    a = torch.nan_to_num(a, nan=0.0, posinf=0.0, neginf=0.0).clamp_min(0.0)
+
+    nonzero = a[a > 0]
+    if nonzero.numel() == 0:
+        return torch.zeros_like(a)
+
+    lo = torch.quantile(nonzero, 0.05)
+    hi = torch.quantile(nonzero, 0.995)
+    if not torch.isfinite(lo):
+        lo = nonzero.min()
+    if not torch.isfinite(hi):
+        hi = nonzero.max()
+
+    if hi <= lo:
+        scaled = (a > 0).float()
+    else:
+        scaled = ((a - lo) / (hi - lo)).clamp(0.0, 1.0)
+
+    # Lift low responses so sparse maps do not look fully black.
+    return scaled.pow(0.5)
+
+
+def _attmap_vis_to_pil(vis: torch.Tensor) -> Image.Image:
+    a = vis.clamp(0.0, 1.0).mul(255).to(torch.uint8).cpu().numpy()
+    img = Image.fromarray(a, mode="L")
+    return ImageOps.colorize(img, black="black", mid="orange", white="red")
+
+
+def attmap_to_pil(att: torch.Tensor) -> Image.Image:
+    """Convert a single HxW attention map to a colored PIL image for display."""
+    vis = _normalize_attmap_for_vis(att)
+    return _attmap_vis_to_pil(vis)
+
+
+def save_attmaps(att: Optional[torch.Tensor], save_dir: str, prefix: str):
+    """Save attention maps to `save_dir` with filenames `{prefix}_{i}.png`.
+
+    Args:
+        att: Tensor of shape (B, H, W) or (H, W) with values in [0,1].
+        save_dir: directory to save images into.
+        prefix: filename prefix (should be sanitized by caller).
+    """
+    if att is None:
+        return
+    if not os.path.exists(save_dir):
+        os.makedirs(save_dir, exist_ok=True)
+
+    if isinstance(att, torch.Tensor):
+        ten = att.detach().cpu()
+    else:
+        ten = torch.tensor(att)
+
+    if ten.ndim == 2:
+        ten = ten.unsqueeze(0)
+
+    for i in range(ten.shape[0]):
+        pil = attmap_to_pil(ten[i])
+        fname = f"{prefix}_{i}.png"
+        pil.save(os.path.join(save_dir, fname), format="PNG", optimize=True)
+
+
+def attmap_overlay_on_image(att_map: torch.Tensor, image: torch.Tensor, alpha: float = 0.45) -> Image.Image:
+    """Overlay a single attention map onto a single image tensor and return a PIL image.
+
+    - `att_map`: HxW float tensor in [0,1]
+    - `image`: 3xH_imgxW_img tensor in [-1,1]
+    - `alpha`: overlay alpha for attention heatmap
+    """
+    # convert image tensor -> PIL
+    try:
+        img_pil = transforms.ToPILImage()(image.mul(0.5).add(0.5))
+    except Exception:
+        # fallback normalization
+        img_pil = transforms.ToPILImage()((image + 1.0) * 0.5)
+
+    vis = _normalize_attmap_for_vis(att_map)
+    att_pil = _attmap_vis_to_pil(vis)
+
+    if att_pil.size != img_pil.size:
+        att_pil = att_pil.resize(img_pil.size, resample=Image.BILINEAR)
+        vis = (
+            F.interpolate(
+                vis.unsqueeze(0).unsqueeze(0),
+                size=(img_pil.size[1], img_pil.size[0]),
+                mode="bilinear",
+                align_corners=False,
+            )
+            .squeeze(0)
+            .squeeze(0)
+        )
+
+    base = img_pil.convert("RGBA")
+    heat = att_pil.convert("RGBA")
+    alpha_mask = Image.fromarray(
+        vis.mul(255 * alpha).clamp(0, 255).to(torch.uint8).cpu().numpy(),
+        mode="L",
+    )
+    heat.putalpha(alpha_mask)
+    return Image.alpha_composite(base, heat).convert("RGB")
+
+
+def save_attmaps_with_overlay(att: Optional[torch.Tensor], images: torch.Tensor, save_dir: str, prefix: str, alpha: float = 0.45):
+    """Save attmaps and overlayed images side-by-side.
+
+    - `att`: (B, H, W) or (H, W)
+    - `images`: (B, 3, H_img, W_img) in [-1,1]
+    """
+    if att is None:
+        return
+    if not os.path.exists(save_dir):
+        os.makedirs(save_dir, exist_ok=True)
+
+    ten = att.detach().cpu() if isinstance(att, torch.Tensor) else torch.tensor(att)
+    imgs = images.detach().cpu()
+
+    if ten.ndim == 2:
+        ten = ten.unsqueeze(0)
+
+    n = min(ten.shape[0], imgs.shape[0])
+    for i in range(n):
+        try:
+            blended = attmap_overlay_on_image(ten[i], imgs[i], alpha=alpha)
+            fname = f"{prefix}_{i}_overlay.png"
+            blended.save(os.path.join(save_dir, fname), format="PNG", optimize=True)
+        except Exception as e:
+            print(f"[attmap overlay save error] idx={i} -> {e}")
 
 
 def clean_checkpoint(ckpts_save_dir, name, checkpoints_total_limit):
@@ -136,7 +420,7 @@ def clean_checkpoint(ckpts_save_dir, name, checkpoints_total_limit):
         logger.info(f"removing checkpoints: {', '.join(removing_checkpoints)}")
 
         for removing_checkpoint in removing_checkpoints:
-            removing_checkpoint = os.path.join(args.ckpts_save_dir, removing_checkpoint)
+            removing_checkpoint = os.path.join(ckpts_save_dir, removing_checkpoint)
             shutil.rmtree(removing_checkpoint)
 
 
@@ -155,29 +439,30 @@ def plot_in_grid(images, save_to, face_indicators=None, face_bboxs=None, preds_g
     """
     images: torch tensor in shape of [N,3,H,W], in range [-1,1]
     """
-    images_w_face = images[face_indicators]
-    images_wo_face = images[face_indicators.logical_not()]
-
     # first reorder everything from most to least male, from most to least female, and finally images without faces
-    idxs_male = (preds_gender == 1).nonzero(as_tuple=False).view([-1])
-    probs_male = pred_class_probs_gender[idxs_male]
-    idxs_male = idxs_male[probs_male.argsort(descending=True)]
+    if preds_gender is not None and pred_class_probs_gender is not None:
+        idxs_male = (preds_gender == 1).nonzero(as_tuple=False).view([-1])
+        probs_male = pred_class_probs_gender[idxs_male]
+        idxs_male = idxs_male[probs_male.argsort(descending=True)]
 
-    idxs_female = (preds_gender == 0).nonzero(as_tuple=False).view([-1])
-    probs_female = pred_class_probs_gender[idxs_female]
-    idxs_female = idxs_female[probs_female.argsort(descending=True)]
+        idxs_female = (preds_gender == 0).nonzero(as_tuple=False).view([-1])
+        probs_female = pred_class_probs_gender[idxs_female]
+        idxs_female = idxs_female[probs_female.argsort(descending=True)]
 
-    idxs_no_face = (preds_gender == -1).nonzero(as_tuple=False).view([-1])
+        idxs_no_face = (preds_gender == -1).nonzero(as_tuple=False).view([-1])
 
-    images_to_plot = []
-    idxs_reordered = torch.torch.cat([idxs_male, idxs_female, idxs_no_face])
-    
+        images_to_plot = []
+        idxs_reordered = torch.cat([idxs_male, idxs_female, idxs_no_face])
+    else:
+        idxs_reordered = torch.arange(images.shape[0], device=images.device)
+        images_to_plot = []
+
     for idx in idxs_reordered:
         img = images[idx]
-        face_indicator = face_indicators[idx]
-        face_bbox = face_bboxs[idx]
-        pred_gender = preds_gender[idx]
-        pred_class_prob_gender = pred_class_probs_gender[idx]
+        face_indicator = face_indicators[idx] if face_indicators is not None else torch.tensor(False, device=images.device)
+        face_bbox = face_bboxs[idx] if face_bboxs is not None else torch.tensor([0,0,0,0], device=images.device)
+        pred_gender = preds_gender[idx] if preds_gender is not None else torch.tensor(-1, device=images.device)
+        pred_class_prob_gender = pred_class_probs_gender[idx] if pred_class_probs_gender is not None else torch.tensor(0.0, device=images.device)
         
         if pred_gender == 1:
             pred = "Male"
@@ -191,15 +476,19 @@ def plot_in_grid(images, save_to, face_indicators=None, face_bboxs=None, preds_g
         
         img_pil = transforms.ToPILImage()(img*0.5+0.5)
         img_pil_draw = ImageDraw.Draw(img_pil)  
-        img_pil_draw.rectangle(face_bbox.tolist(), fill =None, outline =border_color, width=4)
+        if face_bboxs is not None:
+            img_pil_draw.rectangle(face_bbox.tolist(), fill =None, outline =border_color, width=4)
 
         img_pil = ImageOps.expand(img_pil, border=(50,0,0,0),fill=border_color)
 
         img_pil_draw = ImageDraw.Draw(img_pil)
-        if pred_class_prob_gender.item() < 1:
+        if pred_class_probs_gender is not None and pred_class_prob_gender.item() < 1:
             img_pil_draw.rectangle([(0,0),(50,(1-pred_class_prob_gender.item())*512)], fill ="white", outline =None)
 
-        fnt = ImageFont.truetype(font="../data/0-utils/arial-bold.ttf", size=100)
+        try:
+            fnt = ImageFont.truetype(font="../data/0-utils/arial-bold.ttf", size=100)
+        except:
+            fnt = ImageFont.load_default()
         img_pil_draw.text((400, 400), f"{idx.item()}", align ="left", font=fnt)
 
         img_pil = ImageOps.expand(img_pil_draw._image, border=(10,10,10,10),fill="black")
@@ -207,6 +496,8 @@ def plot_in_grid(images, save_to, face_indicators=None, face_bboxs=None, preds_g
         images_to_plot.append(img_pil)
         
     N_imgs = len(images_to_plot)
+    if N_imgs == 0:
+        return
     N1 = int(math.sqrt(N_imgs))
     N2 = math.ceil(N_imgs / N1)
 
@@ -383,28 +674,6 @@ def crop_face(img_tensor, bbox_new, target_size, fill_value):
     img_face = torchvision.transforms.Resize(size=target_size)(img_face)
     return img_face
 
-def image_pipeline(img, tgz_landmark):
-    img = (img+1)/2.0 * 255 # map to [0,255]
-
-    crop_size = (112,112)
-    src_landmark = np.array(
-    [[38.2946, 51.6963], # left eye
-    [73.5318, 51.5014], # right eye
-    [56.0252, 71.7366], # nose
-    [41.5493, 92.3655], # left corner of the mouth
-    [70.7299, 92.2041]] # right corner of the mouth
-    )
-
-    tform = transform.SimilarityTransform()
-    tform.estimate(tgz_landmark, src_landmark)
-
-    M = torch.tensor(tform.params[0:2, :]).unsqueeze(dim=0).to(img.dtype).to(img.device)
-    img_face = kornia.geometry.transform.warp_affine(img.unsqueeze(dim=0), M, crop_size, mode='bilinear', padding_mode='zeros', align_corners=False)
-    img_face = img_face.squeeze()
-
-    img_face = (img_face/255.0)*2-1 # map back to [-1,1]
-    return img_face
-
 
 class PromptsDataset(Dataset):
     def __init__(
@@ -488,7 +757,7 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--resume_from_checkpoint",
         type=str,
-        default=None,
+        default="./outputs/gender-debias-text-encoder/BS-32_wImg-2-0.2-0.2_wFace-0_Th-0.2_loraR-50_lr-5e-05_03082151/ckpts/checkpoint_tmp-580",
         help="provide the checkpoint path to resume from checkpoint",
     )
     parser.add_argument(
@@ -528,6 +797,17 @@ def parse_args(input_args=None):
         default=1
         )
     parser.add_argument(
+        "--train_only_no_eval_models",
+        action="store_true",
+        help="skip loading eval-only CLIP/MobileNet/face/DINO models and disable evaluation for train-only profiling",
+    )
+    parser.add_argument(
+        "--load_eval_models",
+        dest="train_only_no_eval_models",
+        action="store_false",
+        help="load eval-only models and allow evaluation",
+    )
+    parser.add_argument(
         "--report_to",
         type=str,
         default="wandb",
@@ -559,14 +839,22 @@ def parse_args(input_args=None):
     parser.add_argument(
         '--weight_loss_img', 
         default=8,
-        help="weight for the image semantics preserving loss", 
+        help="weight for the CLIP image-preservation loss",
         type=float, 
     )
     parser.add_argument(
-        '--weight_loss_face', 
+        '--weight_loss_align',
         default=1,
-        help="weight for the face realism preserving loss", 
+        help="weight for the dynamic target alignment loss",
         type=float, 
+    )
+    parser.add_argument(
+        '--weight_loss_realistic',
+        '--weight_loss_face_realistic',
+        dest="weight_loss_realistic",
+        default=1.0,
+        help="weight for the realistic-face SDS loss (prompt: 'a photo of a realistic face')",
+        type=float,
     )
     parser.add_argument(
         '--uncertainty_threshold', 
@@ -574,8 +862,15 @@ def parse_args(input_args=None):
         type=float, 
         default=0.2
         )
-    parser.add_argument('--factor1', help="train, val, test batch size", type=float, default=0.2)
-    parser.add_argument('--factor2', help="train, val, test batch size", type=float, default=0.2)
+    parser.add_argument(
+        "--ratio",
+        "--target_male_ratio",
+        dest="target_male_ratio",
+        type=float,
+        default=0.50,
+        help="target male ratio for 2-class assignment (0.0 ~ 1.0).",
+    )
+    parser.add_argument('--factor1', help="downweight factor for image loss on invalid/misaligned targets", type=float, default=0.2)
 
     # batch size, properly set to max out GPU
     parser.add_argument(
@@ -600,7 +895,7 @@ def parse_args(input_args=None):
             "These images are used to measure bias."
         ),
         type=int, 
-        default=8
+        default=60
         )
     parser.add_argument(
         '--val_GPU_batch_size', 
@@ -630,34 +925,12 @@ def parse_args(input_args=None):
         help="prompt template, and occupations for train and val",
     )
     parser.add_argument(
-        '--classifier_weight_path',
-        default="../data/2-trained-classifiers/CelebA_MobileNetLarge_08060852/epoch=9-step=12660_MobileNetLarge.pt",
-        help="pre-trained classifer that predicts binary gender (used for TRAINING fair loss target/signal)",
+        '--classifier_weight_path', 
+        default="/root/data/5-trained-test-classifiers/CelebA-MobileNetLarge-Gender-09191318/epoch=19-step=25320_MobileNetLarge.pt",
+        help="pre-trained classifer that predicts binary gender", 
         type=str,
-        required=False,
+        required=False, 
     )
-    parser.add_argument(
-        '--test_classifier_weight_path',
-        default="../data/5-trained-test-classifiers/CelebA-MobileNetLarge-Gender-09191318/epoch=19-step=25320_MobileNetLarge.pt",
-        help="held-out test classifier used ONLY for eval metrics (e.g. gender_gap_abs_mnet); training uses --classifier_weight_path",
-        type=str,
-        required=False,
-    )
-    parser.add_argument(
-        '--face_feats_path', 
-        help="external face feats, used for the face realism preserving loss", 
-        type=str, 
-        default="../data/3-face-features/CelebA_MobileNetLarge_08240859/face_feats.pkl"
-        )
-    # parser.add_argument(
-    #     '--aligned_face_gender_model_path', 
-    #     help="train, val, test batch size", 
-    #     type=str, 
-    #     default="../data/3-face-features/CelebA_MobileNetLarge_08240859/epoch=9-step=6330_MobileNetLarge.pt"
-    #     )
-    parser.add_argument('--opensphere_config', help="train, val, test batch size", type=str, default="../data/4-opensphere_checkpoints/opensphere_checkpoints/20220424_210641/config.yml")
-    parser.add_argument('--opensphere_model_path', help="train, val, test batch size", type=str, default="../data/4-opensphere_checkpoints/opensphere_checkpoints/20220424_210641/models/backbone_100000.pth")
-
     # learning related settings
     parser.add_argument(
         "--learning_rate",
@@ -712,59 +985,6 @@ def parse_args(input_args=None):
         default=224,
         help="faces will be resized to this size",
     )
-    parser.add_argument(
-        "--size_aligned_face",
-        type=int,
-        default=112,
-        help="aligned faces will be resized to this size",
-    )
-    parser.add_argument('--face_gender_confidence_level', help="train, val, test batch size", type=float, default=0.9)
-    parser.add_argument(
-        "--face_detector_require_cuda",
-        dest="face_detector_require_cuda",
-        action="store_true",
-        help="Require InsightFace detector to use CUDAExecutionProvider. If CUDA provider is unavailable, raise an error.",
-    )
-    parser.add_argument(
-        "--no_face_detector_require_cuda",
-        dest="face_detector_require_cuda",
-        action="store_false",
-        help="Allow InsightFace detector to run on CPUExecutionProvider.",
-    )
-    parser.set_defaults(face_detector_require_cuda=True)
-    parser.add_argument(
-        "--use_face_recognition_fallback",
-        action="store_true",
-        default=False,
-        help="Retry InsightFace misses with face_recognition. Disabled by default to avoid slow CPU fallback.",
-    )
-    parser.add_argument(
-        "--use_gpu_facedetect_fallback",
-        dest="use_gpu_facedetect_fallback",
-        action="store_true",
-        help=(
-            "On an InsightFace (det_size 640) miss, retry detection on the GPU at smaller "
-            "det_size(s). buffalo_l/SCRFD is anchored ~640px, so a single large face in a "
-            "512px portrait is often missed at 640 but caught at 320/448. Fully GPU, recovers "
-            "most misses without the slow CPU dlib path. Only retries already-missed images, "
-            "so detections from the 640 pass are unchanged."
-        ),
-    )
-    parser.add_argument(
-        "--no_gpu_facedetect_fallback",
-        dest="use_gpu_facedetect_fallback",
-        action="store_false",
-        help="Disable the GPU smaller-det_size retry fallback.",
-    )
-    parser.set_defaults(use_gpu_facedetect_fallback=True)
-    parser.add_argument(
-        "--gpu_facedetect_fallback_det_sizes",
-        type=int,
-        nargs="+",
-        default=[320, 448],
-        help="det_size(s), tried in order, used to retry InsightFace misses for the GPU fallback.",
-    )
-
     # passed directly by accelerate
     parser.add_argument(
         "--local_rank",
@@ -776,6 +996,75 @@ def parse_args(input_args=None):
     # config file
     parser.add_argument("--config", help="config file", type=str, default=None)
 
+    # =====================
+    # [ADDED] SDS classifier & attn gating args
+    # =====================
+    parser.add_argument("--sds_t_min", type=int, default=400, help="min t index for SDS")
+    parser.add_argument("--sds_t_max", type=int, default=800, help="max t index for SDS")
+    parser.add_argument("--sds_num_t", type=int, default=15, help="number of t samples (linspace)")
+    parser.add_argument("--sds_num_eps", type=int, default=1, help="number of epsilon samples per t")
+    parser.add_argument("--sds_tau", type=float, default=0.0001, help="temperature for -softmax on SDS losses")
+    parser.add_argument("--use_attn_weight", type=bool, default=True,
+                        help="SDS에서 어텐션 가중치 사용할지 여부")
+    parser.add_argument(
+        "--zeroshot_model", type=str, default="openai/clip-vit-large-patch14",
+        help="zero-shot gender classifier로 사용할 CLIP 모델 이름"
+    )
+    parser.add_argument(
+        "--skip_final_steps", type=int, default=0,
+        help="Absolute number of final denoising steps to skip when using gradient-guided generation."
+    )
+    parser.add_argument(
+        "--skip_final_steps_pct", type=float, default=0.0,
+        help="If >0, compute final step skipping as this percentage of the sampled num_denoising_steps (overrides --skip_final_steps)."
+    )
+    parser.add_argument(
+        "--dynamic_target_skip_final_steps",
+        type=int,
+        default=0,
+        help="absolute final denoising steps to skip only for dynamic target class assignment",
+    )
+    parser.add_argument(
+        "--dynamic_target_skip_final_steps_pct",
+        type=float,
+        default=0.0,
+        help="percentage of final denoising steps to skip only for dynamic target class assignment",
+    )
+    parser.add_argument(
+        "--eval_at_step0",
+        dest="eval_at_step0",
+        action="store_true",
+        help="학습 시작 전(global_step==0) 평가를 수행합니다.",
+    )
+    parser.add_argument(
+        "--no_eval_at_step0",
+        dest="eval_at_step0",
+        action="store_false",
+        help="학습 시작 전(global_step==0) 평가를 건너뜁니다.",
+    )
+
+    # =====================
+    # [ADDED] Region masking switch (face / attn / none)
+    # =====================
+    parser.add_argument("--region_mask_mode", type=str, default="attn",
+                        choices=["none", "face", "attn"],
+                        help="SDS 및 backprop에서 사용할 영역 마스킹 방식 선택. 'attn'은 SDS 분류 프롬프트(woman/man) 토큰 기반 어텐션 맵, 'face'는 자동으로 attn으로 대체, 'none'은 전체.")
+    parser.add_argument(
+        "--save_attmaps",
+        dest="save_attmaps",
+        action="store_true",
+        help="평가 시 attmap/overlay 이미지를 저장합니다.",
+    )
+    parser.add_argument(
+        "--no_save_attmaps",
+        dest="save_attmaps",
+        action="store_false",
+        help="평가 시 attmap/overlay 저장을 끕니다.",
+    )
+    parser.set_defaults(save_attmaps=True)
+    parser.set_defaults(eval_at_step0=False)
+    parser.set_defaults(train_only_no_eval_models=False)
+
     if input_args is not None:
         args = parser.parse_args(input_args)
     else:
@@ -784,10 +1073,23 @@ def parse_args(input_args=None):
     if args.config:
         with open(args.config, "r") as yaml_file:
             config_data = yaml.safe_load(yaml_file)
+        if "ratio" in config_data and "target_male_ratio" not in config_data:
+            config_data["target_male_ratio"] = config_data["ratio"]
+        if "weight_loss_face_realistic" in config_data and "weight_loss_realistic" not in config_data:
+            config_data["weight_loss_realistic"] = config_data["weight_loss_face_realistic"]
+        if "ratio" in config_data:
+            config_data.pop("ratio")
+        if "weight_loss_face_realistic" in config_data:
+            config_data.pop("weight_loss_face_realistic")
         args_dict = vars(args)
         for key, value in config_data.items():
+            if key not in args_dict:
+                continue
             args_dict[key] = type(args_dict[key])(value)
         args = argparse.Namespace(**args_dict)
+
+    args.target_male_ratio = float(np.clip(args.target_male_ratio, 0.0, 1.0))
+    args.target_female_ratio = 1.0 - args.target_male_ratio
 
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
     if env_local_rank != -1 and env_local_rank != args.local_rank:
@@ -797,8 +1099,10 @@ def parse_args(input_args=None):
 
 logger = get_logger(__name__)
 
+
 def _bytes_to_mb(num_bytes):
     return float(num_bytes) / (1024 ** 2)
+
 
 def _cpu_rss_mb():
     try:
@@ -809,36 +1113,12 @@ def _cpu_rss_mb():
     except Exception:
         return None
 
+
 def _tensor_bytes(tensor):
     if tensor is None:
         return 0
     return tensor.numel() * tensor.element_size()
 
-def _resolve_cuda_device_id(accelerator):
-    if accelerator.device.type != "cuda":
-        return None
-    if accelerator.device.index is not None:
-        return int(accelerator.device.index)
-    return int(max(accelerator.local_process_index, 0))
-
-def _get_face_app_provider_map(face_app):
-    provider_map = {}
-    models = getattr(face_app, "models", {})
-    if isinstance(models, dict):
-        model_items = models.items()
-    else:
-        model_items = enumerate(models)
-
-    for model_name, model_obj in model_items:
-        session = getattr(model_obj, "session", None)
-        providers = None
-        if session is not None and hasattr(session, "get_providers"):
-            try:
-                providers = session.get_providers()
-            except Exception:
-                providers = None
-        provider_map[str(model_name)] = providers
-    return provider_map
 
 class RuntimeProfiler:
     def __init__(self, accelerator, args):
@@ -1080,10 +1360,14 @@ class RuntimeProfiler:
                 wandb_logs[f"profile/{key_name}/state_mb"] = event["state_mb"]
         wandb_tracker.log(wandb_logs, step=global_step)
 
+
 def main(args):
 
     if not args.train_text_encoder and not args.train_unet:
         raise ValueError("At least one of --train_text_encoder and --train_unet must be True.")
+    if args.region_mask_mode == "face":
+        logger.warning("region_mask_mode=face requested, but this run keeps face detector for evaluation only. Overriding to region_mask_mode=attn.")
+        args.region_mask_mode = "attn"
 
     logging_dir = Path(args.output_dir, args.logging_dir)
 
@@ -1108,6 +1392,11 @@ def main(args):
         if not is_wandb_available():
             raise ImportError("Make sure to install wandb if you want to use it for logging during training.")
         import wandb
+        if version.parse(wandb.__version__) < version.parse("0.22.3"):
+            raise RuntimeError(
+                f"wandb>=0.22.3 is required for long API keys, but found wandb=={wandb.__version__}. "
+                "Please upgrade wandb (e.g., pip install --upgrade wandb==0.22.3)."
+            )
     else:
         raise ValueError("--report_to must be set to 'wanb', others are not implemented.")
     
@@ -1136,12 +1425,27 @@ def main(args):
     # The trackers initializes automatically on the main process.
     now = datetime.now(my_timezone)
     timestring = f"{now.month:02}{now.day:02}{now.hour:02}{now.minute:02}"
-    folder_name = f"BS-{args.train_images_per_prompt_GPU*accelerator.num_processes}_wImg-{args.weight_loss_img}-{args.factor1}-{args.factor2}_wFace-{args.weight_loss_face}_Th-{args.uncertainty_threshold}_loraR-{args.rank}_lr-{args.learning_rate}_{timestring}"
+    folder_name = (
+        f"BS-{args.train_images_per_prompt_GPU * accelerator.num_processes}"
+        f"_wImg-{args.weight_loss_img}"
+        f"_wAlign-{args.weight_loss_align}"
+        f"_wReal-{args.weight_loss_realistic}"
+        f"_dynSkip-{args.dynamic_target_skip_final_steps_pct:g}pct"
+        f"_imgFactor-{args.factor1}"
+        f"_Th-{args.uncertainty_threshold}"
+        f"_loraR-{args.rank}_lr-{args.learning_rate}_{timestring}"
+    )
     
     args.imgs_save_dir = os.path.join(args.output_dir, args.proj_name, folder_name, "imgs")
     args.ckpts_save_dir = os.path.join(args.output_dir, args.proj_name, folder_name, "ckpts")
     args.profile_log_path = os.path.join(args.output_dir, args.proj_name, folder_name, "profile_events.jsonl")
     profiler = RuntimeProfiler(accelerator, args)
+    if args.train_only_no_eval_models:
+        args.evaluate_every_n_iter = 0
+        args.eval_at_step0 = False
+    load_eval_models = args.evaluate_every_n_iter > 0 or args.eval_at_step0
+    if not load_eval_models:
+        accelerator.print("[train-only] Skipping eval-only model loading: zero-shot CLIP, MobileNet, face detector, eval CLIP, DINOv2.")
 
     if accelerator.is_main_process:
         os.makedirs(args.imgs_save_dir, exist_ok=True)
@@ -1183,7 +1487,9 @@ def main(args):
             args.pretrained_model_name_or_path,
             subfolder="scheduler",
             )
-    
+    # [ADDED] dedicated DDPM for forward noising used in SDS
+    with profiler.capture("load_ddpm_forward_scheduler", category="module_load", immediate_print=True):
+        ddpm_forward = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
 
     # We only train the additional adapter LoRA layers
     text_encoder.requires_grad_(False)
@@ -1223,13 +1529,72 @@ def main(args):
     if args.train_unet:        
         with profiler.capture("load_eval_unet_to_device", category="module_load", immediate_print=True):
             eval_unet = UNet2DConditionModel.from_pretrained(
-            args.pretrained_model_name_or_path,
-            subfolder="unet",
-            )
+                args.pretrained_model_name_or_path,
+                subfolder="unet",
+                )
             eval_unet.requires_grad_(False)
             eval_unet.to(accelerator.device, dtype=weight_dtype)
         profiler.record_model_memory("eval_unet_after_device_move", eval_unet, immediate_print=True)
 
+    clip_model = None
+    clip_processor = None
+    gender_text_features = None
+    if load_eval_models:
+        with profiler.capture("load_clip_zero_shot_gender_model", category="module_load", immediate_print=True):
+            clip_model = CLIPModel.from_pretrained(args.zeroshot_model).to(accelerator.device)
+            clip_model.eval().requires_grad_(False)
+            clip_processor = CLIPProcessor.from_pretrained(args.zeroshot_model)
+        profiler.record_model_memory("clip_zero_shot_gender_model", clip_model, immediate_print=True)
+        # ---- zero-shot gender text embedding 미리 계산 (man / woman) ----
+        gender_prompts = ["a photo of a woman", "a photo of a man"]
+        with torch.no_grad():
+            text_inputs = clip_processor(
+                text=gender_prompts,
+                return_tensors="pt",
+                padding=True
+            )
+            text_inputs = {k: v.to(accelerator.device) for k, v in text_inputs.items()}
+            gender_text_features = clip_model.get_text_features(**text_inputs)
+            gender_text_features = F.normalize(gender_text_features, dim=-1)
+
+    # Dedicated eval metrics models:
+    # - CLIP-T / CLIP-I: CLIP ViT-bigG-14
+    # - DINO_I: DINOv2 vit-g/14
+    eval_clip_model_name = "ViT-bigG-14"
+    eval_clip_pretrained = "laion2b_s39b_b160k"
+    eval_dino_model_name = "dinov2_vitg14"
+    clip_eval_model = None
+    clip_eval_preprocess = None
+    clip_eval_tokenizer = None
+    dinov2_eval = None
+    dinov2_eval_img_mean = None
+    dinov2_eval_img_std = None
+    if load_eval_models and accelerator.is_main_process:
+        clip_eval_precision = "fp32"
+        if weight_dtype == torch.float16:
+            clip_eval_precision = "fp16"
+        elif weight_dtype == torch.bfloat16:
+            clip_eval_precision = "bf16"
+
+        with profiler.capture("load_eval_clip_bigG_model", category="module_load", immediate_print=True):
+            clip_eval_model, _, clip_eval_preprocess = open_clip.create_model_and_transforms(
+                eval_clip_model_name,
+                pretrained=eval_clip_pretrained,
+                precision=clip_eval_precision,
+                device=accelerator.device,
+            )
+            clip_eval_model.eval().requires_grad_(False)
+            clip_eval_tokenizer = open_clip.get_tokenizer(eval_clip_model_name)
+        profiler.record_model_memory("eval_clip_bigG_model", clip_eval_model, immediate_print=True)
+
+        with profiler.capture("load_eval_dinov2_model", category="module_load", immediate_print=True):
+            dinov2_eval = torch.hub.load('facebookresearch/dinov2', eval_dino_model_name)
+            dinov2_eval.to(accelerator.device, dtype=weight_dtype)
+            dinov2_eval.requires_grad_(False)
+            dinov2_eval.eval()
+            dinov2_eval_img_mean = torch.tensor([0.485, 0.456, 0.406]).reshape([-1,1,1]).to(accelerator.device, dtype=weight_dtype)
+            dinov2_eval_img_std = torch.tensor([0.229, 0.224, 0.225]).reshape([-1,1,1]).to(accelerator.device, dtype=weight_dtype)
+        profiler.record_model_memory("eval_dinov2_model", dinov2_eval, immediate_print=True)
     # if args.enable_xformers_memory_efficient_attention:
     #     if is_xformers_available():
     #         import xformers
@@ -1269,8 +1634,9 @@ def main(args):
         unet.set_attn_processor(unet_lora_procs)
         unet_lora_layers = AttnProcsLayers(unet.attn_processors)
         
-        for p in unet_lora_layers.parameters():
-            torch.distributed.broadcast(p, src=0)
+        if accelerator.num_processes > 1:
+            for p in unet_lora_layers.parameters():
+                torch.distributed.broadcast(p, src=0)
         
         unet_lora_ema = EMAModel(unet_lora_layers.parameters(), decay=args.EMA_decay)
         unet_lora_ema.to(accelerator.device)
@@ -1283,8 +1649,9 @@ def main(args):
         # ensure that dtype is float32, even if rest of the model that isn't trained is loaded in fp16
         text_encoder_lora_params = LoraLoaderMixin._modify_text_encoder(text_encoder, dtype=torch.float32, rank=args.rank, patch_mlp=True)
         
-        for p in text_encoder_lora_params:
-            torch.distributed.broadcast(p, src=0)
+        if accelerator.num_processes > 1:
+            for p in text_encoder_lora_params:
+                torch.distributed.broadcast(p, src=0)
                     
         text_encoder_lora_dict = {}
         text_encoder_lora_params_name_order = []
@@ -1303,7 +1670,8 @@ def main(args):
                 lora_param = text_encoder_lora_dict[name].detach().clone()
             else:
                 lora_param = torch.zeros_like(text_encoder_lora_dict[name])
-            torch.distributed.broadcast(lora_param, src=0)
+            if accelerator.num_processes > 1:
+                torch.distributed.broadcast(lora_param, src=0)
             text_encoder_lora_dict[name].data = lora_param
 
         class CustomModel(torch.nn.Module):
@@ -1376,116 +1744,41 @@ def main(args):
         train_dataloader_idxs.append(idxs)
 
     
-    prompts_val = [prompt.format(occupation=occupation) for prompt in experiment_data["prompt_templates_test"] for occupation in experiment_data["occupations_val_set"]]
+    prompts_val = [prompt.format(occupation=occupation) for prompt in experiment_data["prompt_templates_test"] for occupation in experiment_data["occupations_test_set"]]
     
     
     #######################################################
-    # set up things needed for finetuning        
-    with profiler.capture("load_mobilenet_gender_classifier", category="module_load", immediate_print=True):
-        gender_classifier = mobilenet_v3_large(weights=MobileNet_V3_Large_Weights.DEFAULT, width_mult=1.0, reduced_tail=False, dilated=False)
-        gender_classifier._modules['classifier'][3] = nn.Linear(1280, 80, bias=True)
-    
-        gender_classifier.load_state_dict(torch.load(args.classifier_weight_path))
-        gender_classifier.to(accelerator.device, dtype=weight_dtype)
-        gender_classifier.requires_grad_(False)
-        gender_classifier.eval()
-    profiler.record_model_memory("mobilenet_gender_classifier", gender_classifier, immediate_print=True)
+    # set up things needed for finetuning
+    gender_classifier = None
+    if load_eval_models:
+        with profiler.capture("load_mobilenet_gender_classifier", category="module_load", immediate_print=True):
+            gender_classifier = mobilenet_v3_large(weights=MobileNet_V3_Large_Weights.DEFAULT, width_mult=1.0, reduced_tail=False, dilated=False)
+            gender_classifier._modules['classifier'][3] = nn.Linear(1280, 2, bias=True)
 
-    # Held-out classifier used ONLY for eval metrics (gender_gap_abs_mnet). Training fair loss
-    # keeps using `gender_classifier` (args.classifier_weight_path); evaluation reports gender
-    # gap with this separate test classifier so the metric is not the same model that drives training.
-    with profiler.capture("load_mobilenet_gender_classifier_test", category="module_load", immediate_print=True):
-        test_gender_classifier = mobilenet_v3_large(weights=MobileNet_V3_Large_Weights.DEFAULT, width_mult=1.0, reduced_tail=False, dilated=False)
-        test_gender_classifier._modules['classifier'][3] = nn.Linear(1280, 80, bias=True)
+            # NOTE: MobileNet classifier is used only for evaluation-time metrics.
+            if os.path.exists(args.classifier_weight_path):
+                gender_classifier.load_state_dict(torch.load(args.classifier_weight_path))
+            gender_classifier.to(accelerator.device)
+            gender_classifier.requires_grad_(False)
+            gender_classifier.eval()
+        profiler.record_model_memory("mobilenet_gender_classifier", gender_classifier, immediate_print=True)
 
-        test_gender_classifier.load_state_dict(torch.load(args.test_classifier_weight_path))
-        test_gender_classifier.to(accelerator.device, dtype=weight_dtype)
-        test_gender_classifier.requires_grad_(False)
-        test_gender_classifier.eval()
-    profiler.record_model_memory("mobilenet_gender_classifier_test", test_gender_classifier, immediate_print=True)
-    
-    # set up face detector on all devices
-    with profiler.capture("load_face_detection_models", category="module_load", immediate_print=True):
-        import onnxruntime as ort
-
-        face_recognition = None
-        ort_available_providers = ort.get_available_providers()
-        face_detector_device_id = _resolve_cuda_device_id(accelerator)
-        can_use_face_detector_cuda = (
-            accelerator.device.type == "cuda"
-            and "CUDAExecutionProvider" in ort_available_providers
-        )
-        if args.face_detector_require_cuda and not can_use_face_detector_cuda:
-            raise RuntimeError(
-                "InsightFace face detector requires CUDA, but CUDAExecutionProvider is unavailable in onnxruntime. "
-                f"Current providers: {ort_available_providers}. "
-                "This usually means CPU-only `onnxruntime` is installed. "
-                "Install a CUDA-compatible `onnxruntime-gpu` build, or run with `--no_face_detector_require_cuda` "
-                "to allow CPU execution."
-            )
-
-        if can_use_face_detector_cuda:
-            face_app_providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
-            face_app_provider_options = [{"device_id": str(face_detector_device_id)}, {}]
-            face_app_ctx_id = face_detector_device_id
-        else:
-            face_app_providers = ["CPUExecutionProvider"]
-            face_app_provider_options = [{}]
-            face_app_ctx_id = -1
-
-        # Pre-download the insightface "buffalo_l" weights on the main process only,
-        # then barrier. With multiple ranks an empty cache otherwise triggers a
-        # concurrent download+extract into the same directory, so one rank reads a
-        # half-written .onnx and dies with INVALID_PROTOBUF (Protobuf parsing failed).
-        # Fetching once up front guarantees every rank loads a complete, valid cache.
-        if accelerator.is_main_process:
-            from insightface.utils import ensure_available
-            ensure_available('models', 'buffalo_l')
-        accelerator.wait_for_everyone()
-
-        face_app = FaceAnalysis(
-            name="buffalo_l",
-            allowed_modules=['detection'],
-            providers=face_app_providers,
-            provider_options=face_app_provider_options,
-            )
-        face_app.prepare(ctx_id=face_app_ctx_id, det_size=(640, 640))
-
-        face_app_provider_map = _get_face_app_provider_map(face_app)
-        if args.face_detector_require_cuda:
-            applied_detection_providers = face_app_provider_map.get("detection") or []
-            if "CUDAExecutionProvider" not in applied_detection_providers:
-                raise RuntimeError(
-                    "InsightFace detection session was initialized without CUDAExecutionProvider. "
-                    f"Applied detection providers: {applied_detection_providers}. "
-                    "Please verify onnxruntime-gpu / CUDA / cuDNN compatibility."
-                )
-
-        if accelerator.is_main_process:
-            accelerator.print(f"[face-detect] onnxruntime providers available: {ort_available_providers}")
-            accelerator.print(
-                f"[face-detect] requested providers: {face_app_providers}, ctx_id={face_app_ctx_id}, device_id={face_detector_device_id}"
-            )
-            accelerator.print(f"[face-detect] applied providers by model: {face_app_provider_map}")
-
-        if args.use_face_recognition_fallback:
+    # set up face_recognition and face_app on all devices (evaluation only)
+    face_recognition = None
+    face_app = None
+    if load_eval_models:
+        with profiler.capture("load_face_detection_models", category="module_load", immediate_print=True):
             import face_recognition
-            try:
-                import dlib
-                dlib_cuda_enabled = bool(getattr(dlib, "DLIB_USE_CUDA", False))
-            except Exception:
-                dlib_cuda_enabled = False
-            if not dlib_cuda_enabled:
-                args.use_face_recognition_fallback = False
-                if accelerator.is_main_process:
-                    accelerator.print(
-                        "[face-detect] face_recognition fallback was requested but dlib CUDA is unavailable; "
-                        "fallback has been disabled to avoid slow CPU path."
-                    )
-    
+            face_app = FaceAnalysis(
+                name="buffalo_l",
+                allowed_modules=['detection'],
+                providers=['CUDAExecutionProvider'],
+                provider_options=[{'device_id': accelerator.device.index}]
+                )
+            face_app.prepare(ctx_id=0, det_size=(640, 640))
 
     with profiler.capture("load_clip_image_encoder", category="module_load", immediate_print=True):
-        clip_image_processoor = CLIPImageProcessor.from_pretrained(
+        clip_image_processor = CLIPImageProcessor.from_pretrained(
             "laion/CLIP-ViT-H-14-laion2B-s32B-b79K",
         )
         clip_vision_model_w_proj = CLIPVisionModelWithProjection.from_pretrained(
@@ -1495,100 +1788,43 @@ def main(args):
         clip_vision_model_w_proj.visual_projection.to(accelerator.device, dtype=weight_dtype)
         clip_vision_model_w_proj.requires_grad_(False)
         clip_vision_model_w_proj.gradient_checkpointing_enable()
-        clip_img_mean = torch.tensor(clip_image_processoor.image_mean).reshape([-1,1,1]).to(accelerator.device, dtype=weight_dtype) # mean is based on range [0,1]
-        clip_img_std = torch.tensor(clip_image_processoor.image_std).reshape([-1,1,1]).to(accelerator.device, dtype=weight_dtype) # std is based on range [0,1]
     profiler.record_model_memory("clip_image_encoder", clip_vision_model_w_proj, immediate_print=True)
+    clip_img_mean = torch.tensor(clip_image_processor.image_mean).reshape([-1,1,1]).to(accelerator.device, dtype=weight_dtype) # mean is based on range [0,1]
+    clip_img_std = torch.tensor(clip_image_processor.image_std).reshape([-1,1,1]).to(accelerator.device, dtype=weight_dtype) # std is based on range [0,1]
+    
+    CE_loss = nn.CrossEntropyLoss(reduction="none")   
 
-
-    with profiler.capture("load_dinov2_image_encoder", category="module_load", immediate_print=True):
-        # Serialize the torch.hub download/extract across ranks. On a cold cache every
-        # rank otherwise downloads + extracts dinov2 into the same dir concurrently, and
-        # one rank's shutil.rmtree collides with another rank still extracting
-        # (OSError [Errno 39] Directory not empty: 'data'). Let the main process populate
-        # the cache first, barrier, then all ranks load from a warm cache. Same fix as the
-        # insightface pre-download above.
-        with accelerator.main_process_first():
-            dinov2 = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitb14')
-        dinov2.to(accelerator.device, dtype=weight_dtype)
-        dinov2.requires_grad_(False)
-        dinov2_img_mean = torch.tensor([0.485, 0.456, 0.406]).reshape([-1,1,1]).to(accelerator.device, dtype=weight_dtype)
-        dinov2_img_std = torch.tensor([0.229, 0.224, 0.225]).reshape([-1,1,1]).to(accelerator.device, dtype=weight_dtype)
-    profiler.record_model_memory("dinov2_image_encoder", dinov2, immediate_print=True)
-
-    # Dedicated eval-metric models (main process only) -- identical to 1-main-debias-DAL.py:
-    #   - Clip-I / Clip-T : open_clip CLIP ViT-bigG-14 (laion2b_s39b_b160k)
-    #   - DINO-I          : DINOv2 vit-g/14 (dinov2_vitg14)
-    eval_clip_model_name = "ViT-bigG-14"
-    eval_clip_pretrained = "laion2b_s39b_b160k"
-    eval_dino_model_name = "dinov2_vitg14"
-    clip_eval_model = None
-    clip_eval_preprocess = None
-    clip_eval_tokenizer = None
-    dinov2_eval = None
-    dinov2_eval_img_mean = None
-    dinov2_eval_img_std = None
-    if accelerator.is_main_process:
-        clip_eval_precision = "fp32"
-        if weight_dtype == torch.float16:
-            clip_eval_precision = "fp16"
-        elif weight_dtype == torch.bfloat16:
-            clip_eval_precision = "bf16"
-
-        clip_eval_model, _, clip_eval_preprocess = open_clip.create_model_and_transforms(
-            eval_clip_model_name,
-            pretrained=eval_clip_pretrained,
-            precision=clip_eval_precision,
-            device=accelerator.device,
-        )
-        clip_eval_model.eval().requires_grad_(False)
-        clip_eval_tokenizer = open_clip.get_tokenizer(eval_clip_model_name)
-
-        # dinov2_eval is loaded ONLY on the main process -> no cross-rank torch.hub cache
-        # race to serialize. Do NOT wrap in accelerator.main_process_first(): only rank 0
-        # would enter and hit its internal barrier while other ranks never do -> NCCL hang.
-        dinov2_eval = torch.hub.load('facebookresearch/dinov2', eval_dino_model_name)
-        dinov2_eval.to(accelerator.device, dtype=weight_dtype)
-        dinov2_eval.requires_grad_(False)
-        dinov2_eval.eval()
-        dinov2_eval_img_mean = torch.tensor([0.485, 0.456, 0.406]).reshape([-1,1,1]).to(accelerator.device, dtype=weight_dtype)
-        dinov2_eval_img_std = torch.tensor([0.229, 0.224, 0.225]).reshape([-1,1,1]).to(accelerator.device, dtype=weight_dtype)
-
-    CE_loss = nn.CrossEntropyLoss(reduction="none")
-
-    # build opensphere model
-    sys.path.append(Path(__file__).parent.parent.__str__())
-    sys.path.append(Path(__file__).parent.parent.joinpath("opensphere").__str__())
-    from opensphere.builder import build_from_cfg
-    from opensphere.utils import fill_config
-
-    with profiler.capture("load_opensphere_face_feature_net", category="module_load", immediate_print=True):
-        with open(args.opensphere_config, 'r') as f:
-            opensphere_config = yaml.load(f, yaml.SafeLoader)
-        opensphere_config['data'] = fill_config(opensphere_config['data'])
-        face_feats_net = build_from_cfg(
-            opensphere_config['model']['backbone']['net'],
-            'model.backbone',
-        )
-        face_feats_net = nn.DataParallel(face_feats_net)
-        face_feats_net.load_state_dict(torch.load(args.opensphere_model_path))
-        face_feats_net = face_feats_net.module
-        face_feats_net.to(accelerator.device)
-        face_feats_net.requires_grad_(False)
-        face_feats_net.to(weight_dtype)
-        face_feats_net.eval()
-    profiler.record_model_memory("opensphere_face_feature_net", face_feats_net, immediate_print=True)
-
-    with profiler.capture("load_face_feature_database", category="module_load", immediate_print=True):
-        face_feats_model = FaceFeatsModel(args.face_feats_path)
-        face_feats_model.to(weight_dtype_high_precision)
-        face_feats_model.to(accelerator.device)
-        face_feats_model.eval()
-    profiler.record_model_memory("face_feature_database", face_feats_model, immediate_print=True)
+    # Training uses only align/image/realistic losses. Face detector + MobileNet are eval-only.
 
     #######################################################
+
+    def resolve_skip_final_steps(total_steps, skip_final_steps=0, skip_final_steps_pct=0.0):
+        skip_final_steps_pct = 0.0 if skip_final_steps_pct is None else float(skip_final_steps_pct)
+        if skip_final_steps_pct < 0:
+            raise ValueError("skip_final_steps_pct must be non-negative.")
+
+        skip_from_pct = 0
+        if skip_final_steps_pct > 0:
+            skip_from_pct = int(math.floor(total_steps * skip_final_steps_pct / 100.0 + 0.5))
+
+        skip_final_steps = skip_from_pct if skip_from_pct > 0 else skip_final_steps
+        skip_final_steps = 0 if skip_final_steps is None else int(skip_final_steps)
+        if skip_final_steps < 0:
+            raise ValueError("skip_final_steps must be non-negative.")
+        if skip_final_steps >= total_steps and total_steps > 0:
+            skip_final_steps = total_steps - 1
+        return skip_final_steps
     
     @torch.no_grad()
-    def generate_image_no_gradient(prompt, noises, num_denoising_steps, which_text_encoder, which_unet):
+    def generate_image_no_gradient(
+        prompt,
+        noises,
+        num_denoising_steps,
+        which_text_encoder,
+        which_unet,
+        skip_final_steps: int = 0,
+        skip_final_steps_pct: float = 0.0,
+    ):
         """
         prompts: str
         noises: [N,4,64,64], N is number images to be generated for the prompt
@@ -1626,107 +1862,178 @@ def main(args):
 
         prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds])
         prompt_embeds = prompt_embeds.to(weight_dtype)
-        
+
         noise_scheduler.set_timesteps(num_denoising_steps)
+        timesteps = noise_scheduler.timesteps
+        total_steps = len(timesteps)
+
+        skip_final_steps = resolve_skip_final_steps(total_steps, skip_final_steps, skip_final_steps_pct)
+
+        steps_to_run = total_steps - skip_final_steps
         latents = noises
-        for i, t in enumerate(noise_scheduler.timesteps):
-        
+        for i, t in enumerate(timesteps[:steps_to_run]):
+
             # scale model input
             latent_model_input = torch.cat([latents.to(weight_dtype)] * 2)
             latent_model_input = noise_scheduler.scale_model_input(latent_model_input, t)
-            
+
             noises_pred = which_unet(
                 latent_model_input,
                 t,
                 encoder_hidden_states=prompt_embeds,
             ).sample
             noises_pred = noises_pred.to(weight_dtype_high_precision)
-            
+
             noises_pred_uncond, noises_pred_text = noises_pred.chunk(2)
             noises_pred = noises_pred_uncond + args.guidance_scale * (noises_pred_text - noises_pred_uncond)
-            
+
             latents = noise_scheduler.step(noises_pred, t, latents).prev_sample
+        if skip_final_steps > 0:
+            t_cur = timesteps[steps_to_run]
+
+            latent_model_input = torch.cat([latents.to(weight_dtype)] * 2)
+            latent_model_input = noise_scheduler.scale_model_input(latent_model_input, t_cur)
+
+            eps = which_unet(
+                latent_model_input,
+                t_cur,
+                encoder_hidden_states=prompt_embeds,
+            ).sample
+            eps = eps.to(weight_dtype_high_precision)
+
+            eps_u, eps_c = eps.chunk(2)
+            eps = eps_u + args.guidance_scale * (eps_c - eps_u)
+
+            step_out = noise_scheduler.step(eps, t_cur, latents)
+            if hasattr(step_out, "pred_original_sample") and step_out.pred_original_sample is not None:
+                latents = step_out.pred_original_sample
+            else:
+                alpha_bar = noise_scheduler.alphas_cumprod[t_cur].to(device=latents.device, dtype=latents.dtype)
+                latents = (latents - (1 - alpha_bar).sqrt() * eps.to(latents.dtype)) / alpha_bar.sqrt()
 
         latents = 1 / vae.config.scaling_factor * latents
         images = vae.decode(latents.to(vae.dtype)).sample.clamp(-1,1) # in range [-1,1]
-        
-        return images
+
+        att = None
+        return images, att
     
-    def generate_image_w_gradient(prompt, noises, num_denoising_steps, which_text_encoder, which_unet):
-        """
-        prompts: str
-        noises: [N,4,64,64], N is number images to be generated for the prompt
-        """
-        # to enable gradient_checkpointing, unet must be set to train()
-        unet.train()
-        
+    def generate_image_w_gradient(
+        prompt,
+        noises,
+        num_denoising_steps,
+        which_text_encoder,
+        which_unet,
+        skip_final_steps: int = 0,
+        skip_final_steps_pct: float = 0.0,
+    ):
+        which_unet.train()  # <- 전역 unet 말고 which_unet로 맞추는 게 안전
+
         N = noises.shape[0]
         prompts = [prompt] * N
-        
-        prompts_token = tokenizer(prompts, return_tensors="pt", padding=True)
-        prompts_token["input_ids"] = prompts_token["input_ids"].to(accelerator.device)
-        prompts_token["attention_mask"] = prompts_token["attention_mask"].to(accelerator.device)
 
-        prompt_embeds = which_text_encoder(
-            prompts_token["input_ids"],
-            prompts_token["attention_mask"],
-        )
-        prompt_embeds = prompt_embeds[0]
+        prompts_token = tokenizer(prompts, return_tensors="pt", padding=True).to(accelerator.device)
+        prompt_embeds = which_text_encoder(prompts_token["input_ids"], prompts_token["attention_mask"])[0]
 
-        batch_size = prompt_embeds.shape[0]
-        uncond_tokens = [""] * batch_size
-        max_length = prompt_embeds.shape[1]
-        uncond_input = tokenizer(
-                uncond_tokens,
-                padding="max_length",
-                max_length=max_length,
-                truncation=True,
-                return_tensors="pt",
-            )
-        uncond_input["input_ids"] = uncond_input["input_ids"].to(accelerator.device)
-        uncond_input["attention_mask"] = uncond_input["attention_mask"].to(accelerator.device)
-        negative_prompt_embeds = which_text_encoder(
-            uncond_input["input_ids"],
-            uncond_input["attention_mask"],
-        )
-        negative_prompt_embeds = negative_prompt_embeds[0]
-
+        uncond_input = tokenizer([""] * N, padding="max_length", max_length=prompt_embeds.shape[1],
+                                truncation=True, return_tensors="pt").to(accelerator.device)
+        negative_prompt_embeds = which_text_encoder(uncond_input["input_ids"], uncond_input["attention_mask"])[0]
         prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds]).to(weight_dtype)
-        
-        noise_scheduler.set_timesteps(num_denoising_steps)
-        grad_coefs = []
-        for i, t in enumerate(noise_scheduler.timesteps):
-            grad_coefs.append( noise_scheduler.alphas_cumprod[t].sqrt().item() * (1-noise_scheduler.alphas_cumprod[t]).sqrt().item() / (1-noise_scheduler.alphas[t].item()) )
-        grad_coefs = np.array(grad_coefs)
-        grad_coefs /= (math.prod(grad_coefs)**(1/len(grad_coefs)))
-            
-        latents = noises
-        for i, t in enumerate(noise_scheduler.timesteps):
-        
-            # scale model input
-            latent_model_input = torch.cat([latents.detach().to(weight_dtype)]*2)
-            latent_model_input = noise_scheduler.scale_model_input(latent_model_input, t)
-            
-            noises_pred = which_unet(
-                latent_model_input,
-                t,
-                encoder_hidden_states=prompt_embeds,
-            ).sample
-            noises_pred = noises_pred.to(weight_dtype_high_precision)
-            
-            noises_pred_uncond, noises_pred_text = noises_pred.chunk(2)
-            noises_pred = noises_pred_uncond + args.guidance_scale * (noises_pred_text - noises_pred_uncond)
-            
-            hook_fn = make_grad_hook(grad_coefs[i])
-            noises_pred.register_hook(hook_fn)
-            
-            latents = noise_scheduler.step(noises_pred, t, latents).prev_sample
 
-        latents = 1 / vae.config.scaling_factor * latents
-        images = vae.decode(latents.to(vae.dtype)).sample.clamp(-1,1) # in range [-1,1]
-        
-        return images
-    
+        noise_scheduler.set_timesteps(num_denoising_steps)
+        timesteps = noise_scheduler.timesteps
+        total_steps = len(timesteps)
+
+        skip_final_steps = resolve_skip_final_steps(total_steps, skip_final_steps, skip_final_steps_pct)
+
+        # grad_coefs (원 코드 유지)
+        grad_coefs = []
+        for i, t in enumerate(timesteps):
+            grad_coefs.append(
+                noise_scheduler.alphas_cumprod[t].sqrt().item()
+                * (1 - noise_scheduler.alphas_cumprod[t]).sqrt().item()
+                / (1 - noise_scheduler.alphas[t].item())
+            )
+        grad_coefs = np.array(grad_coefs)
+        grad_coefs /= (math.prod(grad_coefs) ** (1 / len(grad_coefs)))
+
+        steps_to_run = total_steps - skip_final_steps
+        latents = noises
+
+        # 1) 앞부분 steps_to_run 만큼은 기존 step과 동일
+        for i, t in enumerate(timesteps[:steps_to_run]):
+            latent_model_input = torch.cat([latents.detach().to(weight_dtype)] * 2)
+            latent_model_input = noise_scheduler.scale_model_input(latent_model_input, t)
+
+            eps = which_unet(latent_model_input, t, encoder_hidden_states=prompt_embeds).sample
+            eps = eps.to(weight_dtype_high_precision)
+
+            eps_u, eps_c = eps.chunk(2)
+            eps = eps_u + args.guidance_scale * (eps_c - eps_u)
+
+            eps.register_hook(make_grad_hook(grad_coefs[i]))
+            latents = noise_scheduler.step(eps, t, latents).prev_sample
+        # 2) skip이 있으면: "현재 latents가 위치한 timestep"에서 eps를 다시 예측해 x0로 점프
+        if skip_final_steps > 0:
+            t_cur = timesteps[steps_to_run]  # <- 중요: steps_to_run-1가 아니라 steps_to_run
+
+            latent_model_input = torch.cat([latents.detach().to(weight_dtype)] * 2)
+            latent_model_input = noise_scheduler.scale_model_input(latent_model_input, t_cur)
+
+            eps = which_unet(latent_model_input, t_cur, encoder_hidden_states=prompt_embeds).sample
+            eps = eps.to(weight_dtype_high_precision)
+
+            eps_u, eps_c = eps.chunk(2)
+            eps = eps_u + args.guidance_scale * (eps_c - eps_u)
+
+            eps.register_hook(make_grad_hook(grad_coefs[steps_to_run]))
+
+            step_out = noise_scheduler.step(eps, t_cur, latents)
+
+            # scheduler가 제공하면 이게 가장 안전 (clip/threshold 포함)
+            if hasattr(step_out, "pred_original_sample") and step_out.pred_original_sample is not None:
+                latents = step_out.pred_original_sample
+            else:
+                # fallback: x0 공식
+                alpha_bar = noise_scheduler.alphas_cumprod[t_cur].to(device=latents.device, dtype=latents.dtype)
+                latents = (latents - (1 - alpha_bar).sqrt() * eps.to(latents.dtype)) / alpha_bar.sqrt()
+
+        latents = latents / vae.config.scaling_factor
+        images = vae.decode(latents.to(vae.dtype)).sample.clamp(-1, 1)
+
+        att = None
+        return images, att
+
+    def get_original_components():
+        original_text_encoder = eval_text_encoder if args.train_text_encoder else text_encoder
+        original_unet = eval_unet if args.train_unet else unet
+        return original_text_encoder, original_unet
+
+    def generate_images_no_gradient_batched(
+        prompt,
+        noises,
+        num_denoising_steps,
+        which_text_encoder,
+        which_unet,
+        batch_size,
+        skip_final_steps=0,
+        skip_final_steps_pct=0.0,
+    ):
+        images = []
+        num_batches = math.ceil(noises.shape[0] / batch_size)
+        for j in range(num_batches):
+            noises_ij = noises[batch_size * j : batch_size * (j + 1)]
+            images_ij, _ = generate_image_no_gradient(
+                prompt,
+                noises_ij,
+                num_denoising_steps,
+                which_text_encoder=which_text_encoder,
+                which_unet=which_unet,
+                skip_final_steps=skip_final_steps,
+                skip_final_steps_pct=skip_final_steps_pct,
+            )
+            images.append(images_ij)
+        return torch.cat(images)
+
     
     def get_clip_feat(images, normalize=True, to_high_precision=True):
         """get clip features
@@ -1748,49 +2055,262 @@ def main(args):
             embeds = torch.nn.functional.normalize(embeds, dim=-1)
         return embeds
     
-    def get_dino_feat(images, normalize=True, to_high_precision=True):
-        """get dino features
-
-        Args:
-            images (torch.tensor): shape [N,3,H,W], in range [-1,1]
-            normalize (bool):
-            to_high_precision (bool):
-
-        Returns:
-            embeds (torch.tensor)
-        """
-        images_preprocessed = ((images+1)*0.5 - dinov2_img_mean) / dinov2_img_std
-        embeds = dinov2(images_preprocessed)
-        
-        if to_high_precision:
-            embeds = embeds.to(torch.float)
-        if normalize:
-            embeds = torch.nn.functional.normalize(embeds, dim=-1)
-        return embeds
-
     def get_dino_eval_feat(images, normalize=True, to_high_precision=True):
-        """Get evaluation-time DINOv2 vit-g/14 features (identical to 1-main-debias-DAL.py)."""
+        """Get evaluation-time DINOv2 vit-g/14 features."""
         images_preprocessed = ((images+1)*0.5 - dinov2_eval_img_mean) / dinov2_eval_img_std
         embeds = dinov2_eval(images_preprocessed)
+
         if to_high_precision:
             embeds = embeds.to(torch.float)
         if normalize:
             embeds = torch.nn.functional.normalize(embeds, dim=-1)
         return embeds
+    
+    def _text_embeds(prompts: list, which_text_encoder):
+        toks = tokenizer(prompts, padding="max_length", max_length=tokenizer.model_max_length, truncation=True, return_tensors="pt")
+        input_ids = toks.input_ids.to(accelerator.device)
+        attn_mask = toks.attention_mask.to(accelerator.device)
+        return which_text_encoder(input_ids, attn_mask)[0]
 
-    def get_face_feats(net, data, flip=True, normalize=True, to_high_precision=True):
-        # extract features from the original 
-        # and horizontally flipped data
-        feats = net(data)
-        if flip:
-            data = torch.flip(data, [3])
-            feats += net(data)
-        if to_high_precision:
-            feats = feats.to(torch.float)
-        if normalize:
-            feats = torch.nn.functional.normalize(feats, dim=-1)
-        return feats
-        
+
+    def find_token_positions(tokenizer, prompt: str, keywords: List[str]) -> List[int]:
+        """Find token piece indices that contain any keyword (case-insensitive).
+        Returns list of indices (may be empty).
+        """
+        toks = tokenizer(prompt, padding="max_length", max_length=tokenizer.model_max_length, truncation=True, return_tensors="pt")
+        ids = toks.input_ids[0]
+        pieces = tokenizer.convert_ids_to_tokens(ids)
+        kws = [k.lower() for k in keywords]
+        pos = []
+        for i, piece in enumerate(pieces):
+            p = piece.lower().replace("Ġ", "").replace("▁", "")
+            if any(k in p for k in kws):
+                pos.append(i)
+        return pos
+
+    # =========================
+    # [MODIFIED] SDS-based classifier utilities
+    #   - region_mask_mode에 따라 attn/none 마스크 적용
+    #   - 마스크는 err_f/err_m에 곱해져 경사가 관심 영역 밖으로 흐르지 않음
+    # =========================
+    def sds_logits_from_images(
+        images: torch.Tensor,
+        tau: float,
+        t_min: int,
+        t_max: int,
+        num_t: int,
+        num_eps: int,
+        sds_text_encoder=None,
+        sds_unet=None,
+        compute_realistic_sds: bool = False,
+        return_attmap: bool = False,
+    ):
+        """
+        - region_mask_mode == 'attn': SDS 분류 프롬프트(woman/man)의 토큰 어텐션맵을 헤드/블록/timestep 평균해 사용
+        - region_mask_mode == 'none': 마스크 미적용
+        """
+        B = images.shape[0]
+        sds_text_encoder = text_encoder if sds_text_encoder is None else sds_text_encoder
+        sds_unet = unet if sds_unet is None else sds_unet
+
+        lat = vae.encode(images.to(weight_dtype)).latent_dist.sample() * vae.config.scaling_factor  # [B,4,64,64]
+
+        # --- t 인덱스/확장 ---
+        t_idx = torch.linspace(t_min, t_max, steps=num_t, device=accelerator.device).round().long()
+        K = t_idx.shape[0]
+        lat_exp = lat.unsqueeze(1).unsqueeze(2).expand(B, K, num_eps, *lat.shape[1:]).contiguous().view(B*K*num_eps, *lat.shape[1:])
+        t_vec = t_idx.view(1, K, 1).expand(B, K, num_eps).reshape(-1)
+        BKE = lat_exp.shape[0]
+
+        # --- eps & z_t (dtype 유지) ---
+        eps = torch.randn_like(lat_exp, dtype=weight_dtype)
+        alpha_bar = ddpm_forward.alphas_cumprod.to(device=accelerator.device, dtype=lat_exp.dtype)[t_vec]
+        zt = alpha_bar.sqrt().view(-1,1,1,1) * lat_exp + (1.0 - alpha_bar).sqrt().view(-1,1,1,1) * eps
+
+        # --- 텍스트 임베딩 ---
+        female_prompt = "a photo of a woman"
+        male_prompt   = "a photo of a man"
+        realistic_prompt = "a photo of a realistic face"
+        pe_f = _text_embeds([female_prompt]*BKE, sds_text_encoder).to(weight_dtype)
+        pe_m = _text_embeds([male_prompt]*BKE,   sds_text_encoder).to(weight_dtype)
+        pe_r = None
+        if compute_realistic_sds:
+            pe_r = _text_embeds([realistic_prompt]*BKE, sds_text_encoder).to(weight_dtype)
+
+        # --- region weight map (w_map): attn / none ---
+        w_map = None  # [BKE,H,W] or None
+        attmap_mean = None  # [B,H,W] or None
+
+        # 해상도(H,W): eps_pred_*와 동일(보통 64x64)
+        _H = zt.shape[-2]
+        _W = zt.shape[-1]
+
+        def _forward_with_optional_attn(prompt_embeds: torch.Tensor, token_positions: List[int]):
+            capture = None
+            att_bke = None
+            if args.region_mask_mode == "attn" and args.use_attn_weight and len(token_positions) > 0:
+                capture = CrossAttnCapture(
+                    token_indices=token_positions,
+                    use_cpu=False,
+                    expect_cfg_pair=False,
+                ).add_hooks(sds_unet)
+            try:
+                eps_pred = sds_unet(zt.to(weight_dtype), t_vec, encoder_hidden_states=prompt_embeds).sample.to(weight_dtype)
+                if capture is not None:
+                    att_bke = capture.aggregated_map()
+            finally:
+                if capture is not None:
+                    capture.clear()
+            return eps_pred, att_bke
+
+        tok_pos_f = find_token_positions(tokenizer, female_prompt, keywords=["woman"])
+        tok_pos_m = find_token_positions(tokenizer, male_prompt, keywords=["man"])
+
+        # --- UNet 예측 + prompt-token attention map 수집 ---
+        eps_pred_f, att_f_bke = _forward_with_optional_attn(pe_f, tok_pos_f)
+        eps_pred_m, att_m_bke = _forward_with_optional_attn(pe_m, tok_pos_m)
+        eps_pred_r = None
+        if compute_realistic_sds:
+            eps_pred_r = sds_unet(zt.to(weight_dtype), t_vec, encoder_hidden_states=pe_r).sample.to(weight_dtype)
+
+        # region_mask_mode == 'attn': woman/man 토큰 attmap 평균 사용
+        if args.region_mask_mode == "attn":
+            if args.use_attn_weight and att_f_bke is not None and att_m_bke is not None:
+                a_f = att_f_bke.to(device=accelerator.device, dtype=torch.float32)
+                a_m = att_m_bke.to(device=accelerator.device, dtype=torch.float32)
+                if a_f.shape[-2:] != (_H, _W):
+                    a_f = F.interpolate(a_f.unsqueeze(1), size=(_H, _W), mode="bilinear", align_corners=False).squeeze(1)
+                if a_m.shape[-2:] != (_H, _W):
+                    a_m = F.interpolate(a_m.unsqueeze(1), size=(_H, _W), mode="bilinear", align_corners=False).squeeze(1)
+
+                att_f = a_f.reshape(B, K, num_eps, _H, _W).mean(dim=(1, 2))  # [B,H,W]
+                att_m = a_m.reshape(B, K, num_eps, _H, _W).mean(dim=(1, 2))  # [B,H,W]
+                attmap_mean = 0.5 * (att_f + att_m)
+                w_map = (
+                    attmap_mean.unsqueeze(1)
+                    .unsqueeze(2)
+                    .expand(B, K, num_eps, _H, _W)
+                    .contiguous()
+                    .view(BKE, _H, _W)
+                    .to(weight_dtype)
+                )
+
+        # --- SDS(가중 MSE; 같은 맵으로 f/m 모두 가중) ---
+        err_f = ((eps_pred_f - eps)**2).mean(dim=1)  # [BKE,H,W]
+        err_m = ((eps_pred_m - eps)**2).mean(dim=1)  # [BKE,H,W]
+        err_r = None
+        if compute_realistic_sds:
+            err_r = ((eps_pred_r - eps)**2).mean(dim=1)  # [BKE,H,W]
+        if w_map is not None:
+            # Convert w_map into per-sample sum-to-one weights, then rescale by H*W so
+            # the final reduction remains a spatial mean with average weight 1.
+            w = w_map.to(err_f.dtype).clamp_min(0)
+            w_sum = w.flatten(1).sum(dim=1).clamp_min(1e-8)  # [BKE]
+            hw = err_f.shape[-2] * err_f.shape[-1]
+            w = (w / w_sum.view(-1, 1, 1)) * hw
+            sds_f_per = (err_f * w).flatten(1).mean(dim=1)  # [BKE]
+            sds_m_per = (err_m * w).flatten(1).mean(dim=1)  # [BKE]
+        else:
+            # 마스크 없음
+            sds_f_per = err_f.flatten(1).mean(dim=1)  # [BKE]
+            sds_m_per = err_m.flatten(1).mean(dim=1)  # [BKE]
+        sds_r_per = None
+        if compute_realistic_sds:
+            # realistic SDS always uses full pixels (no w_map)
+            sds_r_per = err_r.flatten(1).mean(dim=1)
+
+        # --- 로짓/확률: fp32 강제 계산 & fp32 출력 ---
+        with torch.autocast("cuda", enabled=False):
+            # 1) [B*K*E] -> [B,K,E] -> (K,E) 평균 => [B]
+            sds_f32 = sds_f_per.float().view(B, K, num_eps).mean(dim=(1, 2))  # [B], fp32
+            sds_m32 = sds_m_per.float().view(B, K, num_eps).mean(dim=(1, 2))  # [B], fp32
+            sds_r32 = None
+            if sds_r_per is not None:
+                sds_r32 = sds_r_per.float().view(B, K, num_eps).mean(dim=(1, 2))  # [B], fp32
+
+            tau32   = torch.tensor(tau, device=accelerator.device, dtype=torch.float32)
+
+            # 2) logits/probs shape = [B,2]
+            logits32 = torch.stack([-sds_f32 / tau32, -sds_m32 / tau32], dim=1)  # [B,2], fp32
+
+            # 3) 수치 안정화(softmax 불변 변환): 행별 최대값 빼기
+            logits32 = logits32 - logits32.max(dim=1, keepdim=True).values
+
+            probs32  = torch.softmax(logits32, dim=1)  # [B,2], fp32
+
+        preds = probs32.argmax(dim=1)  # [B]
+
+        # --- 안전성 검사: NaN/Inf 및 소프트맥스 행합 ---
+        row_sums   = probs32.sum(dim=1)                       # [B]
+        bad_logits = (~torch.isfinite(logits32)).any(dim=1)   # [B]
+        bad_probs  = (~torch.isfinite(probs32)).any(dim=1)    # [B]
+        bad_sum    = (~torch.isfinite(row_sums)) | ((row_sums - 1.0).abs() > 1e-4)
+        bad_rows   = bad_logits | bad_probs | bad_sum         # [B]
+
+        if bad_rows.any():
+            idx = torch.nonzero(bad_rows).squeeze(1)
+            print(f"[ALERT] non-finite detected in logits/probs (rows={idx.tolist()})")
+            print("tau:", float(tau32))
+            print("sds_f32[min,max]:", float(sds_f32.min()), float(sds_f32.max()))
+            print("sds_m32[min,max]:", float(sds_m32.min()), float(sds_m32.max()))
+            print("logits32 (bad rows):\n", logits32[idx])
+            print("probs32 (bad rows) & row sums:\n", probs32[idx], "\nrow_sums:", row_sums[idx])
+            raise FloatingPointError("Non-finite in logits/probs")
+
+        if return_attmap:
+            return preds, probs32, logits32, sds_f32, sds_m32, sds_r32, attmap_mean
+        return preds, probs32, logits32, sds_f32, sds_m32, sds_r32
+
+    def clip_gender_classifier(
+        images: torch.Tensor,
+        clip_model: CLIPModel,
+        clip_processor: CLIPProcessor,
+        text_features: torch.Tensor,
+        device: torch.device,
+    ):
+        """
+        images: [B, 3, H, W]  (보통 [-1,1] 범위라고 가정)
+        반환:
+            preds:  [B] int64       (0: woman, 1: man)
+            probs:  [B, 2] float32
+            logits: [B, 2] float32
+        """
+
+        with torch.no_grad():
+            # 1) [-1,1] -> [0,1]
+            imgs = images.detach().cpu()
+            imgs = (imgs * 0.5 + 0.5).clamp(0, 1)
+
+            # 2) Tensor -> PIL
+            to_pil = T.ToPILImage()
+            pil_images = [to_pil(img) for img in imgs]
+
+            # 3) CLIPProcessor로 이미지 전처리
+            img_inputs = clip_processor(
+                images=pil_images,
+                return_tensors="pt"
+            )
+            pixel_values = img_inputs["pixel_values"].to(device)
+
+            # 4) image feature 추출
+            image_features = clip_model.get_image_features(pixel_values=pixel_values)
+            image_features = F.normalize(image_features, dim=-1)
+
+            # 5) text_features와 cosine similarity 기반 logits 계산
+            #    CLIP의 logit_scale까지 같이 사용 (원래 forward와 동일한 방식)
+            logit_scale = clip_model.logit_scale.exp()
+            logits = (image_features @ text_features.t()) * logit_scale
+
+            # 6) 확률 & 예측 클래스
+            probs = F.softmax(logits, dim=-1)
+            preds = probs.argmax(dim=-1)
+
+        return preds, probs, logits
+
+
+    # =======================================
+    # Face helpers are used only for evaluation-time MobileNet metrics and plots.
+    # =======================================
     def get_face(images, fill_value=-1):
         """
         images:shape [N,3,H,W], in range [-1,1], pytorch tensor
@@ -1802,47 +2322,21 @@ def main(args):
             face_chips: torch tensor of shape [N,3,224,224]
                 if face_indicator is False, the corresponding face_chip will be all fill_value
         """
-        face_indicators_app, face_bboxs_app, face_chips_app, face_landmarks_app, aligned_face_chips_app = get_face_app(images, fill_value=fill_value)
+        face_indicators_app, face_bboxs_app, face_chips_app = get_face_app(images, fill_value=fill_value)
 
-        # GPU fallback: retry the images the primary (det_size 640) pass missed at smaller
-        # det_size(s) on the GPU. buffalo_l/SCRFD is anchored ~640px, so a single large face
-        # in a 512px portrait is frequently missed at 640 but detected at 320/448. We retry
-        # ONLY the missed images, so detections from the 640 pass are left untouched (no
-        # training drift). Fully on the GPU (onnxruntime CUDA) -- no slow dlib/CPU path.
-        if getattr(args, "use_gpu_facedetect_fallback", False):
-            det_model = getattr(face_app, "det_model", None)
-            if det_model is not None:
-                saved_input_size = det_model.input_size
-                try:
-                    for det_size in args.gpu_facedetect_fallback_det_sizes:
-                        missed = face_indicators_app.logical_not()
-                        if missed.sum() == 0:
-                            break
-                        det_model.input_size = (int(det_size), int(det_size))
-                        fi_re, fb_re, fc_re, fl_re, afc_re = get_face_app(images[missed], fill_value=fill_value)
-                        face_bboxs_app[missed] = fb_re
-                        face_chips_app[missed] = fc_re
-                        face_landmarks_app[missed] = fl_re
-                        aligned_face_chips_app[missed] = afc_re
-                        face_indicators_app[missed] = fi_re
-                finally:
-                    det_model.input_size = saved_input_size
-
-        if (
-            args.use_face_recognition_fallback
-            and face_recognition is not None
-            and face_indicators_app.logical_not().sum() > 0
-        ):
-            face_indicators_FR, face_bboxs_FR, face_chips_FR, face_landmarks_FR, aligned_face_chips_FR = get_face_FR(images[face_indicators_app.logical_not()], fill_value=fill_value)
+        # Keep the same fallback behavior as ft.py:
+        # if InsightFace misses a face, retry that subset with face_recognition.
+        if face_indicators_app.logical_not().sum() > 0:
+            face_indicators_FR, face_bboxs_FR, face_chips_FR = get_face_FR(
+                images[face_indicators_app.logical_not()],
+                fill_value=fill_value,
+            )
 
             face_bboxs_app[face_indicators_app.logical_not()] = face_bboxs_FR
             face_chips_app[face_indicators_app.logical_not()] = face_chips_FR
-            face_landmarks_app[face_indicators_app.logical_not()] = face_landmarks_FR
-            aligned_face_chips_app[face_indicators_app.logical_not()] = aligned_face_chips_FR
-
             face_indicators_app[face_indicators_app.logical_not()] = face_indicators_FR
 
-        return face_indicators_app, face_bboxs_app, face_chips_app, face_landmarks_app, aligned_face_chips_app
+        return face_indicators_app, face_bboxs_app, face_chips_app
 
     
     def get_largest_face_FR(faces_from_FR, dim_max, dim_min):
@@ -1876,48 +2370,28 @@ def main(args):
         face_indicators_FR = []
         face_bboxs_FR = []
         face_chips_FR = []
-        face_landmarks_FR = []
-        aligned_face_chips_FR = []
         for idx, image_np in enumerate(images_np):
-            # import pdb; pdb.set_trace()
             faces_from_FR = face_recognition.face_locations(image_np, model="cnn", number_of_times_to_upsample=0)
             if len(faces_from_FR) == 0:
                 face_indicators_FR.append(False)
                 face_bboxs_FR.append([fill_value]*4)
                 face_chips_FR.append(torch.ones([1,3,args.size_face,args.size_face], dtype=images.dtype, device=images.device)*(fill_value))
-                face_landmarks_FR.append(torch.ones([1,5,2], dtype=images.dtype, device=images.device)*(fill_value))
-                aligned_face_chips_FR.append(torch.ones([1,3,args.size_aligned_face,args.size_aligned_face], dtype=images.dtype, device=images.device)*(fill_value))
             else:
                 face_from_FR = get_largest_face_FR(faces_from_FR, dim_max=image_np.shape[0], dim_min=0)
                 bbox = face_from_FR
                 bbox = np.array((bbox[-1],) + bbox[:-1]) # need to convert bbox from face_recognition to the right order
                 bbox = expand_bbox(bbox, expand_coef=1.1, target_ratio=1) # need to use a larger expand_coef for FR
                 face_chip = crop_face(images[idx], bbox, target_size=[args.size_face,args.size_face], fill_value=fill_value)
-                
-                face_landmarks = face_recognition.face_landmarks(image_np, face_locations=[face_from_FR], model="large")
 
-                left_eye = np.array(face_landmarks[0]["left_eye"]).mean(axis=0)
-                right_eye = np.array(face_landmarks[0]["right_eye"]).mean(axis=0)
-                nose_tip = np.array(face_landmarks[0]["nose_bridge"][-1])
-                top_lip_left = np.array(face_landmarks[0]["top_lip"][0])
-                top_lip_right = np.array(face_landmarks[0]["top_lip"][6])
-                face_landmarks = np.stack([left_eye, right_eye, nose_tip, top_lip_left, top_lip_right])
-                
-                aligned_face_chip = image_pipeline(images[idx], face_landmarks)
-                
                 face_indicators_FR.append(True)
                 face_bboxs_FR.append(bbox)
                 face_chips_FR.append(face_chip.unsqueeze(dim=0))
-                face_landmarks_FR.append(torch.tensor(face_landmarks).unsqueeze(dim=0).to(device=images.device).to(images.dtype))
-                aligned_face_chips_FR.append(aligned_face_chip.unsqueeze(dim=0))
         
         face_indicators_FR = torch.tensor(face_indicators_FR).to(device=images.device)
         face_bboxs_FR = torch.tensor(face_bboxs_FR).to(device=images.device)
         face_chips_FR = torch.cat(face_chips_FR, dim=0)
-        face_landmarks_FR = torch.cat(face_landmarks_FR, dim=0)
-        aligned_face_chips_FR = torch.cat(aligned_face_chips_FR, dim=0)
         
-        return face_indicators_FR, face_bboxs_FR, face_chips_FR, face_landmarks_FR, aligned_face_chips_FR
+        return face_indicators_FR, face_bboxs_FR, face_chips_FR
 
     def get_largest_face_app(face_from_app, dim_max, dim_min):
         if len(face_from_app) == 1:
@@ -1949,8 +2423,6 @@ def main(args):
         face_indicators_app = []
         face_bboxs_app = []
         face_chips_app = []
-        face_landmarks_app = []
-        aligned_face_chips_app = []
         for idx, image_np in enumerate(images_np):
             # face_app.get input should be [BGR]
             faces_from_app = face_app.get(image_np[:,:,[2,1,0]])
@@ -1958,56 +2430,44 @@ def main(args):
                 face_indicators_app.append(False)
                 face_bboxs_app.append([fill_value]*4)
                 face_chips_app.append(torch.ones([1,3,args.size_face,args.size_face], dtype=images.dtype, device=images.device)*(fill_value))
-                face_landmarks_app.append(torch.ones([1,5,2], dtype=images.dtype, device=images.device)*(fill_value))
-                aligned_face_chips_app.append(torch.ones([1,3,args.size_aligned_face,args.size_aligned_face], dtype=images.dtype, device=images.device)*(fill_value))
             else:
                 face_from_app = get_largest_face_app(faces_from_app, dim_max=image_np.shape[0], dim_min=0)
                 bbox = expand_bbox(face_from_app["bbox"], expand_coef=0.5, target_ratio=1)
                 face_chip = crop_face(images[idx], bbox, target_size=[args.size_face,args.size_face], fill_value=fill_value)
-                
-                face_landmarks = np.array(face_from_app["kps"])
-                aligned_face_chip = image_pipeline(images[idx], face_landmarks)
-                
+
                 face_indicators_app.append(True)
                 face_bboxs_app.append(bbox)
                 face_chips_app.append(face_chip.unsqueeze(dim=0))
-                face_landmarks_app.append(torch.tensor(face_landmarks).unsqueeze(dim=0).to(device=images.device).to(images.dtype))
-                aligned_face_chips_app.append(aligned_face_chip.unsqueeze(dim=0))
         
         face_indicators_app = torch.tensor(face_indicators_app).to(device=images.device)
         face_bboxs_app = torch.tensor(face_bboxs_app).to(device=images.device)
         face_chips_app = torch.cat(face_chips_app, dim=0)
-        face_landmarks_app = torch.cat(face_landmarks_app, dim=0)
-        aligned_face_chips_app = torch.cat(aligned_face_chips_app, dim=0)
         
-        return face_indicators_app, face_bboxs_app, face_chips_app, face_landmarks_app, aligned_face_chips_app
+        return face_indicators_app, face_bboxs_app, face_chips_app
                 
-    def get_face_gender(face_chips, selector=None, fill_value=-1, classifier=None):
-        """for CelebA classifier
-
-        classifier: which MobileNet to use. Defaults to the training `gender_classifier`
-        (args.classifier_weight_path). Eval passes `test_gender_classifier` so the reported
-        gender-gap metric uses the held-out test classifier (args.test_classifier_weight_path).
-        """
-        clf = classifier if classifier is not None else gender_classifier
+    # NOTE: used for evaluation-time metrics only (face detector + MobileNet).
+    def get_face_gender(face_chips, selector=None, fill_value=-1):
         if selector != None:
             face_chips_w_faces = face_chips[selector]
         else:
             face_chips_w_faces = face_chips
-
+                        
         if face_chips_w_faces.shape[0] == 0:
             logits_gender = torch.empty([0,2], dtype=face_chips.dtype, device=face_chips.device)
             probs_gender = torch.empty([0,2], dtype=face_chips.dtype, device=face_chips.device)
-            # pred_class_probs_gender = torch.empty([0], dtype=face_chips.dtype, device=face_chips.device)
             preds_gender = torch.empty([0], dtype=torch.int64, device=face_chips.device)
         else:
-            logits = clf(face_chips_w_faces)
-            logits_gender = logits.view([logits.shape[0],-1,2])[:,20,:]
+            logits_gender = gender_classifier(face_chips_w_faces.float())
             probs_gender = torch.softmax(logits_gender, dim=-1)
         
             temp = probs_gender.max(dim=-1)
-            # pred_class_probs_gender = temp.values
             preds_gender = temp.indices
+
+        # Pin to float32 so the gathered probs dtype never depends on whether a face
+        # was detected (no-face branch built fp16, has-face branch .float()->fp32);
+        # the mismatch silently DEADLOCKED all_gather until the NCCL watchdog timeout.
+        logits_gender = logits_gender.float()
+        probs_gender = probs_gender.float()
         
         if selector != None:
             preds_gender_new = torch.ones(
@@ -2036,12 +2496,12 @@ def main(args):
             return preds_gender, probs_gender, logits_gender
         
     @torch.no_grad()
-    def generate_dynamic_targets(probs, target_ratio=0.5, w_uncertainty=False):
+    def generate_dynamic_targets(probs, target_male_ratio=0.5, w_uncertainty=False):
         """generate dynamic targets for the distributional alignment loss
 
         Args:
             probs (torch.tensor): shape [N,2], N points in a probability simplex of 2 dims
-            target_ratio (float): target distribution, the percentage of class 1 (male)
+            target_male_ratio (float): target distribution, the percentage of class 1 (male)
             w_uncertainty (True/False): whether return uncertainty measures
         
         Returns:
@@ -2050,9 +2510,10 @@ def main(args):
         """
         idxs_2_rank = (probs!=-1).all(dim=-1)
         probs_2_rank = probs[idxs_2_rank]
+        target_male_ratio = float(np.clip(target_male_ratio, 0.0, 1.0))
 
         rank = torch.argsort(torch.argsort(probs_2_rank[:,1]))
-        targets = (rank >= (rank.shape[0]*target_ratio)).long()
+        targets = (rank >= (rank.shape[0] * (1.0 - target_male_ratio))).long()
 
         targets_all = torch.ones([probs.shape[0]], dtype=torch.long, device=probs.device) * (-1)
         targets_all[idxs_2_rank] = targets
@@ -2063,14 +2524,14 @@ def main(args):
                 1 - scipy.stats.binom.cdf(
                     (rank[targets==1]).cpu().numpy(), 
                     probs_2_rank.shape[0], 
-                    1-target_ratio
+                    target_male_ratio
                     )
                 ).to(probs.dtype).to(probs.device)
             uncertainty[targets==0] = torch.tensor(
                 scipy.stats.binom.cdf(
                     rank[targets==0].cpu().numpy(), 
                     probs_2_rank.shape[0], 
-                    target_ratio
+                    target_male_ratio
                     )
                 ).to(probs.dtype).to(probs.device)
             
@@ -2082,17 +2543,19 @@ def main(args):
             return targets_all
 
     @torch.no_grad()
-    def evaluate_process(which_text_encoder, which_unet, name, prompts, noises, current_global_step):
+    def evaluate_process(which_text_encoder, which_unet, name, prompts, noises, current_global_step, enable_sds_eval: bool = True):
         logs = []
         log_imgs = []
         num_denoising_steps = 25
-        # eval similarity metrics accumulated over all prompts (main process only) -- identical to DAL.py
         clip_i_sims = []
         dino_i_sims = []
         clip_t_sims = []
-        to_pil_eval = transforms.ToPILImage()
+        to_pil_eval = T.ToPILImage()
+        need_attmap_eval = bool(args.save_attmaps)
+        need_sds_classifier_eval = bool(enable_sds_eval)
+        need_sds_forward = need_sds_classifier_eval or need_attmap_eval
 
-        def _clip_image_features_eval(imgs):
+        def _clip_image_features_eval(imgs: torch.Tensor):
             # imgs: [-1,1] -> [0,1], CPU PIL -> CLIP ViT-bigG-14 image features (normalized)
             imgs_01 = (imgs.detach().cpu() * 0.5 + 0.5).clamp(0, 1)
             pil_images = [to_pil_eval(img) for img in imgs_01]
@@ -2103,48 +2566,88 @@ def main(args):
             )
             with torch.no_grad():
                 feats = clip_eval_model.encode_image(pixel_values)
-                feats = torch.nn.functional.normalize(feats.float(), dim=-1)
+                feats = F.normalize(feats.float(), dim=-1)
             return feats
 
-        def _clip_text_features_eval(text):
+        def _clip_text_features_eval(text: str):
             with torch.no_grad():
                 text_tokens = clip_eval_tokenizer([text]).to(accelerator.device)
                 feats = clip_eval_model.encode_text(text_tokens)
-                feats = torch.nn.functional.normalize(feats.float(), dim=-1)
+                feats = F.normalize(feats.float(), dim=-1)
             return feats
 
         for prompt_i, noises_i in itertools.zip_longest(prompts, noises):
             if accelerator.is_main_process:
                 logs_i = {
+                    "gender_gap": [],
+                    "gender_gap_abs": [],
+                    "bias_score": [],
+                    "bias_score_abs": [],
+                    "gender_pred_between_0.2_0.8": [],
+                    "gender_gap_mnet": [],
                     "gender_gap_abs_mnet": [],
+                    "gender_pred_between_0.2_0.8_mnet": [],
+                    "gender_gap_abs_mnet_ori": [],
                 }
+                if enable_sds_eval:
+                    logs_i["gender_gap_abs_sds"] = []
                 log_imgs_i = {}
             ################################################
             # step 1: generate all ori images
-            images_ori = []
-            N = math.ceil(noises_i.shape[0] / args.val_GPU_batch_size)
-            for j in range(N):
-                noises_ij = noises_i[args.val_GPU_batch_size*j:args.val_GPU_batch_size*(j+1)]
-                if args.train_text_encoder and args.train_unet:
-                    images_ij = generate_image_no_gradient(prompt_i, noises_ij, num_denoising_steps, which_text_encoder=eval_text_encoder, which_unet=eval_unet)
-                elif args.train_text_encoder and not args.train_unet:
-                    images_ij = generate_image_no_gradient(prompt_i, noises_ij, num_denoising_steps, which_text_encoder=eval_text_encoder, which_unet=unet)
-                elif not args.train_text_encoder and args.train_unet:
-                    images_ij = generate_image_no_gradient(prompt_i, noises_ij, num_denoising_steps, which_text_encoder=text_encoder, which_unet=eval_unet)
-                images_ori.append(images_ij)
-            images_ori = torch.cat(images_ori)
-            face_indicators_ori, face_bboxs_ori, face_chips_ori, face_landmarks_ori, aligned_face_chips_ori = get_face(images_ori)
-            preds_gender_ori, probs_gender_ori, logits_gender_ori = get_face_gender(face_chips_ori, selector=face_indicators_ori, fill_value=-1, classifier=test_gender_classifier)
-            
-            face_feats_ori = get_face_feats(face_feats_net, aligned_face_chips_ori)
-            _, face_real_scores_ori = face_feats_model.semantic_search(face_feats_ori, selector=face_indicators_ori, return_similarity=True)
+            original_text_encoder, original_unet = get_original_components()
+            sds_eval_text_encoder = eval_text_encoder if args.train_text_encoder else text_encoder
+            images_ori = generate_images_no_gradient_batched(
+                prompt_i,
+                noises_i,
+                num_denoising_steps,
+                which_text_encoder=original_text_encoder,
+                which_unet=original_unet,
+                batch_size=args.val_GPU_batch_size,
+            )
 
+            # --- Face detector + MobileNet classifier (evaluation only) ---
+            face_indicators_ori, face_bboxs_ori, face_chips_ori = get_face(images_ori)
+            preds_gender_ori_mnet, probs_gender_ori_mnet, logits_gender_ori_mnet = get_face_gender(
+                face_chips_ori,
+                selector=face_indicators_ori,
+                fill_value=-1,
+            )
+
+            # --- SDS-based classifier (optional; can be disabled for fast eval) ---
+            attmap_ori_all = None
+            attmap_ori = None
+            if need_sds_forward:
+                preds_gender_ori_sds, probs_gender_ori_sds, logits_gender_ori_sds, _, _, _, attmap_ori = sds_logits_from_images(
+                    images_ori,
+                    tau=args.sds_tau,
+                    t_min=args.sds_t_min,
+                    t_max=args.sds_t_max,
+                    num_t=args.sds_num_t,
+                    num_eps=args.sds_num_eps,
+                    sds_text_encoder=sds_eval_text_encoder,
+                    sds_unet=which_unet,
+                    compute_realistic_sds=False,
+                    return_attmap=True,
+                )
+            preds_gender_ori, probs_gender_ori, logits_gender_ori = clip_gender_classifier(
+                images_ori,
+                clip_model=clip_model,
+                clip_processor=clip_processor,
+                text_features=gender_text_features,
+                device=accelerator.device,
+            )
             images_ori_all = customized_all_gather(images_ori, accelerator, return_tensor_other_processes=False)
             face_indicators_ori_all = customized_all_gather(face_indicators_ori, accelerator, return_tensor_other_processes=False)
             face_bboxs_ori_all = customized_all_gather(face_bboxs_ori, accelerator, return_tensor_other_processes=False)
             preds_gender_ori_all = customized_all_gather(preds_gender_ori, accelerator, return_tensor_other_processes=False)
             probs_gender_ori_all = customized_all_gather(probs_gender_ori, accelerator, return_tensor_other_processes=False)
-            face_real_scores_ori_all = customized_all_gather(face_real_scores_ori, accelerator, return_tensor_other_processes=False)
+            if need_sds_classifier_eval:
+                preds_gender_ori_all_sds = customized_all_gather(preds_gender_ori_sds, accelerator, return_tensor_other_processes=False)
+                probs_gender_ori_all_sds = customized_all_gather(probs_gender_ori_sds, accelerator, return_tensor_other_processes=False)
+            preds_gender_ori_all_mnet = customized_all_gather(preds_gender_ori_mnet, accelerator, return_tensor_other_processes=False)
+            probs_gender_ori_all_mnet = customized_all_gather(probs_gender_ori_mnet, accelerator, return_tensor_other_processes=False)
+            if need_attmap_eval and attmap_ori is not None:
+                attmap_ori_all = customized_all_gather(attmap_ori, accelerator, return_tensor_other_processes=False)
 
             if accelerator.is_main_process:
                 save_to = os.path.join(args.imgs_save_dir, f"eval_{name}_{global_step}_{prompt_i}_ori.jpg")
@@ -2154,32 +2657,88 @@ def main(args):
                     face_indicators=face_indicators_ori_all, face_bboxs=face_bboxs_ori_all, 
                     preds_gender=preds_gender_ori_all, 
                     pred_class_probs_gender=probs_gender_ori_all.max(dim=-1).values,
-                    # face_real_scores=face_real_scores_ori_all
                 )
-
+                if enable_sds_eval:
+                    save_to = os.path.join(args.imgs_save_dir, f"eval_{name}_{global_step}_{prompt_i}_ori_sds.jpg")
+                    plot_in_grid(
+                        images_ori_all, 
+                        save_to, 
+                        face_indicators=face_indicators_ori_all, face_bboxs=face_bboxs_ori_all, 
+                        preds_gender=preds_gender_ori_all_sds, 
+                        pred_class_probs_gender=probs_gender_ori_all_sds.max(dim=-1).values,
+                    )
+                save_to = os.path.join(args.imgs_save_dir, f"eval_{name}_{global_step}_{prompt_i}_ori_mnet.jpg")
+                plot_in_grid(
+                    images_ori_all,
+                    save_to,
+                    face_indicators=face_indicators_ori_all,
+                    face_bboxs=face_bboxs_ori_all,
+                    preds_gender=preds_gender_ori_all_mnet,
+                    pred_class_probs_gender=probs_gender_ori_all_mnet.max(dim=-1).values,
+                )
                 log_imgs_i["img_ori"] = [save_to]
+                if args.save_attmaps and attmap_ori_all is not None:
+                    att_save_dir = os.path.join(args.imgs_save_dir, "eval_attmaps")
+                    att_prefix = f"eval_{name}_{global_step}_{sanitize_filename(prompt_i)}_ori_att"
+                    save_attmaps(attmap_ori_all, att_save_dir, att_prefix)
+                    save_attmaps_with_overlay(attmap_ori_all, images_ori_all, att_save_dir, att_prefix, alpha=0.45)
+                    att_preview = os.path.join(att_save_dir, f"{att_prefix}_0_overlay.png")
+                    if os.path.exists(att_preview):
+                        log_imgs_i["attmap_ori_overlay"] = [att_preview]
 
             
-            images = []
-            N = math.ceil(noises_i.shape[0] / args.val_GPU_batch_size)
-            for j in range(N):
-                noises_ij = noises_i[args.val_GPU_batch_size*j:args.val_GPU_batch_size*(j+1)]
-                images_ij = generate_image_no_gradient(prompt_i, noises_ij, num_denoising_steps, which_text_encoder=which_text_encoder, which_unet=which_unet)
-                images.append(images_ij)
-            images = torch.cat(images)
+            images = generate_images_no_gradient_batched(
+                prompt_i,
+                noises_i,
+                num_denoising_steps,
+                which_text_encoder=which_text_encoder,
+                which_unet=which_unet,
+                batch_size=args.val_GPU_batch_size,
+            )
             
-            face_indicators, face_bboxs, face_chips, face_landmarks, aligned_face_chips = get_face(images)
-            preds_gender, probs_gender, logits_gender = get_face_gender(face_chips, selector=face_indicators, fill_value=-1, classifier=test_gender_classifier)
-            
-            face_feats = get_face_feats(face_feats_net, aligned_face_chips)
-            _, face_real_scores = face_feats_model.semantic_search(face_feats, selector=face_indicators, return_similarity=True)
+            # --- Face detector + MobileNet classifier (evaluation only) ---
+            face_indicators, face_bboxs, face_chips = get_face(images)
+            preds_gender_mnet, probs_gender_mnet, logits_gender_mnet = get_face_gender(
+                face_chips,
+                selector=face_indicators,
+                fill_value=-1,
+            )
 
+            # --- SDS classifier on generated images (optional; can be disabled for fast eval) ---
+            attmap_gen_all = None
+            attmap_gen = None
+            if need_sds_forward:
+                preds_gender_sds, probs_gender_sds, logits_gender_sds, _, _, _, attmap_gen = sds_logits_from_images(
+                    images,
+                    tau=args.sds_tau,
+                    t_min=args.sds_t_min,
+                    t_max=args.sds_t_max,
+                    num_t=args.sds_num_t,
+                    num_eps=args.sds_num_eps,
+                    sds_text_encoder=sds_eval_text_encoder,
+                    sds_unet=which_unet,
+                    compute_realistic_sds=False,
+                    return_attmap=True,
+                )
+            preds_gender, probs_gender, logits_gender = clip_gender_classifier(
+                images,
+                clip_model=clip_model,
+                clip_processor=clip_processor,
+                text_features=gender_text_features,
+                device=accelerator.device,
+            )
             images_all = customized_all_gather(images, accelerator, return_tensor_other_processes=False)
             face_indicators_all = customized_all_gather(face_indicators, accelerator, return_tensor_other_processes=False)
             face_bboxs_all = customized_all_gather(face_bboxs, accelerator, return_tensor_other_processes=False)
             preds_gender_all = customized_all_gather(preds_gender, accelerator, return_tensor_other_processes=False)
             probs_gender_all = customized_all_gather(probs_gender, accelerator, return_tensor_other_processes=False)
-            face_real_scores = customized_all_gather(face_real_scores, accelerator, return_tensor_other_processes=False)
+            if need_sds_classifier_eval:
+                preds_gender_all_sds = customized_all_gather(preds_gender_sds, accelerator, return_tensor_other_processes=False)
+                probs_gender_all_sds = customized_all_gather(probs_gender_sds, accelerator, return_tensor_other_processes=False)
+            preds_gender_all_mnet = customized_all_gather(preds_gender_mnet, accelerator, return_tensor_other_processes=False)
+            probs_gender_all_mnet = customized_all_gather(probs_gender_mnet, accelerator, return_tensor_other_processes=False)
+            if need_attmap_eval and attmap_gen is not None:
+                attmap_gen_all = customized_all_gather(attmap_gen, accelerator, return_tensor_other_processes=False)
 
             if accelerator.is_main_process:
                 save_to = os.path.join(args.imgs_save_dir, f"eval_{name}_{global_step}_{prompt_i}_generated.jpg")
@@ -2190,24 +2749,78 @@ def main(args):
                     face_bboxs=face_bboxs_all, 
                     preds_gender=preds_gender_all, 
                     pred_class_probs_gender=probs_gender_all.max(dim=-1).values,
-                    # face_real_scores=face_real_scores
                     )
+                if enable_sds_eval:
+                    save_to = os.path.join(args.imgs_save_dir, f"eval_{name}_{global_step}_{prompt_i}_generated_sds.jpg")
+                    plot_in_grid(
+                        images_all, 
+                        save_to, 
+                        face_indicators=face_indicators_all, 
+                        face_bboxs=face_bboxs_all, 
+                        preds_gender=preds_gender_all_sds, 
+                        pred_class_probs_gender=probs_gender_all_sds.max(dim=-1).values,
+                        )
+                save_to = os.path.join(args.imgs_save_dir, f"eval_{name}_{global_step}_{prompt_i}_generated_mnet.jpg")
+                plot_in_grid(
+                    images_all,
+                    save_to,
+                    face_indicators=face_indicators_all,
+                    face_bboxs=face_bboxs_all,
+                    preds_gender=preds_gender_all_mnet,
+                    pred_class_probs_gender=probs_gender_all_mnet.max(dim=-1).values,
+                )
 
                 log_imgs_i["img_generated"] = [save_to]
+                if args.save_attmaps and attmap_gen_all is not None:
+                    att_save_dir = os.path.join(args.imgs_save_dir, "eval_attmaps")
+                    att_prefix = f"eval_{name}_{global_step}_{sanitize_filename(prompt_i)}_generated_att"
+                    save_attmaps(attmap_gen_all, att_save_dir, att_prefix)
+                    save_attmaps_with_overlay(attmap_gen_all, images_all, att_save_dir, att_prefix, alpha=0.45)
+                    att_preview = os.path.join(att_save_dir, f"{att_prefix}_0_overlay.png")
+                    if os.path.exists(att_preview):
+                        log_imgs_i["attmap_generated_overlay"] = [att_preview]
             
             if accelerator.is_main_process:
-                # mnet (MobileNet) gender gap on generated images -- identical to DAL.py
-                probs_tmp_mnet = probs_gender_all[(probs_gender_all!=-1).all(dim=-1)]
+                probs_tmp = probs_gender_all[(probs_gender_all!=-1).all(dim=-1)]
+                male_ratio = ((probs_tmp[:,1]>=0.5)*(probs_tmp[:,1]<=1)).float().mean().item()
+                female_ratio = ((probs_tmp[:,1]>=0)*(probs_tmp[:,1]<=0.5)).float().mean().item()
+                gender_gap = male_ratio - female_ratio
+                gender_pred_between_02_08 = ((probs_tmp[:,1]>=0.2)*(probs_tmp[:,1]<=0.8)).float().mean().item()
+                logs_i["gender_gap"].append(gender_gap)
+                logs_i["gender_gap_abs"].append(abs(gender_gap))
+                bias_score = args.target_male_ratio - male_ratio
+                logs_i["bias_score"].append(bias_score)
+                logs_i["bias_score_abs"].append(abs(bias_score))
+                logs_i["gender_pred_between_0.2_0.8"].append(abs(gender_pred_between_02_08))
+                if enable_sds_eval:
+                    probs_tmp = probs_gender_all_sds[(probs_gender_all_sds!=-1).all(dim=-1)]
+                    gender_gap_sds = (((probs_tmp[:,1]>=0.5)*(probs_tmp[:,1]<=1)).float().mean() - ((probs_tmp[:,1]>=0)*(probs_tmp[:,1]<=0.5)).float().mean()).item()
+                    logs_i["gender_gap_abs_sds"].append(abs(gender_gap_sds))
+                probs_tmp_mnet = probs_gender_all_mnet[(probs_gender_all_mnet!=-1).all(dim=-1)]
                 if probs_tmp_mnet.shape[0] > 0:
                     gender_gap_mnet = (
                         ((probs_tmp_mnet[:,1]>=0.5)*(probs_tmp_mnet[:,1]<=1)).float().mean()
                         - ((probs_tmp_mnet[:,1]>=0)*(probs_tmp_mnet[:,1]<=0.5)).float().mean()
                     ).item()
+                    gender_pred_between_02_08_mnet = ((probs_tmp_mnet[:,1]>=0.2)*(probs_tmp_mnet[:,1]<=0.8)).float().mean().item()
+                    logs_i["gender_gap_mnet"].append(gender_gap_mnet)
                     logs_i["gender_gap_abs_mnet"].append(abs(gender_gap_mnet))
+                    logs_i["gender_pred_between_0.2_0.8_mnet"].append(gender_pred_between_02_08_mnet)
                 else:
+                    logs_i["gender_gap_mnet"].append(np.nan)
                     logs_i["gender_gap_abs_mnet"].append(np.nan)
+                    logs_i["gender_pred_between_0.2_0.8_mnet"].append(np.nan)
+                probs_tmp_mnet_ori = probs_gender_ori_all_mnet[(probs_gender_ori_all_mnet!=-1).all(dim=-1)]
+                if probs_tmp_mnet_ori.shape[0] > 0:
+                    gender_gap_mnet_ori = (
+                        ((probs_tmp_mnet_ori[:,1]>=0.5)*(probs_tmp_mnet_ori[:,1]<=1)).float().mean()
+                        - ((probs_tmp_mnet_ori[:,1]>=0)*(probs_tmp_mnet_ori[:,1]<=0.5)).float().mean()
+                    ).item()
+                    logs_i["gender_gap_abs_mnet_ori"].append(abs(gender_gap_mnet_ori))
+                else:
+                    logs_i["gender_gap_abs_mnet_ori"].append(np.nan)
 
-                # --- similarity metrics (CLIP ViT-bigG-14 + DINOv2 vit-g/14) -- identical to DAL.py ---
+                # --- similarity metrics (CLIP ViT-bigG-14 + DINOv2 vit-g/14) ---
                 with torch.no_grad():
                     clip_feats_ori_eval = _clip_image_features_eval(images_ori_all)
                     clip_feats_gen_eval = _clip_image_features_eval(images_all)
@@ -2222,31 +2835,45 @@ def main(args):
                     clip_text_feat = _clip_text_features_eval(prompt_i)
                     clip_t_sims.extend((clip_feats_gen_eval * clip_text_feat).sum(dim=-1).detach().cpu().tolist())
 
-
+            
             if accelerator.is_main_process:
                 log_imgs.append(log_imgs_i)
                 logs.append(logs_i)
-
-            # Keep all ranks aligned prompt-by-prompt during evaluation: rank 0 does extra
-            # CPU/GPU work (image saving, eval-model metric forwards), so without this sync
-            # other ranks can run ahead into the next collective and trip the NCCL watchdog.
-            accelerator.wait_for_everyone()
         
         if accelerator.is_main_process:
-            # wandb (eval): headline mnet metric + similarity metrics + the two image grids -- identical to DAL.py
-            if logs and ("gender_gap_abs_mnet" in logs[0]):
-                _gg_mnet = float(np.nanmean(np.array([log["gender_gap_abs_mnet"] for log in logs], dtype=float)))
-                wandb_tracker.log({f"eval_{name}_gender_gap_abs_mnet": _gg_mnet}, step=current_global_step)
+            for prompt_i, logs_i in itertools.zip_longest(prompts, logs):
+                for key, values in logs_i.items():
+                    if isinstance(values, list):
+                        wandb_tracker.log({f"eval_{name}_{key}_{prompt_i}": np.mean(values)}, step=current_global_step)
+                    else:
+                        wandb_tracker.log({f"eval_{name}_{key}_{prompt_i}": values.mean().item()}, step=current_global_step)
+                
+                for key in list(logs[0].keys()):
+                    avg = np.array([log[key] for log in logs]).mean()
+                    wandb_tracker.log({f"eval_{name}_{key}": avg}, step=current_global_step)
+                    if key == "bias_score":
+                        wandb_tracker.log({"bias_score": float(avg)}, step=current_global_step)
+                    if key == "bias_score_abs":
+                        wandb_tracker.log({"bias_score_abs": float(avg)}, step=current_global_step)
 
             imgs_dict = {}
             for prompt_i, log_imgs_i in itertools.zip_longest(prompts, log_imgs):
-                for key in ("img_ori", "img_generated"):
-                    if key in log_imgs_i:
-                        imgs_dict.setdefault(key, []).append(
-                            wandb.Image(data_or_path=log_imgs_i[key][0], caption=prompt_i)
-                        )
+                for key, values in log_imgs_i.items():
+                    if key not in imgs_dict.keys():
+                        imgs_dict[key] = [wandb.Image(
+                            data_or_path=values[0],
+                            caption=prompt_i,
+                        )]
+                    else:
+                        imgs_dict[key].append(wandb.Image(
+                            data_or_path=values[0],
+                            caption=prompt_i,
+                        ))
             for key, imgs in imgs_dict.items():
-                wandb_tracker.log({f"eval_{name}_{key}": imgs}, step=current_global_step)
+                wandb_tracker.log(
+                    {f"eval_{name}_{key}": imgs},
+                    step=current_global_step
+                    ) 
 
             if len(clip_i_sims) > 0:
                 wandb_tracker.log({f"eval_{name}_Clip-I": float(np.mean(clip_i_sims))}, step=current_global_step)
@@ -2254,63 +2881,23 @@ def main(args):
                 wandb_tracker.log({f"eval_{name}_DINO_I": float(np.mean(dino_i_sims))}, step=current_global_step)
             if len(clip_t_sims) > 0:
                 wandb_tracker.log({f"eval_{name}_Clip-T": float(np.mean(clip_t_sims))}, step=current_global_step)
-
+        
         return logs, log_imgs
     
-    def apply_grad_hook_face(images, face_bboxs, face_bboxs_ori, targets, preds_gender_ori, probs_gender_ori, factor=0.1):
-        """apply gradient hook on non-face regions of the generated images
+    def gen_image_loss_weights(targets, preds_sds, factor=0.2, out_dtype=None):
         """
-        images_new = []
-        for image, face_bbox, face_bbox_ori, target, pred_gender_ori, prob_gender_ori in itertools.zip_longest(images, face_bboxs, face_bboxs_ori, targets, preds_gender_ori, probs_gender_ori):
-            if (face_bbox == -1).all():
-                images_new.append(image.unsqueeze(dim=0))
-            else:
-                img_width, img_height = image.shape[1:]
-                idx_left = max(face_bbox[0], face_bbox_ori[0], 0)
-                idx_right = min(face_bbox[2], face_bbox_ori[2], img_width)
-                idx_bottom = max(face_bbox[1], face_bbox_ori[1], 0)
-                idx_top = min(face_bbox[3], face_bbox_ori[3], img_height)
-
-                img_face = image[:,idx_bottom:idx_top,idx_left:idx_right].clone()
-                if target==-1:
-                    grad_hook = make_grad_hook(factor)
-                elif target==pred_gender_ori:
-                    grad_hook = make_grad_hook(1)
-                elif target!=pred_gender_ori:
-                    grad_hook = make_grad_hook(factor)
-                img_face.register_hook(grad_hook)
-
-                img_add = torch.zeros_like(image)
-                img_add[:,idx_bottom:idx_top,idx_left:idx_right] = img_face
-
-                mask = torch.zeros_like(image)
-                mask[:,idx_bottom:idx_top,idx_left:idx_right] = 1
-
-                image = mask*img_add + (1-mask)*image
-                images_new.append(image.unsqueeze(dim=0))
-
-        images_new = torch.cat(images_new)
-        return images_new
-    
-    def gen_dynamic_weights(face_indicators, targets, preds_gender_ori, probs_gender_ori, factor=0.2):
-        weights = []
-        for face_indicator, target, pred_gender_ori, prob_gender_ori in itertools.zip_longest(face_indicators, targets, preds_gender_ori, probs_gender_ori):
-            if (face_indicator == False).all():
-                weights.append(1)
-            else:
-                if target==-1:
-                    weights.append(factor)
-                elif target==pred_gender_ori:
-                    weights.append(1)
-                elif target!=pred_gender_ori:
-                    weights.append(factor)
-
-        weights = torch.tensor(weights, dtype=probs_gender_ori.dtype, device=probs_gender_ori.device)
+        realistic.py의 dynamic-weight 로직을 SDS 분류 기준으로 단순화:
+        - target == -1 : factor
+        - target != preds_sds : factor
+        - target == preds_sds : 1
+        """
+        if out_dtype is None:
+            out_dtype = torch.float32
+        weights = torch.ones_like(targets, dtype=out_dtype, device=targets.device)
+        valid = (targets != -1)
+        weights[~valid] = float(factor)
+        weights[valid & (preds_sds != targets)] = float(factor)
         return weights
-
-    def model_sanity_print(model, state):
-        params = [p for p in model.parameters()]
-        print(f"\t{accelerator.device}; {state};\n\t\tparam[0]: {params[0].flatten()[0].item():.8f};\tparam[0].grad: {params[0].grad.flatten()[0].item():.8f}")
 
     lr_scheduler = get_scheduler(
         args.lr_scheduler,
@@ -2335,14 +2922,29 @@ def main(args):
         accelerator.register_for_checkpointing(unet_lora_ema)
         profiler.record_model_memory("unet_lora_after_accelerator_prepare", unet_lora_layers, immediate_print=True)
         
+    def should_trigger_evaluation(current_step: int) -> bool:
+        if not load_eval_models:
+            return False
+        # Evaluate every N steps from the beginning of training.
+        if args.evaluate_every_n_iter <= 0:
+            return False
+        return current_step % args.evaluate_every_n_iter == 0
+
+    def should_enable_sds_eval(current_step: int) -> bool:
+        # Disable SDS evaluation for all eval runs.
+        return False
+
     def evaluation_step(current_step):
+        if not load_eval_models:
+            raise RuntimeError("Evaluation was requested, but eval-only models were skipped by train_only_no_eval_models.")
+        enable_sds_eval = should_enable_sds_eval(current_step)
+        eval_imgs_per_prompt = max(args.val_images_per_prompt_GPU, math.ceil(60 / max(1, accelerator.num_processes)))
         noises_val = torch.randn(
-        [len(prompts_val), args.val_images_per_prompt_GPU,4,64,64],
+        [len(prompts_val), eval_imgs_per_prompt,4,64,64],
         dtype=weight_dtype_high_precision
         ).to(accelerator.device)
-        evaluate_process(text_encoder, unet, "main", prompts_val, noises_val, current_step)
 
-        # evaluate EMA as well
+        # evaluate EMA only
         if args.train_text_encoder:
             text_encoder_lora_dict_copy = copy.deepcopy(text_encoder_lora_dict)
             load_state_dict_results = text_encoder.load_state_dict(text_encoder_lora_ema_dict, strict=False)
@@ -2353,7 +2955,7 @@ def main(args):
                 for p, p_from in itertools.zip_longest(list(unet_lora_layers.parameters()), unet_lora_ema.shadow_params):
                     p.data = p_from.data
             
-        evaluate_process(text_encoder, unet, "EMA", prompts_val, noises_val, current_step)
+        evaluate_process(text_encoder, unet, "EMA", prompts_val, noises_val, current_step, enable_sds_eval=enable_sds_eval)
         
         if args.train_text_encoder:
             load_state_dict_results = text_encoder.load_state_dict(text_encoder_lora_dict_copy, strict=False)
@@ -2407,6 +3009,9 @@ def main(args):
     progress_bar.set_description("Steps")
     wandb_tracker = accelerator.get_tracker("wandb", unwrap=True)
 
+    if args.eval_at_step0 and global_step == 0 and should_trigger_evaluation(global_step):
+        evaluation_step(0)
+
     for epoch in range(first_epoch, args.num_train_epochs):
         for step, data_idx in enumerate(train_dataloader_idxs[epoch]):            
             
@@ -2436,332 +3041,377 @@ def main(args):
 
                 accelerator.wait_for_everyone()
                 optimizer.zero_grad()
-            # logs = []
-            # log_imgs = []
+            profile_meta["prompt"] = prompt_i
 
-            # print noise to check if they are different by device
-            with profiler.capture("noise_all_gather_and_print", events=profile_events, enabled=profile_this_step, **profile_meta):
-                noises_i_all = [noises_i.detach().clone() for i in range(accelerator.num_processes)]
-                torch.distributed.all_gather(noises_i_all, noises_i)
-            if accelerator.is_main_process:
-                now = datetime.now(my_timezone)
-                accelerator.print(
-                    f"{now.strftime('%Y/%m/%d - %H:%M:%S')} --- epoch: {epoch}, step: {step}, prompt: {prompt_i}\n" +
-                    " ".join([f"\tprocess idx: {idx}; noise: {noises_i_all[idx].flatten()[-1].item():.4f};" for idx in range(len(noises_i_all))])
-                    )
-            
             if accelerator.is_main_process:
                 logs_i = {
-                    "loss_fair": [],
-                    "loss_face": [],
-                    "loss_CLIP": [],
-                    "loss_DINO": [],
+                    "loss_align": [],
+                    "loss_realistic": [],
+                    "loss_image": [],
                     "loss": [],
                     "gender_gap": [],
                     "gender_gap_abs": [],
                     "gender_pred_between_0.2_0.8": [],
+                    "bias_score": [],
+                    "bias_score_abs": [],
                 }
                 log_imgs_i = {}
 
             with profiler.capture("sample_and_broadcast_num_denoising_steps", events=profile_events, enabled=profile_this_step, **profile_meta):
                 num_denoising_steps = random.choices(range(19,24), k=1)
-                torch.distributed.broadcast_object_list(num_denoising_steps, src=0)
+                if accelerator.num_processes > 1:
+                    torch.distributed.broadcast_object_list(num_denoising_steps, src=0)
                 num_denoising_steps = num_denoising_steps[0]
+            should_plot_train = args.train_plot_every_n_iter > 0 and step % args.train_plot_every_n_iter == 0
 
             with torch.no_grad():
                 ################################################
-                # step 1: generate all images using the diffusion model being finetuned
-                with profiler.capture("batch_image_generation_no_grad", events=profile_events, enabled=profile_this_step, prompt=prompt_i, images_per_prompt=noises_i.shape[0], generation_batch_size=args.val_GPU_batch_size, **profile_meta):
-                    images = []
-                    N = math.ceil(noises_i.shape[0] / args.val_GPU_batch_size)
-                    for j in range(N):
-                        noises_ij = noises_i[args.val_GPU_batch_size*j:args.val_GPU_batch_size*(j+1)]
-                        images_ij = generate_image_no_gradient(prompt_i, noises_ij, num_denoising_steps, which_text_encoder=text_encoder, which_unet=unet)
-                        images.append(images_ij)
-                    images = torch.cat(images)
+                # Step 1: generate full-step images for dynamic target assignment.
+                with profiler.capture("target_full_image_generation_no_grad", events=profile_events, enabled=profile_this_step, **profile_meta):
+                    images_target = generate_images_no_gradient_batched(
+                        prompt_i,
+                        noises_i,
+                        num_denoising_steps,
+                        which_text_encoder=text_encoder,
+                        which_unet=unet,
+                        batch_size=args.val_GPU_batch_size,
+                        skip_final_steps=args.dynamic_target_skip_final_steps,
+                        skip_final_steps_pct=args.dynamic_target_skip_final_steps_pct,
+                    )
 
-                with profiler.capture("face_detect_generated_batch", events=profile_events, enabled=profile_this_step, prompt=prompt_i, batch_size=images.shape[0], **profile_meta):
-                    face_indicators, face_bboxs, face_chips, face_landmarks, aligned_face_chips = get_face(images)
-                with profiler.capture("mobilenet_generated_batch", events=profile_events, enabled=profile_this_step, prompt=prompt_i, batch_size=face_chips.shape[0], **profile_meta):
-                    preds_gender, probs_gender, logits_gender = get_face_gender(face_chips, selector=face_indicators, fill_value=-1)
+                with profiler.capture("sds_dynamic_target_logits_no_grad", events=profile_events, enabled=profile_this_step, **profile_meta):
+                    sds_train_text_encoder = eval_text_encoder if args.train_text_encoder else text_encoder
+                    preds_gender_sds, probs_gender_sds, logits_gender_sds, _, _, _ = sds_logits_from_images(
+                        images_target,
+                        tau=args.sds_tau,
+                        t_min=args.sds_t_min,
+                        t_max=args.sds_t_max,
+                        num_t=args.sds_num_t,
+                        num_eps=args.sds_num_eps,
+                        sds_text_encoder=sds_train_text_encoder,
+                        sds_unet=unet,
+                        compute_realistic_sds=False,
+                    )
 
+                with profiler.capture("gather_plot_target_skip_and_metrics", events=profile_events, enabled=profile_this_step, **profile_meta):
+                    probs_gender_all_sds = customized_all_gather(probs_gender_sds, accelerator, return_tensor_other_processes=False)
+                    if should_plot_train:
+                        images_target_all = customized_all_gather(images_target, accelerator, return_tensor_other_processes=False)
+                        preds_gender_all_sds = customized_all_gather(preds_gender_sds, accelerator, return_tensor_other_processes=False)
+                        if accelerator.is_main_process:
+                            save_to = os.path.join(args.imgs_save_dir, f"train-{global_step}_target_skip_sds.jpg")
+                            plot_in_grid(
+                                images_target_all,
+                                save_to,
+                                preds_gender=preds_gender_all_sds,
+                                pred_class_probs_gender=probs_gender_all_sds.max(dim=-1).values,
+                            )
+                            log_imgs_i["img_target_skip"] = [save_to]
 
-                with profiler.capture("face_feature_generated_batch", events=profile_events, enabled=profile_this_step, prompt=prompt_i, batch_size=aligned_face_chips.shape[0], **profile_meta):
-                    face_feats = torch.ones([aligned_face_chips.shape[0],512], dtype=weight_dtype_high_precision, device=aligned_face_chips.device) * (-1)
-                    if sum(face_indicators)>0:
-                        face_feats_ = get_face_feats(face_feats_net, aligned_face_chips[face_indicators])
-                        face_feats[face_indicators] = face_feats_
-
-                    _, face_real_scores = face_feats_model.semantic_search(face_feats, selector=face_indicators, return_similarity=True)
-
-                with profiler.capture("gather_plot_generated_batch", events=profile_events, enabled=profile_this_step, prompt=prompt_i, **profile_meta):
-                    face_indicators_all, face_indicators_others = customized_all_gather(face_indicators, accelerator, return_tensor_other_processes=True)
-                    accelerator.print(f"\tNum faces detected: {face_indicators_all.sum().item()}/{face_indicators_all.shape[0]}.")
-
-                    images_all = customized_all_gather(images, accelerator, return_tensor_other_processes=False)
-                    face_bboxs_all = customized_all_gather(face_bboxs, accelerator, return_tensor_other_processes=False)
-                    preds_gender_all = customized_all_gather(preds_gender, accelerator, return_tensor_other_processes=False)
-                    probs_gender_all = customized_all_gather(probs_gender, accelerator, return_tensor_other_processes=False)
-                    face_real_scores_all = customized_all_gather(face_real_scores, accelerator, return_tensor_other_processes=False)
                     if accelerator.is_main_process:
-                        if step % args.train_plot_every_n_iter == 0:
-                            save_to = os.path.join(args.imgs_save_dir, f"train-{global_step}_generated.jpg")
-                            plot_in_grid(images_all, save_to, face_indicators=face_indicators_all, face_bboxs=face_bboxs_all, preds_gender=preds_gender_all, pred_class_probs_gender=probs_gender_all.max(dim=-1).values)
-
-                            log_imgs_i["img_generated"] = [save_to]
-
-                    if accelerator.is_main_process:
-                        probs_tmp = probs_gender_all[(probs_gender_all!=-1).all(dim=-1)]
-                        gender_gap = (((probs_tmp[:,1]>=0.5)*(probs_tmp[:,1]<=1)).float().mean() - ((probs_tmp[:,1]>=0)*(probs_tmp[:,1]<=0.5)).float().mean()).item()
+                        probs_tmp = probs_gender_all_sds[(probs_gender_all_sds!=-1).all(dim=-1)]
+                        male_ratio = ((probs_tmp[:,1]>=0.5)*(probs_tmp[:,1]<=1)).float().mean().item()
+                        female_ratio = ((probs_tmp[:,1]>=0)*(probs_tmp[:,1]<=0.5)).float().mean().item()
+                        gender_gap = male_ratio - female_ratio
                         gender_pred_between_02_08 = ((probs_tmp[:,1]>=0.2)*(probs_tmp[:,1]<=0.8)).float().mean().item()
                         logs_i["gender_gap"].append(gender_gap)
                         logs_i["gender_gap_abs"].append(abs(gender_gap))
+                        bias_score = args.target_male_ratio - male_ratio
+                        logs_i["bias_score"].append(bias_score)
+                        logs_i["bias_score_abs"].append(abs(bias_score))
                         logs_i["gender_pred_between_0.2_0.8"].append(gender_pred_between_02_08)
 
                 ################################################
-                # Step 2: generate dynamic targets 
-                # also broadcast from process idx 0, just in case targets_all computed might be different on different processes
-                with profiler.capture("dynamic_target_allocation", events=profile_events, enabled=profile_this_step, prompt=prompt_i, **profile_meta):
-                    targets_all, uncertainty_all = generate_dynamic_targets(probs_gender_all, w_uncertainty=True)
-                    torch.distributed.broadcast(targets_all, src=0)
-                    torch.distributed.broadcast(uncertainty_all, src=0)
+                # Step 2: generate dynamic targets from the full-step SDS probabilities.
+                with profiler.capture("dynamic_target_allocation", events=profile_events, enabled=profile_this_step, **profile_meta):
+                    targets_all, uncertainty_all = generate_dynamic_targets(
+                        probs_gender_all_sds,
+                        target_male_ratio=args.target_male_ratio,
+                        w_uncertainty=True,
+                    )
+                    if accelerator.num_processes > 1:
+                        torch.distributed.broadcast(targets_all, src=0)
+                        torch.distributed.broadcast(uncertainty_all, src=0)
 
                     targets_all[uncertainty_all>args.uncertainty_threshold] = -1
-                    targets = targets_all[probs_gender.shape[0]*(accelerator.local_process_index):probs_gender.shape[0]*(accelerator.local_process_index+1)]
-                    uncertainty = uncertainty_all[probs_gender.shape[0]*(accelerator.local_process_index):probs_gender.shape[0]*(accelerator.local_process_index+1)]
-                    accelerator.print(f"\tNum faces to compute grads: {(targets_all!=-1).sum().item()}/{targets_all.shape[0]}")
+                    local_batch_size = images_target.shape[0]
+                    local_start = local_batch_size * accelerator.local_process_index
+                    local_end = local_batch_size * (accelerator.local_process_index + 1)
+                    targets = targets_all[local_start:local_end]
+                    accelerator.print(f"\tNum samples to compute grads: {(targets_all!=-1).sum().item()}/{targets_all.shape[0]}")
 
                 ################################################
-                # Step 3: generate all original images using the original diffusion model
-                # note that only targets from above will be used to compute loss
-                # all other variables will not be used below
-                with profiler.capture("original_image_generation_no_grad", events=profile_events, enabled=profile_this_step, prompt=prompt_i, images_per_prompt=noises_i.shape[0], generation_batch_size=args.val_GPU_batch_size, **profile_meta):
-                    images_ori = []
-                    N = math.ceil(noises_i.shape[0] / args.val_GPU_batch_size)
-                    for j in range(N):
-                        noises_ij = noises_i[args.val_GPU_batch_size*j:args.val_GPU_batch_size*(j+1)]
-                        if args.train_text_encoder and args.train_unet:
-                            images_ij = generate_image_no_gradient(prompt_i, noises_ij, num_denoising_steps, which_text_encoder=eval_text_encoder, which_unet=eval_unet)
-                        elif args.train_text_encoder and not args.train_unet:
-                            images_ij = generate_image_no_gradient(prompt_i, noises_ij, num_denoising_steps, which_text_encoder=eval_text_encoder, which_unet=unet)
-                        elif not args.train_text_encoder and args.train_unet:
-                            images_ij = generate_image_no_gradient(prompt_i, noises_ij, num_denoising_steps, which_text_encoder=text_encoder, which_unet=eval_unet)
-                        images_ori.append(images_ij)
-                    images_ori = torch.cat(images_ori)
+                # Step 3: generate original images for the image-preservation loss.
+                with profiler.capture("original_image_generation_no_grad", events=profile_events, enabled=profile_this_step, **profile_meta):
+                    original_text_encoder, original_unet = get_original_components()
+                    images_ori = generate_images_no_gradient_batched(
+                        prompt_i,
+                        noises_i,
+                        num_denoising_steps,
+                        which_text_encoder=original_text_encoder,
+                        which_unet=original_unet,
+                        batch_size=args.val_GPU_batch_size,
+                        skip_final_steps=args.skip_final_steps,
+                        skip_final_steps_pct=args.skip_final_steps_pct,
+                    )
 
-                with profiler.capture("face_detect_original_batch", events=profile_events, enabled=profile_this_step, prompt=prompt_i, batch_size=images_ori.shape[0], **profile_meta):
-                    face_indicators_ori, face_bboxs_ori, face_chips_ori, face_landmarks_ori, aligned_face_chips_ori = get_face(images_ori)
-                with profiler.capture("mobilenet_original_batch", events=profile_events, enabled=profile_this_step, prompt=prompt_i, batch_size=face_chips_ori.shape[0], **profile_meta):
-                    preds_gender_ori, probs_gender_ori, logits_gender_ori = get_face_gender(face_chips_ori, selector=face_indicators_ori, fill_value=-1)
-
-                with profiler.capture("resize_original_images", events=profile_events, enabled=profile_this_step, prompt=prompt_i, batch_size=images_ori.shape[0], **profile_meta):
+                # embeddings for preservation losses
+                with profiler.capture("resize_original_images", events=profile_events, enabled=profile_this_step, **profile_meta):
                     images_small_ori = transforms.Resize(args.img_size_small)(images_ori)
-                with profiler.capture("clip_features_original_batch", events=profile_events, enabled=profile_this_step, prompt=prompt_i, batch_size=images_small_ori.shape[0], **profile_meta):
+                with profiler.capture("clip_features_original_batch", events=profile_events, enabled=profile_this_step, **profile_meta):
                     clip_feats_ori = get_clip_feat(images_small_ori, normalize=True, to_high_precision=True)
-                with profiler.capture("dino_features_original_batch", events=profile_events, enabled=profile_this_step, prompt=prompt_i, batch_size=images_small_ori.shape[0], **profile_meta):
-                    DINO_feats_ori = get_dino_feat(images_small_ori, normalize=True, to_high_precision=True)
 
-                with profiler.capture("gather_plot_original_batch", events=profile_events, enabled=profile_this_step, prompt=prompt_i, **profile_meta):
-                    images_ori_all = customized_all_gather(images_ori, accelerator, return_tensor_other_processes=False)
-                    face_indicators_ori_all = customized_all_gather(face_indicators_ori, accelerator, return_tensor_other_processes=False)
-                    face_bboxs_ori_all = customized_all_gather(face_bboxs_ori, accelerator, return_tensor_other_processes=False)
-                    preds_gender_ori_all = customized_all_gather(preds_gender_ori, accelerator, return_tensor_other_processes=False)
-                    probs_gender_ori_all = customized_all_gather(probs_gender_ori, accelerator, return_tensor_other_processes=False)
-
-                    if accelerator.is_main_process:
-                        if step % args.train_plot_every_n_iter == 0:
+                with profiler.capture("gather_plot_original_batch", events=profile_events, enabled=profile_this_step, **profile_meta):
+                    if should_plot_train:
+                        images_ori_all = customized_all_gather(images_ori, accelerator, return_tensor_other_processes=False)
+                        if accelerator.is_main_process:
                             save_to = os.path.join(args.imgs_save_dir, f"train-{global_step}_ori.jpg")
-                            plot_in_grid(images_ori_all, save_to, face_indicators=face_indicators_ori_all, face_bboxs=face_bboxs_ori_all, preds_gender=preds_gender_ori_all, pred_class_probs_gender=probs_gender_ori_all.max(dim=-1).values)
-
+                            plot_in_grid(images_ori_all, save_to)
                             log_imgs_i["img_ori"] = [save_to]
-
-                with profiler.capture("face_features_original_batch", events=profile_events, enabled=profile_this_step, prompt=prompt_i, batch_size=aligned_face_chips_ori.shape[0], **profile_meta):
-                    face_feats_ori = get_face_feats(face_feats_net, aligned_face_chips_ori)
             
             ################################################
             # Step 4: compute loss
-            with profiler.capture("init_loss_buffers", events=profile_events, enabled=profile_this_step, prompt=prompt_i, **profile_meta):
-                loss_fair_i = torch.ones(targets.shape, dtype=weight_dtype, device=accelerator.device) *(-1)
-                loss_face_i = torch.ones(targets.shape, dtype=weight_dtype, device=accelerator.device) *(-1)
-                loss_CLIP_i = torch.ones(targets.shape, dtype=weight_dtype, device=accelerator.device) *(-1)
-                loss_DINO_i = torch.ones(targets.shape, dtype=weight_dtype, device=accelerator.device) *(-1)
+            with profiler.capture("init_loss_buffers", events=profile_events, enabled=profile_this_step, **profile_meta):
+                loss_align_i = torch.ones(targets.shape, dtype=weight_dtype, device=accelerator.device) *(-1)
+                loss_realistic_i = torch.ones(targets.shape, dtype=weight_dtype, device=accelerator.device) *(-1)
+                loss_image_i = torch.ones(targets.shape, dtype=weight_dtype, device=accelerator.device) *(-1)
                 loss_i = torch.ones(targets.shape, dtype=weight_dtype, device=accelerator.device) *(-1)
-
-                idxs_i = list(range(targets.shape[0]))
-                N_backward = math.ceil(targets.shape[0] / args.train_GPU_batch_size)
+            
+            idxs_i = list(range(targets.shape[0]))
+            N_backward = math.ceil(targets.shape[0] / args.train_GPU_batch_size)
             for j in range(N_backward):
                 idxs_ij = idxs_i[j*args.train_GPU_batch_size:(j+1)*args.train_GPU_batch_size]
                 noises_ij = noises_i[idxs_ij]
                 targets_ij = targets[idxs_ij]
                 clip_feats_ori_ij = clip_feats_ori[idxs_ij]
-                DINO_feats_ori_ij = DINO_feats_ori[idxs_ij]
-                preds_gender_ori_ij = preds_gender_ori[idxs_ij]
-                probs_gender_ori_ij = probs_gender_ori[idxs_ij]
-                face_bboxs_ori_ij = face_bboxs_ori[idxs_ij]
-                face_feats_ori_ij = face_feats_ori[idxs_ij]
                 backward_meta = {
                     **profile_meta,
-                    "prompt": prompt_i,
                     "backward_batch_index": j,
                     "backward_num_batches": N_backward,
                     "backward_batch_size": len(idxs_ij),
                 }
                 
                 with profiler.capture(f"backward_{j}_gradient_image_generation", events=profile_events, enabled=profile_this_step, **backward_meta):
-                    images_ij = generate_image_w_gradient(prompt_i, noises_ij, num_denoising_steps, which_text_encoder=text_encoder, which_unet=unet)
-                with profiler.capture(f"backward_{j}_face_detect_gradient_images", events=profile_events, enabled=profile_this_step, **backward_meta):
-                    face_indicators_ij, face_bboxs_ij, face_chips_ij, face_landmarks_ij, aligned_face_chips_ij = get_face(images_ij)
-                with profiler.capture(f"backward_{j}_mobilenet_gradient_images", events=profile_events, enabled=profile_this_step, **backward_meta):
-                    preds_gender_ij, probs_gender_ij, logits_gender_ij = get_face_gender(face_chips_ij, selector=face_indicators_ij, fill_value=-1)
+                    images_ij, _att_ij = generate_image_w_gradient(
+                        prompt_i,
+                        noises_ij,
+                        num_denoising_steps,
+                        which_text_encoder=text_encoder,
+                        which_unet=unet,
+                        skip_final_steps=args.skip_final_steps,
+                        skip_final_steps_pct=args.skip_final_steps_pct,
+                    )
 
-                with profiler.capture(f"backward_{j}_apply_face_gradient_hooks", events=profile_events, enabled=profile_this_step, **backward_meta):
-                    images_ij = apply_grad_hook_face(images_ij, face_bboxs_ij, face_bboxs_ori_ij, targets_ij, preds_gender_ori_ij, probs_gender_ori_ij, factor=args.factor2)
+                # --- SDS classifier WITH gradient + region hard mask ---
+                with profiler.capture(f"backward_{j}_sds_logits_realistic", events=profile_events, enabled=profile_this_step, **backward_meta):
+                    preds_gender_ij, probs_gender_ij, logits_gender_ij, _, _, sds_realistic_ij = sds_logits_from_images(
+                        images_ij,
+                        tau=args.sds_tau,
+                        t_min=args.sds_t_min,
+                        t_max=args.sds_t_max,
+                        num_t=args.sds_num_t,
+                        num_eps=args.sds_num_eps,
+                        sds_text_encoder=sds_train_text_encoder,
+                        sds_unet=unet,
+                        compute_realistic_sds=True,
+                    )
+
                 with profiler.capture(f"backward_{j}_resize_gradient_images", events=profile_events, enabled=profile_this_step, **backward_meta):
                     images_small_ij = transforms.Resize(args.img_size_small)(images_ij)
                 with profiler.capture(f"backward_{j}_clip_features_gradient_images", events=profile_events, enabled=profile_this_step, **backward_meta):
                     clip_feats_ij = get_clip_feat(images_small_ij, normalize=True, to_high_precision=True)
-                with profiler.capture(f"backward_{j}_dino_features_gradient_images", events=profile_events, enabled=profile_this_step, **backward_meta):
-                    DINO_feats_ij = get_dino_feat(images_small_ij, normalize=True, to_high_precision=True)
-
-                with profiler.capture(f"backward_{j}_clip_dino_loss", events=profile_events, enabled=profile_this_step, **backward_meta):
-                    loss_CLIP_ij = - (clip_feats_ij * clip_feats_ori_ij).sum(dim=-1) + 1
-                    loss_DINO_ij = - (DINO_feats_ij * DINO_feats_ori_ij).sum(dim=-1) + 1
-
-                with profiler.capture(f"backward_{j}_fairness_loss", events=profile_events, enabled=profile_this_step, **backward_meta):
-                    loss_fair_ij = torch.ones(len(idxs_ij), dtype=weight_dtype, device=accelerator.device) *(-1)
-                    idxs_w_face_loss = ((face_indicators_ij == True) * (targets_ij != -1)).nonzero().view([-1])
-                    loss_fair_ij_w_face_loss = CE_loss(logits_gender_ij[idxs_w_face_loss], targets_ij[idxs_w_face_loss])
-                    loss_fair_ij[idxs_w_face_loss] = loss_fair_ij_w_face_loss
+                with profiler.capture(f"backward_{j}_image_loss", events=profile_events, enabled=profile_this_step, **backward_meta):
+                    loss_image_ij = - (clip_feats_ij * clip_feats_ori_ij).sum(dim=-1) + 1
                 
-                loss_face_ij = torch.ones(len(idxs_ij), dtype=weight_dtype, device=accelerator.device) *(-1)
+                with profiler.capture(f"backward_{j}_align_loss", events=profile_events, enabled=profile_this_step, **backward_meta):
+                    loss_align_log_ij = torch.ones(len(idxs_ij), dtype=weight_dtype, device=accelerator.device) *(-1)
+                    loss_align_backward_ij = torch.zeros(len(idxs_ij), dtype=weight_dtype, device=accelerator.device)
+                    idxs_valid = (targets_ij != -1).nonzero().view([-1])
+                    if idxs_valid.numel() > 0:
+                        loss_align_valid = CE_loss(logits_gender_ij[idxs_valid].float(), targets_ij[idxs_valid])
+                        loss_align_log_ij[idxs_valid] = loss_align_valid.to(weight_dtype)
+                        loss_align_backward_ij[idxs_valid] = loss_align_valid.to(weight_dtype)
 
-                idxs_w_face_feats_from_ori = ((face_indicators_ij==True) * (targets_ij!=-1) * (targets_ij==preds_gender_ori_ij) * (probs_gender_ori_ij.max(dim=-1).values>=args.face_gender_confidence_level)).nonzero().view([-1]).tolist()
-                with profiler.capture(f"backward_{j}_face_feature_loss_from_original", events=profile_events, enabled=profile_this_step, matched_faces=len(idxs_w_face_feats_from_ori), **backward_meta):
-                    if len(idxs_w_face_feats_from_ori)>0:
-                        face_feats_1 = get_face_feats(face_feats_net, aligned_face_chips_ij[idxs_w_face_feats_from_ori])
-                        face_feats_target_1 = face_feats_ori_ij[idxs_w_face_feats_from_ori]
-                        loss_face_ij[idxs_w_face_feats_from_ori] = (1 - (face_feats_1*face_feats_target_1).sum(dim=-1)).to(loss_face_ij.dtype)
-                
-                idxs_w_face_feats_from_search = list(set(((face_indicators_ij==True) * (targets_ij!=-1) ).nonzero().view([-1]).tolist()) - set(idxs_w_face_feats_from_ori))
-                with profiler.capture(f"backward_{j}_face_feature_loss_from_search", events=profile_events, enabled=profile_this_step, searched_faces=len(idxs_w_face_feats_from_search), **backward_meta):
-                    if len(idxs_w_face_feats_from_search)>0:
-                        face_feats_2 = get_face_feats(face_feats_net, aligned_face_chips_ij[idxs_w_face_feats_from_search])
-                        face_feats_target_2 = face_feats_model.semantic_search(face_feats_2, face_indicators_ij[idxs_w_face_feats_from_search])
-                        loss_face_ij[idxs_w_face_feats_from_search] = (1 - (face_feats_2*face_feats_target_2).sum(dim=-1)).to(loss_face_ij.dtype)
+                with profiler.capture(f"backward_{j}_realistic_loss", events=profile_events, enabled=profile_this_step, **backward_meta):
+                    if sds_realistic_ij is None:
+                        loss_realistic_ij = torch.zeros(len(idxs_ij), dtype=weight_dtype, device=accelerator.device)
+                    else:
+                        loss_realistic_ij = sds_realistic_ij.to(weight_dtype)
 
-                with profiler.capture(f"backward_{j}_dynamic_weights_and_total_loss", events=profile_events, enabled=profile_this_step, **backward_meta):
-                    dynamic_weights = gen_dynamic_weights(face_indicators_ij, targets_ij, preds_gender_ori_ij, probs_gender_ori_ij, factor=args.factor1)
-                    loss_ij = loss_fair_ij + args.weight_loss_img * dynamic_weights * (loss_CLIP_ij + loss_DINO_ij) + args.weight_loss_face * loss_face_ij
+                with profiler.capture(f"backward_{j}_weights_and_total_loss", events=profile_events, enabled=profile_this_step, **backward_meta):
+                    image_loss_weights = gen_image_loss_weights(
+                        targets_ij,
+                        preds_gender_ij,
+                        factor=args.factor1,
+                        out_dtype=loss_image_ij.dtype,
+                    )
+                    loss_ij = (
+                        args.weight_loss_align * loss_align_backward_ij
+                        + args.weight_loss_img * image_loss_weights * loss_image_ij
+                        + args.weight_loss_realistic * loss_realistic_ij
+                    )
                 with profiler.capture(f"backward_{j}_accelerator_backward", events=profile_events, enabled=profile_this_step, **backward_meta):
                     accelerator.backward(loss_ij.mean())
 
                 with profiler.capture(f"backward_{j}_copy_loss_buffers", events=profile_events, enabled=profile_this_step, **backward_meta):
                     with torch.no_grad():
-                        loss_fair_i[idxs_ij] = loss_fair_ij.to(loss_fair_i.dtype)
-                        loss_face_i[idxs_ij] = loss_face_ij.to(loss_face_i.dtype)
-                        loss_CLIP_i[idxs_ij] = loss_CLIP_ij.to(loss_CLIP_i.dtype)
-                        loss_DINO_i[idxs_ij] = loss_DINO_ij.to(loss_DINO_i.dtype)
+                        loss_align_i[idxs_ij] = loss_align_log_ij.to(loss_align_i.dtype)
+                        loss_realistic_i[idxs_ij] = loss_realistic_ij.to(loss_realistic_i.dtype)
+                        loss_image_i[idxs_ij] = loss_image_ij.to(loss_image_i.dtype)
                         loss_i[idxs_ij] = loss_ij.to(loss_i.dtype)
                     
             # for logging purpose, gather all losses to main_process
-            with profiler.capture("loss_all_gather", events=profile_events, enabled=profile_this_step, prompt=prompt_i, **profile_meta):
+            with profiler.capture("loss_all_gather", events=profile_events, enabled=profile_this_step, **profile_meta):
                 accelerator.wait_for_everyone()
-                loss_fair_all = customized_all_gather(loss_fair_i, accelerator)
-                loss_face_all = customized_all_gather(loss_face_i, accelerator)
-                loss_CLIP_all = customized_all_gather(loss_CLIP_i, accelerator)
-                loss_DINO_all = customized_all_gather(loss_DINO_i, accelerator)
+                loss_align_all = customized_all_gather(loss_align_i, accelerator)
+                loss_realistic_all = customized_all_gather(loss_realistic_i, accelerator)
+                loss_image_all = customized_all_gather(loss_image_i, accelerator)
                 loss_all = customized_all_gather(loss_i, accelerator)
 
-                loss_all = loss_all[loss_fair_all!=-1]
-                loss_fair_all = loss_fair_all[loss_fair_all!=-1]
-                loss_face_all = loss_face_all[loss_face_all!=-1]
-
-            if accelerator.is_main_process:
-                logs_i["loss_fair"].append(loss_fair_all)
-                logs_i["loss_face"].append(loss_face_all)
-                logs_i["loss_CLIP"].append(loss_CLIP_all)
-                logs_i["loss_DINO"].append(loss_DINO_all)
-                logs_i["loss"].append(loss_all)
+                if accelerator.is_main_process:
+                    loss_align_valid_all = loss_align_all[loss_align_all != -1]
+                    if loss_align_valid_all.numel() > 0:
+                        logs_i["loss_align"].append(loss_align_valid_all)
+                    logs_i["loss_realistic"].append(loss_realistic_all)
+                    logs_i["loss_image"].append(loss_image_all)
+                    logs_i["loss"].append(loss_all)
             
             # process logs
-            with profiler.capture("process_train_logs", events=profile_events, enabled=profile_this_step, prompt=prompt_i, **profile_meta):
+            with profiler.capture("process_train_logs", events=profile_events, enabled=profile_this_step, **profile_meta):
                 if accelerator.is_main_process:
-                    for key in ["loss_fair", "loss_face", "loss_CLIP", "loss_DINO", "loss"]:
+                    for key in ["loss_align", "loss_realistic", "loss_image", "loss"]:
                         if logs_i[key] == []:
                             logs_i.pop(key)
                         else:
                             logs_i[key] = torch.cat(logs_i[key])
-                    for key in ["gender_gap", "gender_gap_abs", "gender_pred_between_0.2_0.8"]:
+                    for key in ["gender_gap", "gender_gap_abs", "gender_pred_between_0.2_0.8", "bias_score", "bias_score_abs"]:
                         if logs_i[key] == []:
                             logs_i.pop(key)
 
             ##########################################################################
             # log process for training
-            with profiler.capture("wandb_train_logging", events=profile_events, enabled=profile_this_step, prompt=prompt_i, **profile_meta):
+            with profiler.capture("wandb_train_logging", events=profile_events, enabled=profile_this_step, **profile_meta):
                 if accelerator.is_main_process:
-                    # only upload per-step losses to wandb; grids are saved to disk only
                     for key, values in logs_i.items():
-                        if not key.startswith("loss"):
-                            continue
                         if isinstance(values, list):
                             wandb_tracker.log({f"train_{key}": np.mean(values)}, step=global_step)
                         else:
                             wandb_tracker.log({f"train_{key}": values.mean().item()}, step=global_step)
+                    if "bias_score" in logs_i:
+                        wandb_tracker.log({"bias_score": float(np.mean(logs_i["bias_score"]))}, step=global_step)
+                    if "bias_score_abs" in logs_i:
+                        wandb_tracker.log({"bias_score_abs": float(np.mean(logs_i["bias_score_abs"]))}, step=global_step)
+
+                    for key, values in log_imgs_i.items():
+                        wandb_tracker.log({f"train_{key}":wandb.Image(
+                                data_or_path=values[0],
+                                caption=prompt_i,
+                            )
+                            },
+                            step=global_step
+                            )
 
             if args.train_text_encoder:
-                model_sanity_print(text_encoder_lora_model, "check No.1, text_encoder: after accelerator.backward()")
-                profiler.record_model_memory("text_encoder_lora_grads_after_backward", text_encoder_lora_model, events=profile_events, enabled=profile_this_step, category="gradient_memory", prompt=prompt_i, **profile_meta)
+                profiler.record_model_memory(
+                    "text_encoder_lora_grads_after_backward",
+                    text_encoder_lora_model,
+                    events=profile_events,
+                    enabled=profile_this_step,
+                    category="gradient_memory",
+                    **profile_meta,
+                )
             if args.train_unet:
-                model_sanity_print(unet_lora_layers, "check No.1, unet: after accelerator.backward()")
-                profiler.record_model_memory("unet_lora_grads_after_backward", unet_lora_layers, events=profile_events, enabled=profile_this_step, category="gradient_memory", prompt=prompt_i, **profile_meta)
+                profiler.record_model_memory(
+                    "unet_lora_grads_after_backward",
+                    unet_lora_layers,
+                    events=profile_events,
+                    enabled=profile_this_step,
+                    category="gradient_memory",
+                    **profile_meta,
+                )
 
             # note that up till now grads are not synced
-            # we mannually sync grads
-            # accelerator.wait_for_everyone()
+            # we manually sync grads
             grad_is_finite = True
             with torch.no_grad():
                 if args.train_text_encoder:
-                    with profiler.capture("grad_allreduce_text_encoder_lora", events=profile_events, enabled=profile_this_step, prompt=prompt_i, **profile_meta):
+                    with profiler.capture("grad_allreduce_text_encoder_lora", events=profile_events, enabled=profile_this_step, **profile_meta):
                         for p in text_encoder_lora_model.parameters():
+                            if p.grad is None:
+                                grad_is_finite = False
+                                continue
                             if not torch.isfinite(p.grad).all():
                                 grad_is_finite = False
-                            torch.distributed.all_reduce(p.grad, torch.distributed.ReduceOp.SUM)
+                            if accelerator.num_processes > 1:
+                                torch.distributed.all_reduce(p.grad, torch.distributed.ReduceOp.SUM)
                             p.grad = p.grad / accelerator.num_processes / N_backward
+                    profiler.record_model_memory(
+                        "text_encoder_lora_grads_after_allreduce",
+                        text_encoder_lora_model,
+                        events=profile_events,
+                        enabled=profile_this_step,
+                        category="gradient_memory",
+                        **profile_meta,
+                    )
                 if args.train_unet:
-                    with profiler.capture("grad_allreduce_unet_lora", events=profile_events, enabled=profile_this_step, prompt=prompt_i, **profile_meta):
+                    with profiler.capture("grad_allreduce_unet_lora", events=profile_events, enabled=profile_this_step, **profile_meta):
                         for p in unet_lora_layers.parameters():
+                            if p.grad is None:
+                                grad_is_finite = False
+                                continue
                             if not torch.isfinite(p.grad).all():
                                 grad_is_finite = False
-                            torch.distributed.all_reduce(p.grad, torch.distributed.ReduceOp.SUM)
+                            if accelerator.num_processes > 1:
+                                torch.distributed.all_reduce(p.grad, torch.distributed.ReduceOp.SUM)
                             p.grad = p.grad / accelerator.num_processes / N_backward
-                
-            if args.train_text_encoder:
-                model_sanity_print(text_encoder_lora_model, "check No.2, text_encoder: after gradients allreduce & average")
-                profiler.record_model_memory("text_encoder_lora_grads_after_allreduce", text_encoder_lora_model, events=profile_events, enabled=profile_this_step, category="gradient_memory", prompt=prompt_i, **profile_meta)
-            if args.train_unet:
-                model_sanity_print(unet_lora_layers, "check No.2, unet: after gradients allreduce & average")
-                profiler.record_model_memory("unet_lora_grads_after_allreduce", unet_lora_layers, events=profile_events, enabled=profile_this_step, category="gradient_memory", prompt=prompt_i, **profile_meta)
+                    profiler.record_model_memory(
+                        "unet_lora_grads_after_allreduce",
+                        unet_lora_layers,
+                        events=profile_events,
+                        enabled=profile_this_step,
+                        category="gradient_memory",
+                        **profile_meta,
+                    )
 
-            with profiler.capture("optimizer_lr_ema_step", events=profile_events, enabled=profile_this_step, prompt=prompt_i, **profile_meta):
+            with profiler.capture("optimizer_lr_ema_step", events=profile_events, enabled=profile_this_step, **profile_meta):
                 if grad_is_finite:
                     optimizer.step()
                 else:
                     accelerator.print(f"grads are not finite, skipped!")
-            
+
                 lr_scheduler.step()
-            
+
                 if grad_is_finite:
                     if args.train_text_encoder:
                         text_encoder_lora_ema.step(  text_encoder_lora_params )
                     if args.train_unet:
                         unet_lora_ema.step(  unet_lora_layers.parameters() )
-            profiler.record_optimizer_memory("adamw_after_optimizer_step", optimizer, events=profile_events, enabled=profile_this_step, prompt=prompt_i, **profile_meta)
-            profiler.flush_step(profile_events)
+            profiler.record_optimizer_memory(
+                "adamw_after_optimizer_step",
+                optimizer,
+                events=profile_events,
+                enabled=profile_this_step,
+                **profile_meta,
+            )
+            profiler.flush_step(profile_events, wandb_tracker=wandb_tracker)
 
             progress_bar.update(1)
             global_step += 1
 
-            if args.evaluate_every_n_iter > 0 and global_step > 0 and global_step % args.evaluate_every_n_iter == 0:
+            if accelerator.is_main_process:
+                with torch.no_grad():
+                    if args.train_text_encoder:
+                        param_norm = np.mean([p.norm().item() for p in text_encoder_lora_params])
+                        param_ema_norm = np.mean([p.norm().item() for p in text_encoder_lora_ema.shadow_params])
+                        wandb_tracker.log({f"train_TE_lora_norm": param_norm}, step=global_step)
+                        wandb_tracker.log({f"train_TE_lora_ema_norm": param_ema_norm}, step=global_step)
+                    if args.train_unet:
+                        param_norm = np.mean([p.norm().item() for p in unet_lora_layers.parameters()])
+                        param_ema_norm = np.mean([p.norm().item() for p in unet_lora_ema.shadow_params])
+                        wandb_tracker.log({f"train_unet_lora_norm": param_norm}, step=global_step)
+                        wandb_tracker.log({f"train_unet_lora_ema_norm": param_ema_norm}, step=global_step)
+
+            if should_trigger_evaluation(global_step):
                 evaluation_step(global_step)
 
             if accelerator.is_main_process:
@@ -2784,18 +3434,9 @@ def main(args):
                 
                     logger.info(f"Accelerator checkpoint saved to {save_path}")
 
-            torch.cuda.empty_cache()
     accelerator.end_training()
 
 
 if __name__ == "__main__":
     args = parse_args()
     main(args)
-
-
-
-
-
-# accelerate launch --config_file configs/accelerate_config.yaml 1-main-debias.py --config configs/debias-text-encoder.yaml
-# accelerate launch --config_file configs/accelerate_config.yaml 1-main-debias.py --config configs/debias-unet.yaml
-# accelerate launch --config_file configs/accelerate_config.yaml 1-main-debias.py --config configs/debias-text-encoder-and-unet.yaml
