@@ -1,0 +1,375 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Diffusion Training Profile Comparison</title>
+  <style>
+    :root {
+      --bg: #f6f7f9;
+      --ink: #1f2933;
+      --muted: #667085;
+      --line: #d7dde5;
+      --panel: #ffffff;
+      --face: #e76f51;
+      --image: #2a9d8f;
+      --sds-target: #457b9d;
+      --sds-real: #7b61ff;
+      --feature: #f4a261;
+      --backward: #264653;
+      --sync: #8ab17d;
+      --other: #adb5bd;
+      --ftdiff: #2a9d8f;
+      --full: #7b61ff;
+      --skip: #e76f51;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--ink);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      line-height: 1.45;
+    }
+
+    main {
+      width: min(1180px, calc(100vw - 36px));
+      margin: 34px auto 56px;
+    }
+
+    header {
+      margin-bottom: 22px;
+    }
+
+    h1 {
+      margin: 0 0 6px;
+      font-size: 28px;
+      letter-spacing: 0;
+    }
+
+    h2 {
+      margin: 0 0 16px;
+      font-size: 18px;
+      letter-spacing: 0;
+    }
+
+    p {
+      margin: 0;
+      color: var(--muted);
+    }
+
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 22px;
+      margin-top: 18px;
+      box-shadow: 0 1px 2px rgba(16, 24, 40, 0.04);
+    }
+
+    .legend {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px 16px;
+      margin-bottom: 18px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .legend span {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .swatch {
+      width: 12px;
+      height: 12px;
+      border-radius: 3px;
+      display: inline-block;
+    }
+
+    .stack-row {
+      display: grid;
+      grid-template-columns: 140px minmax(260px, 1fr) 72px;
+      gap: 14px;
+      align-items: center;
+      margin: 16px 0;
+    }
+
+    .label {
+      font-weight: 700;
+      white-space: nowrap;
+    }
+
+    .total {
+      text-align: right;
+      font-weight: 800;
+    }
+
+    .stack {
+      height: 34px;
+      border-radius: 6px;
+      overflow: hidden;
+      background: #edf1f5;
+      display: flex;
+      border: 1px solid #e2e8f0;
+    }
+
+    .seg {
+      height: 100%;
+      min-width: 2px;
+      position: relative;
+    }
+
+    .seg:hover::after {
+      content: attr(data-label);
+      position: absolute;
+      left: 50%;
+      top: -34px;
+      transform: translateX(-50%);
+      white-space: nowrap;
+      background: #111827;
+      color: white;
+      font-size: 12px;
+      padding: 5px 7px;
+      border-radius: 4px;
+      z-index: 2;
+    }
+
+    .face { background: var(--face); }
+    .image { background: var(--image); }
+    .sds-target { background: var(--sds-target); }
+    .sds-real { background: var(--sds-real); }
+    .feature { background: var(--feature); }
+    .backward { background: var(--backward); }
+    .sync { background: var(--sync); }
+    .other { background: var(--other); }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 14px;
+    }
+
+    th, td {
+      border-bottom: 1px solid var(--line);
+      padding: 10px 8px;
+      text-align: right;
+      vertical-align: middle;
+    }
+
+    th:first-child, td:first-child {
+      text-align: left;
+      width: 280px;
+    }
+
+    th {
+      color: var(--muted);
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+
+    .bar-cell {
+      min-width: 170px;
+    }
+
+    .bar-wrap {
+      display: grid;
+      grid-template-columns: 1fr 66px;
+      gap: 10px;
+      align-items: center;
+    }
+
+    .bar-track {
+      height: 12px;
+      background: #edf1f5;
+      border-radius: 999px;
+      overflow: hidden;
+    }
+
+    .bar {
+      height: 100%;
+      border-radius: 999px;
+    }
+
+    .ftdiff { background: var(--ftdiff); }
+    .full { background: var(--full); }
+    .skip { background: var(--skip); }
+
+    .notes {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 14px;
+      margin-top: 18px;
+    }
+
+    .note {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 14px;
+      background: #fbfcfe;
+    }
+
+    .note strong {
+      display: block;
+      margin-bottom: 5px;
+    }
+
+    @media (max-width: 760px) {
+      main { width: min(100vw - 22px, 1180px); }
+      .panel { padding: 16px; }
+      .stack-row {
+        grid-template-columns: 1fr;
+        gap: 6px;
+      }
+      .total { text-align: left; }
+      .notes { grid-template-columns: 1fr; }
+      table { font-size: 12px; }
+      .bar-cell { min-width: 130px; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <h1>Training Profile Comparison</h1>
+      <p>Approximate averages from iter 30-35 logs. Times are seconds per iteration; memory is per GPU.</p>
+    </header>
+
+    <section class="panel">
+      <h2>Time Per Iteration</h2>
+      <div class="legend">
+        <span><i class="swatch face"></i>Face detect</span>
+        <span><i class="swatch image"></i>Image generation</span>
+        <span><i class="swatch sds-target"></i>SDS target no-grad</span>
+        <span><i class="swatch sds-real"></i>SDS realistic</span>
+        <span><i class="swatch feature"></i>Feature models</span>
+        <span><i class="swatch backward"></i>accelerator.backward</span>
+        <span><i class="swatch sync"></i>Gather / sync</span>
+        <span><i class="swatch other"></i>Other</span>
+      </div>
+
+      <div class="stack-row">
+        <div class="label">ftdiff</div>
+        <div class="stack" aria-label="ftdiff total 27.0 seconds">
+          <div class="seg face" style="width:24.8%" data-label="Face detect 7.2s"></div>
+          <div class="seg image" style="width:33.1%" data-label="Image generation 9.6s"></div>
+          <div class="seg feature" style="width:0.7%" data-label="Feature models 0.2s"></div>
+          <div class="seg backward" style="width:21.7%" data-label="accelerator.backward 6.3s"></div>
+          <div class="seg sync" style="width:12.4%" data-label="Gather / sync 3.6s"></div>
+          <div class="seg other" style="width:0.3%" data-label="Other 0.1s"></div>
+        </div>
+        <div class="total">27.0s</div>
+      </div>
+
+      <div class="stack-row">
+        <div class="label">ours fullstep</div>
+        <div class="stack" aria-label="ours fullstep total 29.0 seconds">
+          <div class="seg image" style="width:34.1%" data-label="Image generation 9.9s"></div>
+          <div class="seg sds-target" style="width:8.3%" data-label="SDS target no-grad 2.4s"></div>
+          <div class="seg sds-real" style="width:11.7%" data-label="SDS realistic 3.4s"></div>
+          <div class="seg feature" style="width:0.3%" data-label="Feature models 0.1s"></div>
+          <div class="seg backward" style="width:44.5%" data-label="accelerator.backward 12.9s"></div>
+          <div class="seg sync" style="width:0.7%" data-label="Gather / sync 0.2s"></div>
+          <div class="seg other" style="width:0.3%" data-label="Other 0.1s"></div>
+        </div>
+        <div class="total">29.0s</div>
+      </div>
+
+      <div class="stack-row">
+        <div class="label">ours 50% skip</div>
+        <div class="stack" aria-label="ours 50 percent skip total 21.9 seconds">
+          <div class="seg image" style="width:19.7%" data-label="Image generation 5.7s"></div>
+          <div class="seg sds-target" style="width:8.3%" data-label="SDS target no-grad 2.4s"></div>
+          <div class="seg sds-real" style="width:11.7%" data-label="SDS realistic 3.4s"></div>
+          <div class="seg feature" style="width:0.3%" data-label="Feature models 0.1s"></div>
+          <div class="seg backward" style="width:34.8%" data-label="accelerator.backward 10.1s"></div>
+          <div class="seg sync" style="width:0.3%" data-label="Gather / sync 0.1s"></div>
+          <div class="seg other" style="width:0.3%" data-label="Other 0.1s"></div>
+        </div>
+        <div class="total">21.9s</div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>Memory Peaks</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Memory bucket</th>
+            <th>ftdiff</th>
+            <th>ours fullstep</th>
+            <th>ours 50% skip</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Driver/cache cuda_device_used</td>
+            <td class="bar-cell"><div class="bar-wrap"><div class="bar-track"><div class="bar ftdiff" style="width:55%"></div></div><span>33GB</span></div></td>
+            <td class="bar-cell"><div class="bar-wrap"><div class="bar-track"><div class="bar full" style="width:100%"></div></div><span>60GB</span></div></td>
+            <td class="bar-cell"><div class="bar-wrap"><div class="bar-track"><div class="bar skip" style="width:87%"></div></div><span>52GB</span></div></td>
+          </tr>
+          <tr>
+            <td>End live cuda_alloc</td>
+            <td class="bar-cell"><div class="bar-wrap"><div class="bar-track"><div class="bar ftdiff" style="width:75%"></div></div><span>4.48GB</span></div></td>
+            <td class="bar-cell"><div class="bar-wrap"><div class="bar-track"><div class="bar full" style="width:63%"></div></div><span>3.77GB</span></div></td>
+            <td class="bar-cell"><div class="bar-wrap"><div class="bar-track"><div class="bar skip" style="width:63%"></div></div><span>3.77GB</span></div></td>
+          </tr>
+          <tr>
+            <td>Gradient image generation peak</td>
+            <td class="bar-cell"><div class="bar-wrap"><div class="bar-track"><div class="bar ftdiff" style="width:98%"></div></div><span>26GB</span></div></td>
+            <td class="bar-cell"><div class="bar-wrap"><div class="bar-track"><div class="bar full" style="width:100%"></div></div><span>26GB</span></div></td>
+            <td class="bar-cell"><div class="bar-wrap"><div class="bar-track"><div class="bar skip" style="width:75%"></div></div><span>19.6GB</span></div></td>
+          </tr>
+          <tr>
+            <td>SDS target no-grad peak</td>
+            <td class="bar-cell"><div class="bar-wrap"><div class="bar-track"><div class="bar ftdiff" style="width:0%"></div></div><span>-</span></div></td>
+            <td class="bar-cell"><div class="bar-wrap"><div class="bar-track"><div class="bar full" style="width:48%"></div></div><span>11.8GB</span></div></td>
+            <td class="bar-cell"><div class="bar-wrap"><div class="bar-track"><div class="bar skip" style="width:48%"></div></div><span>11.8GB</span></div></td>
+          </tr>
+          <tr>
+            <td>SDS realistic peak</td>
+            <td class="bar-cell"><div class="bar-wrap"><div class="bar-track"><div class="bar ftdiff" style="width:0%"></div></div><span>-</span></div></td>
+            <td class="bar-cell"><div class="bar-wrap"><div class="bar-track"><div class="bar full" style="width:94%"></div></div><span>24.4GB</span></div></td>
+            <td class="bar-cell"><div class="bar-wrap"><div class="bar-track"><div class="bar skip" style="width:94%"></div></div><span>24.4GB</span></div></td>
+          </tr>
+          <tr>
+            <td>no-grad image generation peak</td>
+            <td class="bar-cell"><div class="bar-wrap"><div class="bar-track"><div class="bar ftdiff" style="width:16%"></div></div><span>4.1GB</span></div></td>
+            <td class="bar-cell"><div class="bar-wrap"><div class="bar-track"><div class="bar full" style="width:16%"></div></div><span>4.1GB</span></div></td>
+            <td class="bar-cell"><div class="bar-wrap"><div class="bar-track"><div class="bar skip" style="width:16%"></div></div><span>4.1GB</span></div></td>
+          </tr>
+          <tr>
+            <td>LoRA gradients</td>
+            <td class="bar-cell"><div class="bar-wrap"><div class="bar-track"><div class="bar ftdiff" style="width:1%"></div></div><span>31.6MB</span></div></td>
+            <td class="bar-cell"><div class="bar-wrap"><div class="bar-track"><div class="bar full" style="width:1%"></div></div><span>31.6MB</span></div></td>
+            <td class="bar-cell"><div class="bar-wrap"><div class="bar-track"><div class="bar skip" style="width:1%"></div></div><span>31.6MB</span></div></td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section class="panel">
+      <h2>Reading Guide</h2>
+      <div class="notes">
+        <div class="note">
+          <strong>ftdiff</strong>
+          <p>Face detection and gather/plot/sync are visible time sinks, but the backward graph is lighter than ours fullstep.</p>
+        </div>
+        <div class="note">
+          <strong>ours fullstep</strong>
+          <p>No face detect during training, but SDS scoring makes `accelerator.backward` much heavier.</p>
+        </div>
+        <div class="note">
+          <strong>ours 50% skip</strong>
+          <p>Fastest run. The main win is shorter diffusion generation and a smaller saved graph for image generation.</p>
+        </div>
+      </div>
+    </section>
+  </main>
+</body>
+</html>

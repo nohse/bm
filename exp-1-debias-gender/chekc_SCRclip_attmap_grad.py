@@ -502,6 +502,91 @@ def save_attmaps_with_overlay(att: Optional[torch.Tensor], images: torch.Tensor,
             print(f"[attmap overlay save error] idx={i} -> {e}")
 
 
+def hard_attn_mask_from_map(att: torch.Tensor, threshold: float) -> torch.Tensor:
+    """Per-image HARD mask from a raw attention map.
+
+    Matches attmap_threshold_mask_visualization.py's `threshold_mask`:
+    min-max normalize the map to [0,1] (per image), then keep pixels >= threshold.
+    This is the HARD gate used to relax the image-preservation gradient over the
+    gender-relevant region. It is deliberately different from the SOFT sum-to-one
+    weight used inside sds_logits_from_images (that path stays soft).
+
+    - att: [H,W] (or [1,H,W]) raw attention (nonneg after clamp)
+    Returns a {0,1} float mask of the same H,W.
+    """
+    a = att.detach().float()
+    if a.dim() == 3:
+        a = a.squeeze(0)
+    a = torch.nan_to_num(a, nan=0.0, posinf=0.0, neginf=0.0).clamp_min(0.0)
+    a_min = a.min()
+    a_max = a.max()
+    if float(a_max) <= float(a_min):
+        return torch.zeros_like(a)
+    norm = ((a - a_min) / (a_max - a_min)).clamp(0.0, 1.0)
+    return (norm >= float(threshold)).float()
+
+
+def save_grad_attn_mask_panels(images, attmaps, masks, coefs, targets, preds_ori,
+                               save_dir, prefix, threshold, save_max=None):
+    """Save per-image panels showing HOW the hard attmap threshold is applied as a
+    gradient-region mask in apply_grad_hook_attn.
+
+    For each image, writes a horizontal panel:
+        [ generated image | woman/man attn heatmap overlay | hard-mask overlay (red) ]
+    The red region is exactly where the image-preservation gradient is scaled by
+    `coef` (== factor when target != original-pred or target==-1, else 1.0 in which
+    case the mask is a no-op). Title carries coef / target / pred / retained-fraction.
+
+    - images:  [B,3,H,W] in [-1,1]
+    - attmaps: [B,h,w] raw SDS woman/man attention (latent res)
+    - masks:   [B,1,H,W] hard {0,1} mask at image res (already thresholded)
+    """
+    if images is None or masks is None:
+        return
+    os.makedirs(save_dir, exist_ok=True)
+    imgs = images.detach().float().cpu()
+    att = attmaps.detach().float().cpu() if attmaps is not None else None
+    msk = masks.detach().float().cpu()
+    B = imgs.shape[0]
+    n = B if save_max is None else min(B, save_max)
+    try:
+        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 13)
+    except Exception:
+        font = ImageFont.load_default()
+    for i in range(n):
+        try:
+            base = transforms.ToPILImage()(imgs[i].mul(0.5).add(0.5).clamp(0, 1)).convert("RGB")
+            W, H = base.size
+            if att is not None:
+                heat = attmap_overlay_on_image(att[i], imgs[i], alpha=0.5).convert("RGB")
+            else:
+                heat = base.copy()
+            m = msk[i, 0]
+            if tuple(m.shape) != (H, W):
+                m = F.interpolate(m.view(1, 1, *m.shape), size=(H, W), mode="nearest").view(H, W)
+            red = Image.new("RGB", (W, H), (255, 32, 32))
+            alpha = Image.fromarray(m.mul(int(255 * 0.45)).to(torch.uint8).numpy(), mode="L")
+            over = base.copy()
+            over.paste(red, (0, 0), alpha)
+            frac = float(m.mean())
+            coef = float(coefs[i]) if coefs is not None else 1.0
+            tgt = int(targets[i]) if targets is not None else -9
+            pdo = int(preds_ori[i]) if preds_ori is not None else -9
+            title = (f"{prefix} #{i}  thr={threshold:g}  coef={coef:g}  "
+                     f"tgt={tgt} predOri={pdo}  mask={frac*100:.1f}%")
+            pad = 4
+            strip_h = 20
+            panel = Image.new("RGB", (W * 3 + pad * 4, H + strip_h + pad * 2), "black")
+            d = ImageDraw.Draw(panel)
+            d.text((pad, 3), title, fill="white", font=font)
+            panel.paste(base, (pad, strip_h + pad))
+            panel.paste(heat, (W + pad * 2, strip_h + pad))
+            panel.paste(over, (W * 2 + pad * 3, strip_h + pad))
+            panel.save(os.path.join(save_dir, f"{prefix}_{i:02d}.jpg"), format="JPEG", quality=92)
+        except Exception as e:
+            print(f"[grad-attn mask save error] idx={i} -> {e}")
+
+
 def _install_mid_recorders(unet, store: _AttnStore, token_mask: torch.Tensor):
     """
     Swap ONLY mid_block.*.attn2.processor to recording processors.
@@ -972,7 +1057,7 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--resume_from_checkpoint",
         type=str,
-        default="./outputs/gender_aaai/20260707-1144_gender_aaai_region-attn_skip-50pct_wImg-4_wRealFace-4.0_Th-0.2_lr-5e-05/ckpts/checkpoint_tmp-260",
+        default="",
         help="provide the checkpoint path to resume from checkpoint",
     )
     parser.add_argument(
@@ -1233,6 +1318,30 @@ def parse_args(input_args=None):
              "'cos' = 1 - cosine_similarity on flattened h (scale-invariant).",
     )
     parser.add_argument("--attn_grad_threshold", type=float, default=0.2, help="threshold for binary grad gate on attn map")
+    # =====================
+    # [ADDED] img-loss gradient region gate: face bbox (default) vs HARD attn-threshold mask
+    # =====================
+    parser.add_argument("--grad_region_mode", type=str, default="attn",
+                        choices=["face", "attn"],
+                        help="어느 영역에 img-loss grad hook(factor2)을 걸지: "
+                             "'attn'(기본)=SDS woman/man attmap을 --grad_attn_threshold로 HARD 이진화한 마스크, "
+                             "'face'=InsightFace bbox(레거시 동작). "
+                             "SDS logit의 soft attmap 가중과는 무관(별도 하드 게이트).")
+    parser.add_argument("--grad_attn_threshold", type=float, default=0.2,
+                        help="grad_region_mode='attn'일 때, per-image min-max 정규화한 attmap에 적용하는 HARD threshold.")
+    parser.add_argument(
+        "--save_grad_attn_masks",
+        dest="save_grad_attn_masks",
+        action="store_true",
+        help="grad_region_mode='attn'에서 하드 마스크가 어떻게 적용됐는지 패널을 저장(플롯 주기 기준).",
+    )
+    parser.add_argument(
+        "--no_save_grad_attn_masks",
+        dest="save_grad_attn_masks",
+        action="store_false",
+        help="하드 마스크 적용 패널 저장을 끕니다.",
+    )
+    parser.set_defaults(save_grad_attn_masks=True)
     # parse_args() 안의 인자들 사이에 추가
     parser.add_argument("--use_attn_weight", type=bool, default=True,
                         help="SDS에서 어텐션 가중치 사용할지 여부")
@@ -1310,6 +1419,41 @@ def parse_args(input_args=None):
         default=False,
         help="resume_from_checkpoint + eval_at_step0과 함께 사용. 시작 직후 1회 평가만 수행하고 학습 없이 종료합니다.",
     )
+
+    # =========================================================================
+    # [ADDED] Realistic-face-loss threshold experiment.
+    # Goal: check whether the realistic-face SDS loss ("a photo of a realistic
+    # face") can act as a face / no-face gate (a magnitude-aware replacement for
+    # the magnitude-blind min-max attn hard-mask in apply_grad_hook_attn).
+    # When --realistic_thr_experiment is set, the script loads the checkpoint,
+    # generates images from the val prompts, labels each with get_face (the
+    # code's own detector = ground truth), measures the realistic-face SDS loss
+    # (R independent draws -> mean/std) AND the attn hard-mask fraction @thr
+    # (evidence for the over-masking claim), writes per-rank shard JSON + images,
+    # and exits WITHOUT training. Analysis/plots are done by realistic_thr_analyze.py.
+    # =========================================================================
+    parser.add_argument("--realistic_thr_experiment", action="store_true", default=False,
+                        help="run the realistic-face-loss face/no-face threshold experiment, then exit.")
+    parser.add_argument("--rte_out_dir", type=str, default="",
+                        help="output dir for the experiment; default = <run_dir>/realistic_thr_experiment_ckpt<step>_skip<pct>")
+    parser.add_argument("--rte_target_per_class", type=int, default=25,
+                        help="target number of face AND no-face images to collect (total across ranks).")
+    parser.add_argument("--rte_pool_cap", type=int, default=2400,
+                        help="max total images to GENERATE while harvesting (total across ranks). Safety ceiling.")
+    parser.add_argument("--rte_realistic_repeats", type=int, default=5,
+                        help="number of independent SDS eps draws averaged for the realistic-face loss per image.")
+    parser.add_argument("--rte_num_denoise", type=int, default=25,
+                        help="denoising steps for generation (eval/deploy default 25).")
+    parser.add_argument("--rte_skip_pct", type=float, default=0.0,
+                        help="skip_final_steps_pct for generation (0 = clean full denoise; 50 = training operating point).")
+    parser.add_argument("--rte_mask_threshold", type=float, default=-1.0,
+                        help="threshold for the attn hard-mask fraction diagnostic; <0 -> use --grad_attn_threshold.")
+    parser.add_argument("--rte_batch", type=int, default=8,
+                        help="generation/measurement batch size.")
+    parser.add_argument("--rte_seed", type=int, default=1234,
+                        help="base seed for generation noise (offset per rank).")
+    parser.add_argument("--rte_weights", type=str, default="ema", choices=["ema", "live"],
+                        help="which checkpoint weights to generate with: 'ema' (canonical, matches eval) or 'live' LoRA.")
 
     if input_args is not None:
         args = parser.parse_args(input_args)
@@ -1553,7 +1697,9 @@ def main(args):
     if not args.train_text_encoder and not args.train_unet:
         raise ValueError("At least one of --train_text_encoder and --train_unet must be True.")
     if args.region_mask_mode == "face":
-        logger.warning("region_mask_mode=face requested, but this run uses face detection only for the gradient hook/evaluation. Overriding SDS region_mask_mode to attn.")
+        # NOTE: cannot use the accelerate `logger` here yet — the Accelerator state is
+        # not initialized until below, and logging before that raises. This block only
+        # mutates args; the informational warning is emitted after Accelerator() init.
         args.region_mask_mode = "attn"
 
     logging_dir = Path(args.output_dir, args.logging_dir)
@@ -1601,6 +1747,22 @@ def main(args):
         transformers.utils.logging.set_verbosity_error()
         diffusers.utils.logging.set_verbosity_error()
 
+    # img-loss grad region gate (face bbox vs HARD attn threshold). Emitted here (not
+    # earlier) because the accelerate `logger` requires an initialized Accelerator state.
+    # Keeps the two similarly-named threshold flags from being silently confused: the attn
+    # grad gate ONLY reads --grad_attn_threshold; the legacy --attn_grad_threshold is unused.
+    if accelerator.is_main_process and args.grad_region_mode == "attn":
+        logger.warning(
+            f"grad_region_mode=attn: img-loss gradient is HARD-gated by the woman/man attmap "
+            f"thresholded at --grad_attn_threshold={args.grad_attn_threshold} (per-image min-max, hard). "
+            f"This is SEPARATE from the SOFT SDS attmap weighting inside sds_logits_from_images."
+        )
+        if abs(args.attn_grad_threshold - 0.2) > 1e-9:
+            logger.warning(
+                f"NOTE: --attn_grad_threshold={args.attn_grad_threshold} is NOT read by the attn grad gate. "
+                f"Did you mean --grad_attn_threshold (currently {args.grad_attn_threshold})?"
+            )
+
     def dist_broadcast_if_needed(tensor, src=0):
         if accelerator.num_processes == 1:
             return
@@ -1627,9 +1789,13 @@ def main(args):
     # each loss weight (img / realistic-face). NOTE: the fair-loss fields (_wFair-/_fcw-)
     # from DAL are omitted here because this script has no weight_loss_fair /
     # fair_correct_weight args (it uses the CE-based fair loss).
+    grad_reg_tag = f"_gradReg-{args.grad_region_mode}"
+    if args.grad_region_mode == "attn":
+        grad_reg_tag += f"-th{args.grad_attn_threshold}"
     folder_name = (
         f"{timestring}_{args.proj_name}"
         f"_region-{args.region_mask_mode}"
+        f"{grad_reg_tag}"
         f"_skip-{int(args.skip_final_steps_pct)}pct"
         f"_wImg-{args.weight_loss_img}"
         f"_wRealFace-{args.weight_loss_face_realistic}"
@@ -3450,7 +3616,64 @@ def main(args):
 
         images_new = torch.cat(images_new)
         return images_new
-    
+
+    def apply_grad_hook_attn(images, attmap_gen, targets, preds_gender_ori,
+                             threshold=0.1, factor=0.2, save_dir=None, prefix=None, save_max=None):
+        """apply_grad_hook_face의 attn 버전.
+
+        얼굴 검출 bbox 대신, 생성 이미지의 SDS woman/man attmap(attmap_gen)을
+        per-image min-max 정규화 후 `threshold`로 HARD 이진화한 마스크 영역에만
+        img-loss 경사를 조절한다. class 비교는 face 버전과 동일하게 SDS로 잰
+        original 예측(preds_gender_ori)을 사용한다.
+
+        coef 규칙(face 버전과 동일):
+            target == -1               : factor
+            target == pred_gender_ori  : 1   (마스크 무효; 보존 경사 그대로)
+            target != pred_gender_ori  : factor
+
+        Autograd: forward 값은 보존하고, 마스크 내부 픽셀의 상류 경사만 coef배.
+            images_new = mask * clone(images)[hook: *coef] + (1-mask) * images
+        => d/d images = coef*mask*u + (1-mask)*u  (마스크 안=coef, 밖=1)
+
+        중요: attmap_gen은 detach된 상수 마스크로만 쓴다(soft SDS 가중과 무관).
+        """
+        if attmap_gen is None:
+            # attmap 캡처 실패 시: 경사 조절 없이(coef 1) 이미지 그대로 통과.
+            print("[apply_grad_hook_attn] attmap_gen is None -> skip grad gating (coef=1 everywhere)")
+            return images
+        B = images.shape[0]
+        Himg, Wimg = images.shape[-2], images.shape[-1]
+        with torch.no_grad():
+            masks = []
+            coefs = []
+            for b in range(B):
+                m = hard_attn_mask_from_map(attmap_gen[b], threshold)  # [h,w] {0,1}
+                m = F.interpolate(m.view(1, 1, *m.shape), size=(Himg, Wimg), mode="nearest").view(Himg, Wimg)
+                masks.append(m)
+                target = int(targets[b])
+                pred_ori = int(preds_gender_ori[b])
+                if target == -1:
+                    coef = float(factor)
+                elif target == pred_ori:
+                    coef = 1.0
+                else:
+                    coef = float(factor)
+                coefs.append(coef)
+            mask = torch.stack(masks, dim=0).unsqueeze(1).to(device=images.device, dtype=images.dtype)  # [B,1,H,W]
+            coef_t = torch.tensor(coefs, device=images.device, dtype=images.dtype).view(B, 1, 1, 1)
+
+        img_hooked = images.clone()
+        if img_hooked.requires_grad:
+            img_hooked.register_hook(lambda g, c=coef_t: g * c.to(g.dtype))
+        images_new = mask * img_hooked + (1.0 - mask) * images
+
+        if save_dir is not None and prefix is not None:
+            save_grad_attn_mask_panels(
+                images, attmap_gen, mask, coefs, targets, preds_gender_ori,
+                save_dir=save_dir, prefix=prefix, threshold=threshold, save_max=save_max,
+            )
+        return images_new
+
     def gen_dynamic_weights_sds(face_indicators, targets, preds_ori_sds, factor=0.2, out_dtype=None):
         """1-main-debias-ftdiff.py의 gen_dynamic_weights와 동일한 로직을 SDS 기준으로 옮긴 것.
 
@@ -3590,6 +3813,182 @@ def main(args):
     progress_bar = tqdm(range(global_step, args.max_train_steps), disable=not accelerator.is_local_main_process)
     progress_bar.set_description("Steps")
     wandb_tracker = accelerator.get_tracker("wandb", unwrap=True)
+
+    # =========================================================================
+    # [ADDED] Realistic-face-loss face/no-face threshold experiment.
+    # Runs right after checkpoint load, reuses the exact generation / get_face /
+    # SDS machinery, then exits WITHOUT training. No collective is issued inside
+    # the data-dependent harvest loop (each rank harvests independently); the only
+    # collective is a single barrier before rank0 has written its shard, so ranks
+    # cannot desync/hang even if they generate different numbers of batches.
+    # =========================================================================
+    def _run_realistic_thr_experiment():
+        rank = accelerator.process_index
+        world = accelerator.num_processes
+        device = accelerator.device
+
+        # --- pick generation weights: EMA (canonical, matches eval "generated") or live LoRA ---
+        if args.train_text_encoder and args.rte_weights == "ema":
+            text_encoder.load_state_dict(text_encoder_lora_ema_dict, strict=False)
+        gen_te = text_encoder          # LoRA text encoder (EMA or live loaded above)
+        gen_unet = unet                # frozen base UNet (train_unet=False)
+
+        # --- config ---
+        mask_thr = float(args.rte_mask_threshold) if args.rte_mask_threshold >= 0 else float(args.grad_attn_threshold)
+        target = int(args.rte_target_per_class)
+        per_rank_target = math.ceil(target / world)
+        pool_cap_rank = math.ceil(int(args.rte_pool_cap) / world)
+        R = int(args.rte_realistic_repeats)
+        B = int(args.rte_batch)
+        num_denoise = int(args.rte_num_denoise)
+        skip_pct = float(args.rte_skip_pct)
+
+        # --- output dirs ---
+        if args.rte_out_dir:
+            out_root = args.rte_out_dir
+        else:
+            run_dir = os.path.dirname(os.path.dirname(args.resume_from_checkpoint.rstrip("/"))) \
+                if args.resume_from_checkpoint else args.output_dir
+            out_root = os.path.join(run_dir, f"realistic_thr_experiment_ckpt{global_step}_skip{int(skip_pct)}")
+        face_dir = os.path.join(out_root, "images", "face")
+        noface_dir = os.path.join(out_root, "images", "noface")
+        shard_dir = os.path.join(out_root, "_shards")
+        for d in (face_dir, noface_dir, shard_dir):
+            os.makedirs(d, exist_ok=True)
+
+        if rank == 0:
+            print(f"[RTE] out_root={out_root}")
+            print(f"[RTE] world={world} target/class(total)={target} per_rank_target={per_rank_target} "
+                  f"pool_cap/rank={pool_cap_rank} R={R} B={B} steps={num_denoise} skip_pct={skip_pct} "
+                  f"mask_thr={mask_thr} weights={args.rte_weights} ckpt_step={global_step}", flush=True)
+
+        # --- realistic-face SDS loss (R draws) + attn hard-mask fraction for a batch ---
+        def _measure(images):
+            saved_mode, saved_uaw = args.region_mask_mode, args.use_attn_weight
+            r_draws = []
+            fracs = None
+            with torch.no_grad():
+                # first draw WITH attn capture -> also gives the woman/man attmap for the mask-fraction diagnostic
+                args.region_mask_mode, args.use_attn_weight = "attn", True
+                out = sds_logits_from_images(
+                    images, tau=args.sds_tau, t_min=args.sds_t_min, t_max=args.sds_t_max,
+                    num_t=args.sds_num_t, num_eps=args.sds_num_eps, gate_grad=False,
+                    precomputed_attmaps=None, sds_text_encoder=eval_text_encoder, sds_unet=unet,
+                    sds_scheduler=ddpm_forward, compute_realistic_sds=True, return_attmap=True,
+                )
+                sds_r32 = out[5]
+                attmap_mean = out[6]
+                r_draws.append(sds_r32.detach().float().cpu().numpy())
+                fr = []
+                for b in range(images.shape[0]):
+                    if attmap_mean is not None:
+                        m = hard_attn_mask_from_map(attmap_mean[b], mask_thr)
+                        fr.append(float(m.mean().item()))
+                    else:
+                        fr.append(float("nan"))
+                fracs = np.array(fr, dtype=np.float64)
+                # remaining draws WITHOUT attn capture (realistic loss uses full pixels, region-independent) -> cheaper
+                args.region_mask_mode, args.use_attn_weight = "none", False
+                for _ in range(max(0, R - 1)):
+                    o2 = sds_logits_from_images(
+                        images, tau=args.sds_tau, t_min=args.sds_t_min, t_max=args.sds_t_max,
+                        num_t=args.sds_num_t, num_eps=args.sds_num_eps, gate_grad=False,
+                        precomputed_attmaps=None, sds_text_encoder=eval_text_encoder, sds_unet=unet,
+                        sds_scheduler=ddpm_forward, compute_realistic_sds=True, return_attmap=False,
+                    )
+                    r_draws.append(o2[5].detach().float().cpu().numpy())
+            args.region_mask_mode, args.use_attn_weight = saved_mode, saved_uaw
+            r = np.stack(r_draws, axis=0)  # [R, b]
+            return r.mean(0), r.std(0), r[0], fracs
+
+        my_prompts = list(prompts_val)[rank::world] if world > 1 else list(prompts_val)
+        if len(my_prompts) == 0:
+            my_prompts = list(prompts_val)
+
+        records = []
+        n_face = n_noface = n_gen = kept = 0
+        gen = torch.Generator(device=device)
+        seed_ctr = int(args.rte_seed) + rank * 100003
+        pi = 0
+        to_pil = transforms.ToPILImage()
+        while (n_face < per_rank_target or n_noface < per_rank_target) and n_gen < pool_cap_rank:
+            prompt = my_prompts[pi % len(my_prompts)]
+            pi += 1
+            gen.manual_seed(seed_ctr)
+            seed_ctr += 1
+            noises = torch.randn([B, 4, 64, 64], generator=gen, device=device, dtype=weight_dtype_high_precision)
+            with torch.no_grad():
+                images, _ = generate_image_no_gradient(
+                    prompt, noises, num_denoise,
+                    which_text_encoder=gen_te, which_unet=gen_unet,
+                    skip_final_steps=0, skip_final_steps_pct=skip_pct,
+                )
+            n_gen += B
+
+            with torch.no_grad():
+                face_ind_t, _bbox, _c, _l, _a = get_face(images)
+            face_ind = face_ind_t.detach().cpu().numpy().astype(bool)
+
+            # only keep (and pay SDS cost for) images whose bucket is not full yet
+            keep = []
+            for b in range(images.shape[0]):
+                if face_ind[b] and n_face < per_rank_target:
+                    keep.append(b); n_face += 1
+                elif (not face_ind[b]) and n_noface < per_rank_target:
+                    keep.append(b); n_noface += 1
+            if not keep:
+                continue
+
+            sub = images[keep]
+            rmean, rstd, r0, fracs = _measure(sub)
+            for k, b in enumerate(keep):
+                is_face = bool(face_ind[b])
+                sub_dir = face_dir if is_face else noface_dir
+                fname = f"r{rank}_{kept:05d}_rm{float(rmean[k]):.4f}.png"
+                try:
+                    to_pil((sub[k].detach().float().cpu() * 0.5 + 0.5).clamp(0, 1)).save(os.path.join(sub_dir, fname))
+                except Exception as e:
+                    print(f"[RTE] save error {fname}: {e}", flush=True)
+                records.append({
+                    "rank": rank, "idx": kept, "prompt": prompt, "face": is_face,
+                    "realistic_mean": float(rmean[k]), "realistic_std": float(rstd[k]),
+                    "realistic_draw0": float(r0[k]), "attn_mask_frac": float(fracs[k]),
+                    "image": os.path.join("images", "face" if is_face else "noface", fname),
+                })
+                kept += 1
+
+            if (n_gen // B) % 10 == 0:
+                print(f"[RTE][rank{rank}] gen={n_gen} kept={kept} face={n_face}/{per_rank_target} "
+                      f"noface={n_noface}/{per_rank_target}", flush=True)
+
+        shard = {
+            "meta": {
+                "rank": rank, "world": world, "n_generated": n_gen, "kept": kept,
+                "n_face": n_face, "n_noface": n_noface, "per_rank_target": per_rank_target,
+                "pool_cap_rank": pool_cap_rank, "hit_cap": bool(n_gen >= pool_cap_rank),
+                "R": R, "batch": B, "num_denoise": num_denoise, "skip_pct": skip_pct,
+                "mask_threshold": mask_thr, "weights": args.rte_weights, "ckpt_step": global_step,
+                "sds": {"tau": args.sds_tau, "t_min": args.sds_t_min, "t_max": args.sds_t_max,
+                        "num_t": args.sds_num_t, "num_eps": args.sds_num_eps},
+                "realistic_prompt": "a photo of a realistic face",
+                "out_root": out_root,
+            },
+            "records": records,
+        }
+        with open(os.path.join(shard_dir, f"shard_rank{rank}.json"), "w") as f:
+            json.dump(shard, f, indent=2)
+        print(f"[RTE][rank{rank}] DONE gen={n_gen} kept={kept} face={n_face} noface={n_noface} "
+              f"hit_cap={n_gen >= pool_cap_rank}", flush=True)
+        return out_root
+
+    if args.realistic_thr_experiment:
+        _out_root = _run_realistic_thr_experiment()
+        accelerator.wait_for_everyone()
+        if accelerator.is_main_process:
+            logger.info(f"[RTE] all ranks finished; shards written under {_out_root}/_shards. "
+                        f"Run realistic_thr_analyze.py on this dir for plots/summary.")
+        accelerator.end_training()
+        return
 
     # NOTE: --eval_at_step0 evaluates at the *initial* step of this run.
     # When resuming from a checkpoint, that step equals the checkpoint's step
@@ -3861,7 +4260,10 @@ def main(args):
                 # 1-main-debias-ftdiff.py와 동일하게, fair-loss 분류는 apply_grad_hook_face가
                 # images_ij를 덮어쓰기 '전'의 원본 이미지에서 계산한다. 그래야 아래 얼굴영역
                 # grad hook(factor2)이 img loss 경사에만 걸리고 fair loss 경사에는 걸리지 않는다.
-                preds_gender_ij, probs_gender_ij, logits_gender_ij, _, _, sds_realistic_ij = sds_logits_from_images(
+                # return_attmap=True: attn 하드 게이트(grad_region_mode='attn')에 쓸
+                # 생성 이미지의 woman/man attmap을 함께 받는다. face 모드에서도 무해
+                # (attmap_gen_ij는 detach된 상수라 SDS/fair loss 경사에 영향 없음).
+                preds_gender_ij, probs_gender_ij, logits_gender_ij, _, _, sds_realistic_ij, attmap_gen_ij = sds_logits_from_images(
                     images_ij,
                     tau=args.sds_tau,
                     t_min=args.sds_t_min,
@@ -3874,18 +4276,44 @@ def main(args):
                     sds_unet=unet,
                     sds_scheduler=ddpm_forward,
                     compute_realistic_sds=True,
+                    return_attmap=True,
                 )
 
                 # img loss 경로: 얼굴영역 grad hook(factor2)을 건 버전으로 images_ij를 덮어쓴다
                 # (ftdiff의 `images_ij = apply_grad_hook_face(...)`와 동일한 방식).
-                images_ij = apply_grad_hook_face(
-                    images_ij,
-                    face_bboxs_ij,
-                    face_bboxs_ori_ij,
-                    targets_ij,
-                    preds_gender_ori_sds_ij,
-                    factor=args.factor2,
-                )
+                if args.grad_region_mode == "attn":
+                    grad_mask_save_dir = None
+                    grad_mask_prefix = None
+                    if (
+                        args.save_grad_attn_masks
+                        and accelerator.is_main_process
+                        and j == 0
+                        and (step % args.train_plot_every_n_iter == 0)
+                    ):
+                        grad_mask_save_dir = os.path.join(
+                            args.imgs_save_dir, "grad_attn_masks", f"train-{global_step}"
+                        )
+                        grad_mask_prefix = f"gs{global_step}"
+                    images_ij = apply_grad_hook_attn(
+                        images_ij,
+                        attmap_gen_ij,
+                        targets_ij,
+                        preds_gender_ori_sds_ij,
+                        threshold=args.grad_attn_threshold,
+                        factor=args.factor2,
+                        save_dir=grad_mask_save_dir,
+                        prefix=grad_mask_prefix,
+                        save_max=None,
+                    )
+                else:
+                    images_ij = apply_grad_hook_face(
+                        images_ij,
+                        face_bboxs_ij,
+                        face_bboxs_ori_ij,
+                        targets_ij,
+                        preds_gender_ori_sds_ij,
+                        factor=args.factor2,
+                    )
                 images_small_ij = transforms.Resize(args.img_size_small)(images_ij)
                 clip_feats_ij = get_clip_feat(images_small_ij, normalize=True, to_high_precision=True)
                 DINO_feats_ij = get_dino_feat(images_small_ij, normalize=True, to_high_precision=True)

@@ -1033,10 +1033,10 @@ def parse_args(input_args=None):
 
     # loss weight
     parser.add_argument(
-        '--weight_loss_img', 
-        default=4,
-        help="weight for the image semantics preserving loss", 
-        type=float, 
+        '--weight_loss_img',
+        default=8,
+        help="weight for the image semantics preserving loss",
+        type=float,
     )
     parser.add_argument(
         '--weight_loss_face', 
@@ -1222,6 +1222,16 @@ def parse_args(input_args=None):
     parser.add_argument("--sds_num_t", type=int, default=15, help="number of t samples (linspace)")
     parser.add_argument("--sds_num_eps", type=int, default=1, help="number of epsilon samples per t")
     parser.add_argument("--sds_tau", type=float, default=0.0001, help="temperature for -softmax on SDS losses")
+    # [per-occ CLIP-T] ------------------------------------------------------------
+    parser.add_argument("--clip_t_out_json", type=str, default=None,
+                        help="[per-occ] write per-occupation CLIP-T JSON to this path.")
+    parser.add_argument("--te_lora_ema_pth", type=str, default=None,
+                        help="[per-occ] load TE-LoRA EMA weights from this .pth (2-export output).")
+    parser.add_argument("--disable_sds_eval", action="store_true", default=False,
+                        help="[per-occ] skip SDS classifier/attmap forward at eval (CLIP-T unaffected).")
+    parser.add_argument("--clip_t_only", action="store_true", default=False,
+                        help="[per-occ] fast path: only generate trained-model images and compute CLIP-T; "
+                             "skip ori-image gen, face/MobileNet, DINO-I and CLIP-I (CLIP-T is identical).")
     # h-space loss measured during denoising trajectory (fine DM vs original DM)
     parser.add_argument(
         "--h_loss_form", type=str, default="raw",
@@ -1271,7 +1281,7 @@ def parse_args(input_args=None):
     # =====================
     # [ADDED] Region masking switch (face / attn / none)
     # =====================
-    parser.add_argument("--region_mask_mode", type=str, default="none",
+    parser.add_argument("--region_mask_mode", type=str, default="attn",
                         choices=["none", "face", "attn"],
                         help="SDS 및 backprop에서 사용할 영역 마스킹 방식 선택. 'attn'은 SDS 분류 프롬프트(woman/man) 토큰 기반 어텐션 맵, 'face'는 얼굴 bbox(학습 시 자동 비활성), 'none'은 전체.")
     parser.add_argument(
@@ -2922,6 +2932,7 @@ def main(args):
         clip_i_sims = []
         dino_i_sims = []
         clip_t_sims = []
+        clip_t_per_prompt = {}   # [per-occ] prompt -> list of per-image CLIP-T sims
         to_pil_eval = T.ToPILImage()
         # Enable attmap computation whenever the user wants to save them
         # (--save_attmaps is now default on; pass --no_save_attmaps to disable).
@@ -2970,6 +2981,33 @@ def main(args):
                 if enable_sds_eval:
                     logs_i["gender_gap_abs_sds"] = []
                 log_imgs_i = {}
+
+            # [per-occ CLIP-T fast path] generate ONLY the trained-model images with the
+            # SAME fixed noises the normal path uses (line: which_text_encoder=text_encoder,
+            # which_unet=unet), so the generated images -- and therefore CLIP-T -- are
+            # bit-identical to the full eval, while skipping everything CLIP-T does not need.
+            if getattr(args, "clip_t_only", False):
+                _imgs = []
+                _N = math.ceil(noises_i.shape[0] / args.val_GPU_batch_size)
+                for _j in range(_N):
+                    _nij = noises_i[args.val_GPU_batch_size*_j:args.val_GPU_batch_size*(_j+1)]
+                    _iij, _ = generate_image_no_gradient(prompt_i, _nij, num_denoising_steps, which_text_encoder=text_encoder, which_unet=unet)
+                    _imgs.append(_iij)
+                _imgs = torch.cat(_imgs)
+                _imgs_all = customized_all_gather(_imgs, accelerator, return_tensor_other_processes=False)
+                if accelerator.is_main_process:
+                    with torch.no_grad():
+                        _fg = _clip_image_features_eval(_imgs_all)
+                        _ft = _clip_text_features_eval(prompt_i)
+                        _ct = (_fg * _ft).sum(dim=-1).detach().cpu().tolist()
+                        clip_t_sims.extend(_ct)
+                        clip_t_per_prompt.setdefault(prompt_i, []).extend(_ct)
+                    logs.append({})
+                    log_imgs.append({})
+                    logger.info(f"[per-occ CLIP-T] {prompt_i} -> mean={float(np.mean(_ct)):.4f} (n={len(_ct)})")
+                accelerator.wait_for_everyone()
+                continue
+
             ################################################
             # step 1: generate all ori images
             images_ori = []
@@ -3218,7 +3256,9 @@ def main(args):
                     dino_i_sims.extend((dino_gen_eval * dino_ori_eval).sum(dim=-1).detach().cpu().tolist())
 
                     clip_text_feat = _clip_text_features_eval(prompt_i)
-                    clip_t_sims.extend((clip_feats_gen_eval * clip_text_feat).sum(dim=-1).detach().cpu().tolist())
+                    _clip_t_this = (clip_feats_gen_eval * clip_text_feat).sum(dim=-1).detach().cpu().tolist()
+                    clip_t_sims.extend(_clip_t_this)
+                    clip_t_per_prompt.setdefault(prompt_i, []).extend(_clip_t_this)   # [per-occ]
 
             
             if accelerator.is_main_process:
@@ -3259,6 +3299,36 @@ def main(args):
             if len(clip_t_sims) > 0:
                 wandb_tracker.log({f"eval_{name}_Clip-T": float(np.mean(clip_t_sims))}, step=current_global_step)
 
+            # [per-occ CLIP-T] dump per-occupation averages to a dedicated JSON.
+            if getattr(args, "clip_t_out_json", None) and len(clip_t_per_prompt) > 0:
+                per_occ = {}
+                for _p, _v in clip_t_per_prompt.items():
+                    if len(_v) > 0:
+                        per_occ[_p] = {"clip_t_mean": float(np.mean(_v)),
+                                       "clip_t_std": float(np.std(_v)),
+                                       "n_images": int(len(_v))}
+                out_obj = {
+                    "checkpoint": args.resume_from_checkpoint,
+                    "step": int(current_global_step),
+                    "weights": ("EMA(.pth)" if getattr(args, "te_lora_ema_pth", None) else "EMA(load_state)"),
+                    "te_lora_ema_pth": getattr(args, "te_lora_ema_pth", None),
+                    "eval_clip_model": "ViT-bigG-14 / laion2b_s39b_b160k",
+                    "prompt_template": "A photo of the face of a {occupation}, a person",
+                    "num_occupations": int(len(per_occ)),
+                    "images_per_occupation": int(np.median([o['n_images'] for o in per_occ.values()])) if per_occ else 0,
+                    "overall_clip_t_mean_over_images": float(np.mean(clip_t_sims)),
+                    "overall_clip_t_mean_over_occupations": float(np.mean([o['clip_t_mean'] for o in per_occ.values()])),
+                    "per_occupation": per_occ,
+                }
+                _outp = args.clip_t_out_json
+                os.makedirs(os.path.dirname(os.path.abspath(_outp)), exist_ok=True)
+                with open(_outp, "w") as _f:
+                    json.dump(out_obj, _f, indent=2, ensure_ascii=False, sort_keys=True)
+                logger.info(f"[per-occ CLIP-T] step={current_global_step} "
+                            f"overall(img)={out_obj['overall_clip_t_mean_over_images']:.5f} "
+                            f"overall(occ)={out_obj['overall_clip_t_mean_over_occupations']:.5f} "
+                            f"-> {_outp}")
+
             # Persist a small JSON of the headline metrics for offline comparison
             # across resumed checkpoints (eval_results.json next to /ckpts).
             if name == "EMA":
@@ -3277,7 +3347,7 @@ def main(args):
                 if len(dino_i_sims) > 0:
                     metrics_to_save["eval_EMA_DINO-I"] = float(np.mean(dino_i_sims))
 
-                if args.resume_from_checkpoint and os.path.isdir(args.resume_from_checkpoint):
+                if args.resume_from_checkpoint and os.path.isdir(args.resume_from_checkpoint) and not getattr(args, "clip_t_out_json", None):
                     # .../<run>/ckpts/checkpoint-XXX -> .../<run>/eval_results.json
                     results_path = os.path.join(
                         os.path.dirname(os.path.dirname(args.resume_from_checkpoint)),
@@ -3308,52 +3378,43 @@ def main(args):
         return logs, log_imgs
     
     def apply_grad_hook_face(images, face_bboxs, face_bboxs_ori, targets, preds_gender_ori, factor=0.1):
-        """Scale gradients on the same face region used by 1-main-debias-ftdiff.py.
+        """apply gradient hook on non-face regions of the generated images
 
-        The hook is attached to the intersection of the generated-image face bbox
-        and the original-image face bbox. If that region cannot be formed, the
-        image is left unchanged.
+        1-main-debias-ftdiff.py의 apply_grad_hook_face와 동일한 구현(안전가드 제거).
+        얼굴영역(gen bbox ∩ ori bbox)에만 grad hook을 걸어 img loss 경사를 조절한다.
+        class는 mnet이 아니라 SDS로 잰 original 예측(preds_gender_ori)을 사용한다.
         """
         images_new = []
-        for image, face_bbox, face_bbox_ori, target, pred_gender_ori in itertools.zip_longest(
-            images, face_bboxs, face_bboxs_ori, targets, preds_gender_ori
-        ):
+        for image, face_bbox, face_bbox_ori, target, pred_gender_ori in itertools.zip_longest(images, face_bboxs, face_bboxs_ori, targets, preds_gender_ori):
             if (face_bbox == -1).all():
                 images_new.append(image.unsqueeze(dim=0))
-                continue
-            if (face_bbox_ori == -1).all():
+            else:
+                img_width, img_height = image.shape[1:]
+                idx_left = max(face_bbox[0], face_bbox_ori[0], 0)
+                idx_right = min(face_bbox[2], face_bbox_ori[2], img_width)
+                idx_bottom = max(face_bbox[1], face_bbox_ori[1], 0)
+                idx_top = min(face_bbox[3], face_bbox_ori[3], img_height)
+
+                img_face = image[:,idx_bottom:idx_top,idx_left:idx_right].clone()
+                if target==-1:
+                    grad_hook = make_grad_hook(factor)
+                elif target==pred_gender_ori:
+                    grad_hook = make_grad_hook(1)
+                elif target!=pred_gender_ori:
+                    grad_hook = make_grad_hook(factor)
+                img_face.register_hook(grad_hook)
+
+                img_add = torch.zeros_like(image)
+                img_add[:,idx_bottom:idx_top,idx_left:idx_right] = img_face
+
+                mask = torch.zeros_like(image)
+                mask[:,idx_bottom:idx_top,idx_left:idx_right] = 1
+
+                image = mask*img_add + (1-mask)*image
                 images_new.append(image.unsqueeze(dim=0))
-                continue
 
-            img_height, img_width = image.shape[-2:]
-            idx_left = max(int(round(face_bbox[0].item())), int(round(face_bbox_ori[0].item())), 0)
-            idx_right = min(int(round(face_bbox[2].item())), int(round(face_bbox_ori[2].item())), img_width)
-            idx_bottom = max(int(round(face_bbox[1].item())), int(round(face_bbox_ori[1].item())), 0)
-            idx_top = min(int(round(face_bbox[3].item())), int(round(face_bbox_ori[3].item())), img_height)
-
-            if idx_right <= idx_left or idx_top <= idx_bottom:
-                images_new.append(image.unsqueeze(dim=0))
-                continue
-
-            img_face = image[:, idx_bottom:idx_top, idx_left:idx_right].clone()
-            if target == -1:
-                grad_hook = make_grad_hook(factor)
-            elif target == pred_gender_ori:
-                grad_hook = make_grad_hook(1)
-            elif target != pred_gender_ori:
-                grad_hook = make_grad_hook(factor)
-            img_face.register_hook(grad_hook)
-
-            img_add = torch.zeros_like(image)
-            img_add[:, idx_bottom:idx_top, idx_left:idx_right] = img_face
-
-            mask = torch.zeros_like(image)
-            mask[:, idx_bottom:idx_top, idx_left:idx_right] = 1
-
-            image = mask * img_add + (1 - mask) * image
-            images_new.append(image.unsqueeze(dim=0))
-
-        return torch.cat(images_new)
+        images_new = torch.cat(images_new)
+        return images_new
     
     def gen_dynamic_weights_sds(face_indicators, targets, preds_ori_sds, factor=0.2, out_dtype=None):
         """1-main-debias-ftdiff.py의 gen_dynamic_weights와 동일한 로직을 SDS 기준으로 옮긴 것.
@@ -3417,7 +3478,8 @@ def main(args):
         # and SDS-labeled image grids (_ori_sds.jpg / _generated_sds.jpg).
         # When --save_attmaps is on the SDS forward is already run for the attmap,
         # so this shares that same forward (no extra UNet passes).
-        return True
+        # [per-occ] SDS is unrelated to CLIP-T; allow skipping it to speed eval.
+        return (not getattr(args, "disable_sds_eval", False))
 
     def evaluation_step(current_step):
         enable_sds_eval = should_enable_sds_eval(current_step)
@@ -3430,7 +3492,22 @@ def main(args):
         # evaluate EMA only
         if args.train_text_encoder:
             text_encoder_lora_dict_copy = copy.deepcopy(text_encoder_lora_dict)
-            load_state_dict_results = text_encoder.load_state_dict(text_encoder_lora_ema_dict, strict=False)
+            if getattr(args, "te_lora_ema_pth", None):
+                # [per-occ] Use the EMA weights exported by 2-export-checkpoint.py.
+                _ema_sd = torch.load(args.te_lora_ema_pth, map_location="cpu")
+                _ema_sd = {k: v.to(accelerator.device) for k, v in _ema_sd.items()}
+                # sanity: exported EMA must match the checkpoint's load_state EMA.
+                try:
+                    _md = 0.0
+                    for _k, _v in text_encoder_lora_ema_dict.items():
+                        if _k in _ema_sd:
+                            _md = max(_md, (_ema_sd[_k].float() - _v.float().to(_ema_sd[_k].device)).abs().max().item())
+                    logger.info(f"[per-occ CLIP-T] EMA .pth vs load_state max|diff| = {_md:.3e}")
+                except Exception as _e:
+                    logger.info(f"[per-occ CLIP-T] EMA diff check skipped: {_e}")
+                load_state_dict_results = text_encoder.load_state_dict(_ema_sd, strict=False)
+            else:
+                load_state_dict_results = text_encoder.load_state_dict(text_encoder_lora_ema_dict, strict=False)
         
         if args.train_unet:
             with torch.no_grad():

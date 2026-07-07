@@ -169,3 +169,20 @@ outputs/
 original-SD-generated-images/
 **/2-export-checkpoint_old.py
 **/eval-commands.txt
+
+# ===== Large experiment outputs / artifacts — keep code in git, not outputs =====
+# Big eval/analysis output trees (GBs)
+exp-1-debias-gender/outputs_eval800/
+# Model weights & tensors
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.bin
+*.npy
+*.npz
+# Rendered/analysis images (analysis dirs keep their .py, not the PNGs/JPGs)
+*.png
+*.jpg
+*.jpeg
+*.gif

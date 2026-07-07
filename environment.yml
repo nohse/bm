@@ -200,6 +200,6 @@ dependencies:
       - triton==2.1.0
       - typing-extensions==4.10.0
       - urllib3==2.2.1
-      - wandb==0.16.4
+      - wandb==0.22.3
       - wcwidth==0.2.13
       - zipp==3.17.0

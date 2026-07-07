@@ -16,8 +16,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 
 import os
-import sys
-import shlex
 from pathlib import Path
 
 import argparse
@@ -972,7 +970,7 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--resume_from_checkpoint",
         type=str,
-        default="./outputs/gender_aaai/20260707-1144_gender_aaai_region-attn_skip-50pct_wImg-4_wRealFace-4.0_Th-0.2_lr-5e-05/ckpts/checkpoint_tmp-260",
+        default="",
         help="provide the checkpoint path to resume from checkpoint",
     )
     parser.add_argument(
@@ -1035,10 +1033,10 @@ def parse_args(input_args=None):
 
     # loss weight
     parser.add_argument(
-        '--weight_loss_img',
-        default=8,
-        help="weight for the image semantics preserving loss",
-        type=float,
+        '--weight_loss_img', 
+        default=4,
+        help="weight for the image semantics preserving loss", 
+        type=float, 
     )
     parser.add_argument(
         '--weight_loss_face', 
@@ -1273,7 +1271,7 @@ def parse_args(input_args=None):
     # =====================
     # [ADDED] Region masking switch (face / attn / none)
     # =====================
-    parser.add_argument("--region_mask_mode", type=str, default="attn",
+    parser.add_argument("--region_mask_mode", type=str, default="none",
                         choices=["none", "face", "attn"],
                         help="SDS 및 backprop에서 사용할 영역 마스킹 방식 선택. 'attn'은 SDS 분류 프롬프트(woman/man) 토큰 기반 어텐션 맵, 'face'는 얼굴 bbox(학습 시 자동 비활성), 'none'은 전체.")
     parser.add_argument(
@@ -1450,104 +1448,6 @@ def set_token_mask_all(rec_dict, mask):
     for rp in rec_dict.values():
         rp.set_token_mask(mask)
 
-def _to_wandb_serializable(v):
-    """Coerce an arbitrary arg value into something wandb-config / yaml can store,
-    without ever dropping it. Simple scalars pass through; containers recurse;
-    anything else falls back to its repr string so NOTHING is silently omitted."""
-    if isinstance(v, (str, int, float, bool)) or v is None:
-        return v
-    if isinstance(v, (list, tuple)):
-        return [_to_wandb_serializable(x) for x in v]
-    if isinstance(v, dict):
-        return {str(k): _to_wandb_serializable(x) for k, x in v.items()}
-    return str(v)
-
-
-def _write_run_config_files(args, save_dir, code_path):
-    """Dump EVERY resolved argument (nothing omitted) plus the exact launch command
-    and key library versions to disk, for byte-level reproduction.
-
-    Writes three files into ``save_dir`` and returns their paths:
-      * all_args.txt      -- human-readable ``key = value`` for every arg in vars(args)
-      * all_args.yaml     -- machine-reproducible; feed straight back via ``--config``
-      * run_command.txt   -- exact ``sys.argv`` command line + python/lib versions
-    """
-    os.makedirs(save_dir, exist_ok=True)
-    # vars(args) here is the FINAL, fully-resolved namespace: CLI + merged --config
-    # overrides + derived fields (target_female_ratio, imgs_save_dir, ckpts_save_dir).
-    args_dict = {k: _to_wandb_serializable(v) for k, v in sorted(vars(args).items())}
-    now = datetime.now(my_timezone)
-
-    txt_path = os.path.join(save_dir, "all_args.txt")
-    with open(txt_path, "w") as f:
-        f.write(f"# Full argument dump: {len(args_dict)} args, nothing omitted\n")
-        f.write(f"# written : {now.isoformat()}\n")
-        f.write(f"# script  : {code_path}\n")
-        f.write("# " + "=" * 72 + "\n")
-        for k, v in args_dict.items():
-            f.write(f"{k} = {v!r}\n")
-
-    yaml_path = os.path.join(save_dir, "all_args.yaml")
-    with open(yaml_path, "w") as f:
-        f.write(f"# Reproduce this run with: python {os.path.basename(code_path)} --config all_args.yaml\n")
-        yaml.safe_dump(args_dict, f, default_flow_style=False, sort_keys=True, allow_unicode=True)
-
-    cmd_path = os.path.join(save_dir, "run_command.txt")
-    with open(cmd_path, "w") as f:
-        f.write("# exact command line (sys.argv)\n")
-        f.write("python " + " ".join(shlex.quote(a) for a in sys.argv) + "\n\n")
-        f.write("# environment\n")
-        f.write(f"python       = {sys.version.split()[0]}\n")
-        f.write(f"torch        = {torch.__version__}\n")
-        f.write(f"diffusers    = {diffusers.__version__}\n")
-        f.write(f"transformers = {transformers.__version__}\n")
-        f.write(f"numpy        = {np.__version__}\n")
-        try:
-            import wandb as _wb
-            f.write(f"wandb        = {_wb.__version__}\n")
-        except Exception:
-            pass
-
-    return txt_path, yaml_path, cmd_path
-
-
-def _log_repro_to_wandb(args, wandb, code_path):
-    """Upload the full arg dump + this source file to wandb so the run is exactly
-    reproducible: every arg lands in the wandb config panel, the txt/yaml/command
-    files and the code file show up under the run's Files tab, and an immutable
-    versioned artifact bundles all of them together.
-
-    Best-effort: any wandb failure is logged and swallowed so it can never crash a
-    training run. Call only on the main process, AFTER init_trackers.
-    """
-    run_dir = os.path.dirname(args.imgs_save_dir)            # .../<folder_name>
-    cfg_dir = os.path.join(run_dir, "run_config")
-    txt_path, yaml_path, cmd_path = _write_run_config_files(args, cfg_dir, code_path)
-
-    try:
-        # 1) every single arg -> wandb config panel (searchable/filterable)
-        wandb.config.update(
-            {k: _to_wandb_serializable(v) for k, v in vars(args).items()},
-            allow_val_change=True,
-        )
-        # 2) drop the files (incl. the code file) into the run's Files tab
-        for p in (txt_path, yaml_path, cmd_path, code_path):
-            wandb.save(p, base_path=os.path.dirname(p), policy="now")
-        # 3) immutable, versioned bundle for exact reproduction
-        art = wandb.Artifact(name=f"run-repro-{wandb.run.id}", type="run-config")
-        art.add_file(txt_path, name="all_args.txt")
-        art.add_file(yaml_path, name="all_args.yaml")
-        art.add_file(cmd_path, name="run_command.txt")
-        art.add_file(code_path, name=os.path.basename(code_path))
-        wandb.run.log_artifact(art)
-        logger.info(
-            f"[repro] uploaded {len(vars(args))} args + code to wandb "
-            f"(config + Files + artifact 'run-repro-{wandb.run.id}'); local copy: {cfg_dir}"
-        )
-    except Exception as e:
-        logger.warning(f"[repro] failed to upload args/code to wandb (continuing): {e}")
-
-
 def main(args):
 
     if not args.train_text_encoder and not args.train_unet:
@@ -1643,19 +1543,14 @@ def main(args):
         os.makedirs(args.imgs_save_dir, exist_ok=True)
         os.makedirs(args.ckpts_save_dir, exist_ok=True)
         accelerator.init_trackers(
-            args.proj_name,
+            args.proj_name, 
             init_kwargs = {
                 "wandb": {
-                    "name": folder_name,
+                    "name": folder_name, 
                     "dir": args.output_dir
                         }
                 }
             )
-
-        # Reproducibility: push every resolved arg + this source file to wandb so the
-        # run can be reproduced exactly (config panel + all_args.txt/yaml + run_command.txt
-        # + the code file, plus an immutable versioned artifact). Best-effort, main proc only.
-        _log_repro_to_wandb(args, wandb, os.path.abspath(__file__))
 
     tokenizer = CLIPTokenizer.from_pretrained(
         args.pretrained_model_name_or_path,
@@ -3413,43 +3308,52 @@ def main(args):
         return logs, log_imgs
     
     def apply_grad_hook_face(images, face_bboxs, face_bboxs_ori, targets, preds_gender_ori, factor=0.1):
-        """apply gradient hook on non-face regions of the generated images
+        """Scale gradients on the same face region used by 1-main-debias-ftdiff.py.
 
-        1-main-debias-ftdiff.py의 apply_grad_hook_face와 동일한 구현(안전가드 제거).
-        얼굴영역(gen bbox ∩ ori bbox)에만 grad hook을 걸어 img loss 경사를 조절한다.
-        class는 mnet이 아니라 SDS로 잰 original 예측(preds_gender_ori)을 사용한다.
+        The hook is attached to the intersection of the generated-image face bbox
+        and the original-image face bbox. If that region cannot be formed, the
+        image is left unchanged.
         """
         images_new = []
-        for image, face_bbox, face_bbox_ori, target, pred_gender_ori in itertools.zip_longest(images, face_bboxs, face_bboxs_ori, targets, preds_gender_ori):
+        for image, face_bbox, face_bbox_ori, target, pred_gender_ori in itertools.zip_longest(
+            images, face_bboxs, face_bboxs_ori, targets, preds_gender_ori
+        ):
             if (face_bbox == -1).all():
                 images_new.append(image.unsqueeze(dim=0))
-            else:
-                img_width, img_height = image.shape[1:]
-                idx_left = max(face_bbox[0], face_bbox_ori[0], 0)
-                idx_right = min(face_bbox[2], face_bbox_ori[2], img_width)
-                idx_bottom = max(face_bbox[1], face_bbox_ori[1], 0)
-                idx_top = min(face_bbox[3], face_bbox_ori[3], img_height)
-
-                img_face = image[:,idx_bottom:idx_top,idx_left:idx_right].clone()
-                if target==-1:
-                    grad_hook = make_grad_hook(factor)
-                elif target==pred_gender_ori:
-                    grad_hook = make_grad_hook(1)
-                elif target!=pred_gender_ori:
-                    grad_hook = make_grad_hook(factor)
-                img_face.register_hook(grad_hook)
-
-                img_add = torch.zeros_like(image)
-                img_add[:,idx_bottom:idx_top,idx_left:idx_right] = img_face
-
-                mask = torch.zeros_like(image)
-                mask[:,idx_bottom:idx_top,idx_left:idx_right] = 1
-
-                image = mask*img_add + (1-mask)*image
+                continue
+            if (face_bbox_ori == -1).all():
                 images_new.append(image.unsqueeze(dim=0))
+                continue
 
-        images_new = torch.cat(images_new)
-        return images_new
+            img_height, img_width = image.shape[-2:]
+            idx_left = max(int(round(face_bbox[0].item())), int(round(face_bbox_ori[0].item())), 0)
+            idx_right = min(int(round(face_bbox[2].item())), int(round(face_bbox_ori[2].item())), img_width)
+            idx_bottom = max(int(round(face_bbox[1].item())), int(round(face_bbox_ori[1].item())), 0)
+            idx_top = min(int(round(face_bbox[3].item())), int(round(face_bbox_ori[3].item())), img_height)
+
+            if idx_right <= idx_left or idx_top <= idx_bottom:
+                images_new.append(image.unsqueeze(dim=0))
+                continue
+
+            img_face = image[:, idx_bottom:idx_top, idx_left:idx_right].clone()
+            if target == -1:
+                grad_hook = make_grad_hook(factor)
+            elif target == pred_gender_ori:
+                grad_hook = make_grad_hook(1)
+            elif target != pred_gender_ori:
+                grad_hook = make_grad_hook(factor)
+            img_face.register_hook(grad_hook)
+
+            img_add = torch.zeros_like(image)
+            img_add[:, idx_bottom:idx_top, idx_left:idx_right] = img_face
+
+            mask = torch.zeros_like(image)
+            mask[:, idx_bottom:idx_top, idx_left:idx_right] = 1
+
+            image = mask * img_add + (1 - mask) * image
+            images_new.append(image.unsqueeze(dim=0))
+
+        return torch.cat(images_new)
     
     def gen_dynamic_weights_sds(face_indicators, targets, preds_ori_sds, factor=0.2, out_dtype=None):
         """1-main-debias-ftdiff.py의 gen_dynamic_weights와 동일한 로직을 SDS 기준으로 옮긴 것.

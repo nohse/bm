@@ -1,0 +1,24 @@
+# Controlled last-step-vs-all-steps h-space loss comparison config.
+# Copy of debias-text-encoder2.yaml (the config used by the check_last_cos example),
+# with two purpose-built changes:
+#   - weight_loss_img: 4 -> 8   ("8 img loss")
+#   - max_train_steps: 10000 -> 600
+# parse_args() applies this YAML AFTER the CLI flags, so these keys OVERRIDE any
+# matching --flag. weight_loss_img is pinned to 8 here so both runs get exactly 8
+# (a CLI --weight_loss_img is redundant but harmless as long as it is also 8).
+# Shared verbatim by BOTH runs (check_last_cos.py and the block_ablation.py) so the
+# only intended difference is the h-space loss (last step vs all steps).
+proj_name: gender_aaai
+train_text_encoder: True
+train_unet: False
+weight_loss_img: 8
+weight_loss_face: 0
+factor1: 0.2
+factor2: 0.2
+uncertainty_threshold: 0.2
+train_images_per_prompt_GPU: 12
+train_GPU_batch_size: 3
+val_images_per_prompt_GPU: 30
+val_GPU_batch_size: 8
+learning_rate: 5e-5
+max_train_steps: 600

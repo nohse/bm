@@ -972,7 +972,7 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--resume_from_checkpoint",
         type=str,
-        default="./outputs/gender_aaai/20260707-1144_gender_aaai_region-attn_skip-50pct_wImg-4_wRealFace-4.0_Th-0.2_lr-5e-05/ckpts/checkpoint_tmp-260",
+        default="",
         help="provide the checkpoint path to resume from checkpoint",
     )
     parser.add_argument(
@@ -3833,6 +3833,9 @@ def main(args):
             loss_face_realistic_i = torch.ones(targets.shape, dtype=weight_dtype, device=accelerator.device) *(-1)
             loss_img_x0_clip_dino_i = torch.ones(targets.shape, dtype=weight_dtype, device=accelerator.device) *(-1)
             loss_i = torch.ones(targets.shape, dtype=weight_dtype, device=accelerator.device) *(-1)
+            # [exceptnoface] 각 step에서 '생성 이미지'의 얼굴 검출 여부를 모아두는 버퍼.
+            # (얼굴 미검출 → fair loss 제외) 스텝 단위로 집계/로깅하기 위해 사용한다.
+            face_indicators_i = torch.zeros(targets.shape, dtype=torch.bool, device=accelerator.device)
 
             idxs_i = list(range(targets.shape[0]))
             N_backward = math.ceil(targets.shape[0] / args.train_GPU_batch_size)
@@ -3856,6 +3859,8 @@ def main(args):
                 )
                 with torch.no_grad():
                     face_indicators_ij, face_bboxs_ij, _, _, _ = get_face(images_ij)
+                    # [exceptnoface] 생성 이미지의 얼굴 검출 결과를 step 버퍼에 기록(로깅용)
+                    face_indicators_i[idxs_ij] = face_indicators_ij.to(dtype=torch.bool)
 
                 # --- SDS classifier WITH gradient (fair loss) ---
                 # 1-main-debias-ftdiff.py와 동일하게, fair-loss 분류는 apply_grad_hook_face가
@@ -3894,7 +3899,12 @@ def main(args):
                 loss_img_x0_clip_dino_ij = (loss_CLIP_ij + loss_DINO_ij).to(weight_dtype)
 
                 loss_fair_ij = torch.ones(len(idxs_ij), dtype=weight_dtype, device=accelerator.device) *(-1)
-                idxs_valid = (targets_ij != -1).nonzero().view([-1])
+                # 얼굴이 검출되지 않은(생성) 이미지는 fair loss 학습에서 제외한다.
+                # 1-main-debias-ftdiff.py와 동일하게, 생성 이미지에서 얼굴이 검출된
+                # (face_indicators_ij == True) 표본에만 fair(gender) CE loss를 건다.
+                # 얼굴 미검출 표본은 loss_fair_ij == -1(상수, grad 없음)로 남아 fair loss
+                # 경사에 기여하지 않는다(뒤에서 -1은 로깅 집계에서도 제외됨).
+                idxs_valid = ((face_indicators_ij == True) * (targets_ij != -1)).nonzero().view([-1])
                 logits_gender_ij = logits_gender_ij.half()
                 if idxs_valid.numel() > 0:
                     loss_fair_ij[idxs_valid] = CE_loss(logits_gender_ij[idxs_valid], targets_ij[idxs_valid])
@@ -3933,6 +3943,25 @@ def main(args):
             loss_face_realistic_all = customized_all_gather(loss_face_realistic_i, accelerator)
             loss_img_x0_clip_dino_all = customized_all_gather(loss_img_x0_clip_dino_i, accelerator)
             loss_all = customized_all_gather(loss_i, accelerator)
+
+            # [exceptnoface] 스텝 단위 얼굴-게이트 집계 로그.
+            # 이 시점의 loss_fair_all은 아직 -1 필터 전이므로 (loss_fair_all != -1)이 곧
+            # fair loss에 참여한 표본(=얼굴 검출 && target 유효)의 수이다. 얼굴이 검출되지
+            # 않은 표본은 여기서 빠지며, 그 수를 함께 출력한다.
+            face_indicators_all_log = customized_all_gather(face_indicators_i, accelerator)
+            targets_all_log = customized_all_gather(targets, accelerator)
+            if accelerator.is_main_process:
+                n_total = int(loss_fair_all.shape[0])
+                n_face = int(face_indicators_all_log.sum().item())
+                n_valid_target = int((targets_all_log != -1).sum().item())
+                n_participate = int((loss_fair_all != -1).sum().item())
+                n_excluded_noface = n_valid_target - n_participate
+                accelerator.print(
+                    f"\t[fair-loss face-gate] step={global_step} | "
+                    f"generated faces detected: {n_face}/{n_total} | "
+                    f"fair-loss participants (face & valid target): {n_participate}/{n_valid_target} | "
+                    f"excluded no-face (valid target): {n_excluded_noface}"
+                )
 
             loss_all = loss_all[loss_fair_all!=-1]
             loss_fair_all = loss_fair_all[loss_fair_all!=-1]

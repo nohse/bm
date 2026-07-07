@@ -1,0 +1,28 @@
+# debias-text-encoder3.yaml + attmap hard-threshold grad gate.
+# All requested knobs pinned EXPLICITLY (config overrides CLI in this script).
+proj_name: gender_aaai
+train_text_encoder: True
+train_unet: False
+
+# --- requested losses / denoising ---
+weight_loss_img: 2                 # img semantics preserving loss (CLIP+DINO)
+weight_loss_face_realistic: 4      # realistic-face SDS loss ("a photo of a realistic face")
+skip_final_steps_pct: 50           # truncated denoising: skip final 50% of sampled steps
+
+weight_loss_face: 0
+factor1: 0.2
+factor2: 0.2
+uncertainty_threshold: 0.2
+
+# --- NEW: img-loss grad gate uses the HARD attmap threshold (not the face detector) ---
+grad_region_mode: attn             # relax img-preservation grad on the attmap region
+grad_attn_threshold: 0.2           # per-image min-max normalized attmap, hard >= 0.1
+save_grad_attn_masks: True         # save panels showing how the 0.1 mask is applied
+# region_mask_mode stays "attn" (default): SDS logit uses the SOFT attmap weight (unchanged)
+
+train_images_per_prompt_GPU: 8
+train_GPU_batch_size: 4
+val_images_per_prompt_GPU: 20
+val_GPU_batch_size: 8
+learning_rate: 5e-5
+max_train_steps: 10000

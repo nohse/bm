@@ -1,4 +1,4 @@
-    #!/usr/bin/env python
+#!/usr/bin/env python
 # coding=utf-8
 # Copyright 2023 The HuggingFace Inc. team. All rights reserved.
 #
@@ -407,7 +407,7 @@ def attmap_to_pil(att: torch.Tensor) -> Image.Image:
 
 
 def save_attmaps(att: Optional[torch.Tensor], save_dir: str, prefix: str):
-    """Save attention maps to `save_dir` with filenames `{prefix}_{i}.jpg`.
+    """Save attention maps to `save_dir` with filenames `{prefix}_{i}.png`.
 
     Args:
         att: Tensor of shape (B, H, W) or (H, W) with values in [0,1].
@@ -429,8 +429,8 @@ def save_attmaps(att: Optional[torch.Tensor], save_dir: str, prefix: str):
 
     for i in range(ten.shape[0]):
         pil = attmap_to_pil(ten[i])
-        fname = f"{prefix}_{i}.jpg"
-        pil.save(os.path.join(save_dir, fname), format="JPEG", quality=95)
+        fname = f"{prefix}_{i}.png"
+        pil.save(os.path.join(save_dir, fname), format="PNG", optimize=True)
 
 
 def attmap_overlay_on_image(att_map: torch.Tensor, image: torch.Tensor, alpha: float = 0.45) -> Image.Image:
@@ -494,8 +494,8 @@ def save_attmaps_with_overlay(att: Optional[torch.Tensor], images: torch.Tensor,
     for i in range(n):
         try:
             blended = attmap_overlay_on_image(ten[i], imgs[i], alpha=alpha)
-            fname = f"{prefix}_{i}_overlay.jpg"
-            blended.save(os.path.join(save_dir, fname), format="JPEG", quality=95)
+            fname = f"{prefix}_{i}_overlay.png"
+            blended.save(os.path.join(save_dir, fname), format="PNG", optimize=True)
         except Exception as e:
             print(f"[attmap overlay save error] idx={i} -> {e}")
 
@@ -705,110 +705,19 @@ def make_grad_hook(coef):
     return lambda x: coef * x
 
 def customized_all_gather(tensor, accelerator, return_tensor_other_processes=False):
-    """All-gather a tensor along dim 0 across processes.
-
-    Hardened against the NCCL deadlock that used to hang a whole run for the full
-    watchdog timeout (~1h) and then SIGABRT it. torch.distributed.all_gather requires
-    every rank to pass an IDENTICALLY shaped tensor, but the old implementation passed
-    each rank's raw tensor with no agreement step: if two ranks ever disagreed on a
-    shape (e.g. a per-rank, data-dependent count) every rank blocked until the timeout.
-
-    Now we first all_gather a tiny FIXED-SIZE shape descriptor (a collective that can
-    never deadlock), then:
-      * all shapes equal     -> original fast path (result is byte-for-byte identical);
-      * only dim-0 differs    -> log the per-rank shapes and pad-to-max / gather / trim
-                                 so the run survives instead of hanging;
-      * trailing dims differ  -> raise a clear, SYNCHRONIZED error on every rank (every
-                                 rank sees the same gathered descriptors and raises the
-                                 same way, so this also cannot deadlock).
-    """
-    world = accelerator.num_processes
-    t = tensor.detach()
-
-    if world == 1:
-        tensor_all = t.clone()
-        if return_tensor_other_processes:
-            tensor_others = torch.empty([0,] + list(t.shape[1:]), device=accelerator.device, dtype=t.dtype)
-            return tensor_all, tensor_others
-        return tensor_all
-
-    # 1) fixed-size shape+dtype agreement -- this collective itself can never hang.
-    #    NOTE: torch.distributed.all_gather requires identical SHAPE *and* DTYPE on every
-    #    rank, so we check both. (A fp16-vs-fp32 dtype split from a no-face code path was
-    #    the actual cause of the eval hangs, and shapes alone are identical there.)
-    _MAXD = 8
-    _DTYPE_CODES = {
-        torch.float32: 0, torch.float16: 1, torch.bfloat16: 2, torch.float64: 3,
-        torch.int64: 4, torch.int32: 5, torch.int16: 6, torch.int8: 7,
-        torch.uint8: 8, torch.bool: 9,
-    }
-    assert t.dim() <= _MAXD, f"customized_all_gather: tensor ndim {t.dim()} exceeds {_MAXD}"
-    desc = torch.full([_MAXD + 2], -1, dtype=torch.long, device=t.device)
-    desc[0] = t.dim()
-    if t.dim() > 0:
-        desc[1:1 + t.dim()] = torch.tensor(list(t.shape), dtype=torch.long, device=t.device)
-    desc[_MAXD + 1] = _DTYPE_CODES.get(t.dtype, -2)
-    descs = [torch.empty_like(desc) for _ in range(world)]
-    torch.distributed.all_gather(descs, desc)
-    shapes, dtype_codes = [], []
-    for d in descs:
-        nd = int(d[0].item())
-        shapes.append(tuple(int(x) for x in d[1:1 + nd].tolist()))
-        dtype_codes.append(int(d[_MAXD + 1].item()))
-
-    shapes_equal = all(s == shapes[0] for s in shapes)
-    dtypes_equal = all(c == dtype_codes[0] for c in dtype_codes)
-
-    if shapes_equal and dtypes_equal:
-        # 2a) fast path: identical shape+dtype -> original behavior, unchanged.
-        tensor_all = [t.clone() for _ in range(world)]
-        torch.distributed.all_gather(tensor_all, t)
-        if return_tensor_other_processes:
-            tensor_others = torch.cat(
-                [tensor_all[idx] for idx in range(world) if idx != accelerator.local_process_index], dim=0
-            )
-        tensor_all = torch.cat(tensor_all, dim=0)
-        return (tensor_all, tensor_others) if return_tensor_other_processes else tensor_all
-
-    # 2b) metadata disagrees: the old code would have DEADLOCKED here.
-    if not dtypes_equal:
-        # dtype codes: 0=f32 1=f16 2=bf16 3=f64 4=i64 5=i32 6=i16 7=i8 8=u8 9=bool (-2=other)
-        raise RuntimeError(
-            "customized_all_gather: tensor DTYPE differs across ranks "
-            f"(per-rank dtype codes: {dtype_codes}, shapes: {shapes}); this cannot be "
-            "all_gathered and would have deadlocked NCCL until the watchdog timeout. "
-            "dtype codes: 0=f32 1=f16 2=bf16 3=f64 4=i64 5=i32 6=i16 7=i8 8=u8 9=bool."
-        )
-    if any(len(s) != len(shapes[0]) or s[1:] != shapes[0][1:] for s in shapes):
-        raise RuntimeError(
-            "customized_all_gather: tensors differ across ranks in ndim or trailing dims "
-            f"(per-rank shapes: {shapes}); this cannot be all_gathered and would have "
-            "deadlocked NCCL until the watchdog timeout."
-        )
-    if accelerator.is_main_process:
-        print(
-            "[customized_all_gather][WARN] dim-0 length differs across ranks "
-            f"(per-rank shapes: {shapes}); padding to max and trimming so the run survives "
-            "(the old code would have hung until the NCCL watchdog timeout)."
-        )
-    sizes = [s[0] for s in shapes]
-    max_n = max(sizes)
-    if t.shape[0] < max_n:
-        pad = torch.zeros([max_n - t.shape[0], *t.shape[1:]], device=t.device, dtype=t.dtype)
-        t_pad = torch.cat([t, pad], dim=0)
-    else:
-        t_pad = t
-    gathered = [torch.empty_like(t_pad) for _ in range(world)]
-    torch.distributed.all_gather(gathered, t_pad)
-    parts = [gathered[r][:sizes[r]] for r in range(world)]
-    tensor_all = torch.cat(parts, dim=0)
+    tensor_all = [tensor.detach().clone() for i in range(accelerator.num_processes)]
+    torch.distributed.all_gather(tensor_all, tensor)
     if return_tensor_other_processes:
-        others_parts = [parts[r] for r in range(world) if r != accelerator.local_process_index]
-        tensor_others = torch.cat(others_parts, dim=0) if others_parts else torch.empty(
-            [0,] + list(t.shape[1:]), device=t.device, dtype=t.dtype
-        )
+        if accelerator.num_processes>1:
+            tensor_others = torch.cat([tensor_all[idx] for idx in range(accelerator.num_processes) if idx != accelerator.local_process_index], dim=0)
+        else:
+            tensor_others = torch.empty([0,]+ list(tensor_all[0].shape[1:]), device=accelerator.device, dtype=tensor_all[0].dtype)
+    tensor_all = torch.cat(tensor_all, dim=0)
+    
+    if return_tensor_other_processes:
         return tensor_all, tensor_others
-    return tensor_all
+    else:
+        return tensor_all
 
 
 def expand_bbox(bbox, expand_coef, target_ratio):
@@ -1222,13 +1131,19 @@ def parse_args(input_args=None):
     parser.add_argument("--sds_num_t", type=int, default=15, help="number of t samples (linspace)")
     parser.add_argument("--sds_num_eps", type=int, default=1, help="number of epsilon samples per t")
     parser.add_argument("--sds_tau", type=float, default=0.0001, help="temperature for -softmax on SDS losses")
-    # h-space loss measured during denoising trajectory (fine DM vs original DM)
+    # h-space L2 loss (replaces trajectory eps L2 in the img-loss slot of total loss)
     parser.add_argument(
-        "--h_loss_form", type=str, default="raw",
-        choices=["raw", "cos"],
-        help="h-space distance form during generation steps. "
-             "'raw' = elementwise MSE (default). "
-             "'cos' = 1 - cosine_similarity on flattened h (scale-invariant).",
+        "--h_loss_num_t", type=int, default=5,
+        help="K_h: number of timesteps used for the h-space L2 loss, picked as a "
+             "subset of the sds_num_t timesteps (so reuses the SDS zt and eps). "
+             "Must be <= sds_num_t.",
+    )
+    parser.add_argument(
+        "--h_loss_t_select", type=str, default="stratified",
+        choices=["stratified", "random", "first", "all"],
+        help="how to choose h_loss_num_t indices from the SDS t list. "
+             "'stratified' = evenly spaced; 'random' = new random subset each step; "
+             "'first' = first K; 'all' = use every SDS timestep (h_loss_num_t ignored).",
     )
     parser.add_argument("--attn_grad_threshold", type=float, default=0.2, help="threshold for binary grad gate on attn map")
     # parse_args() 안의 인자들 사이에 추가
@@ -1271,7 +1186,7 @@ def parse_args(input_args=None):
     # =====================
     # [ADDED] Region masking switch (face / attn / none)
     # =====================
-    parser.add_argument("--region_mask_mode", type=str, default="none",
+    parser.add_argument("--region_mask_mode", type=str, default="attn",
                         choices=["none", "face", "attn"],
                         help="SDS 및 backprop에서 사용할 영역 마스킹 방식 선택. 'attn'은 SDS 분류 프롬프트(woman/man) 토큰 기반 어텐션 맵, 'face'는 얼굴 bbox(학습 시 자동 비활성), 'none'은 전체.")
     parser.add_argument(
@@ -1286,21 +1201,8 @@ def parse_args(input_args=None):
         action="store_false",
         help="평가 시 attmap/overlay 저장을 끕니다.",
     )
-    parser.add_argument(
-        "--log_wandb_images",
-        dest="log_wandb_images",
-        action="store_true",
-        help="평가/학습 이미지를 wandb에 업로드합니다.",
-    )
-    parser.add_argument(
-        "--no_wandb_images",
-        dest="log_wandb_images",
-        action="store_false",
-        help="이미지를 wandb에 업로드하지 않습니다(디스크 저장은 유지).",
-    )
-    parser.set_defaults(save_attmaps=True)
+    parser.set_defaults(save_attmaps=False)
     parser.set_defaults(eval_at_step0=False)
-    parser.set_defaults(log_wandb_images=True)
 
     parser.add_argument(
         "--eval_only",
@@ -1501,16 +1403,6 @@ def main(args):
         transformers.utils.logging.set_verbosity_error()
         diffusers.utils.logging.set_verbosity_error()
 
-    def dist_broadcast_if_needed(tensor, src=0):
-        if accelerator.num_processes == 1:
-            return
-        if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
-            raise RuntimeError(
-                "torch.distributed is not initialized even though Accelerator reports "
-                f"{accelerator.num_processes} processes. Launch with accelerate/torchrun."
-            )
-        torch.distributed.broadcast(tensor, src=src)
-
     set_seed(args.seed, device_specific=True)
 
     # Handle the repository creation
@@ -1521,20 +1413,8 @@ def main(args):
     # We need to initialize the trackers we use, and also store our configuration.
     # The trackers initializes automatically on the main process.
     now = datetime.now(my_timezone)
-    timestring = now.strftime("%Y%m%d-%H%M")
-    # Folder name encodes (per constrain.txt): date + which experiment (proj_name) +
-    # the run-defining knobs -> region_mask_mode (attn/none), final-step skip %, and
-    # each loss weight (img / realistic-face). NOTE: the fair-loss fields (_wFair-/_fcw-)
-    # from DAL are omitted here because this script has no weight_loss_fair /
-    # fair_correct_weight args (it uses the CE-based fair loss).
-    folder_name = (
-        f"{timestring}_{args.proj_name}"
-        f"_region-{args.region_mask_mode}"
-        f"_skip-{int(args.skip_final_steps_pct)}pct"
-        f"_wImg-{args.weight_loss_img}"
-        f"_wRealFace-{args.weight_loss_face_realistic}"
-        f"_Th-{args.uncertainty_threshold}_lr-{args.learning_rate}"
-    )
+    timestring = f"{now.month:02}{now.day:02}{now.hour:02}{now.minute:02}"
+    folder_name = f"BS-{args.train_images_per_prompt_GPU*accelerator.num_processes}_wImg-{args.weight_loss_img}-{args.factor1}-{args.factor2}_wFace-{args.weight_loss_face}_Th-{args.uncertainty_threshold}_loraR-{args.rank}_lr-{args.learning_rate}_{timestring}"
     
     args.imgs_save_dir = os.path.join(args.output_dir, args.proj_name, folder_name, "imgs")
     args.ckpts_save_dir = os.path.join(args.output_dir, args.proj_name, folder_name, "ckpts")
@@ -1656,13 +1536,6 @@ def main(args):
         clip_eval_model.eval().requires_grad_(False)
         clip_eval_tokenizer = open_clip.get_tokenizer(eval_clip_model_name)
 
-        # NOTE: dinov2_eval is loaded ONLY on the main process (we are inside
-        # `if accelerator.is_main_process`). There is therefore no cross-rank torch.hub
-        # cache race to serialize here. Wrapping a main-process-only load in
-        # accelerator.main_process_first() is a DEADLOCK: only rank 0 enters the context
-        # and calls its internal barrier() at the end, while ranks 1..N never execute the
-        # matching barrier -> NCCL hangs forever right after this load. Load directly
-        # (matches 1-main-gender-sgd_dmscr_h_gen.py).
         dinov2_eval = torch.hub.load('facebookresearch/dinov2', eval_dino_model_name)
         dinov2_eval.to(accelerator.device, dtype=weight_dtype)
         dinov2_eval.requires_grad_(False)
@@ -1709,7 +1582,7 @@ def main(args):
         unet_lora_layers = AttnProcsLayers(unet.attn_processors)
         
         for p in unet_lora_layers.parameters():
-            dist_broadcast_if_needed(p, src=0)
+            torch.distributed.broadcast(p, src=0)
         
         unet_lora_ema = EMAModel(unet_lora_layers.parameters(), decay=args.EMA_decay)
         unet_lora_ema.to(accelerator.device)
@@ -1722,7 +1595,7 @@ def main(args):
         text_encoder_lora_params = LoraLoaderMixin._modify_text_encoder(text_encoder, dtype=torch.float32, rank=args.rank, patch_mlp=True)
         
         for p in text_encoder_lora_params:
-            dist_broadcast_if_needed(p, src=0)
+            torch.distributed.broadcast(p, src=0)
                     
         text_encoder_lora_dict = {}
         text_encoder_lora_params_name_order = []
@@ -1741,7 +1614,7 @@ def main(args):
                 lora_param = text_encoder_lora_dict[name].detach().clone()
             else:
                 lora_param = torch.zeros_like(text_encoder_lora_dict[name])
-            dist_broadcast_if_needed(lora_param, src=0)
+            torch.distributed.broadcast(lora_param, src=0)
             text_encoder_lora_dict[name].data = lora_param
 
         class CustomModel(torch.nn.Module):
@@ -1860,13 +1733,7 @@ def main(args):
     clip_img_std = torch.tensor(clip_image_processoor.image_std).reshape([-1,1,1]).to(accelerator.device, dtype=weight_dtype) # std is based on range [0,1]
     
 
-    # Serialize the torch.hub download/extract across ranks. On a cold cache every rank
-    # otherwise downloads + extracts dinov2 into the same dir concurrently, and one rank's
-    # shutil.rmtree collides with another rank still extracting (OSError [Errno 39]
-    # Directory not empty: 'data'). Main process populates the cache first, barrier, then
-    # all ranks load from a warm cache.
-    with accelerator.main_process_first():
-        dinov2 = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitb14')
+    dinov2 = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitb14')
     dinov2.to(accelerator.device, dtype=weight_dtype)
     dinov2.requires_grad_(False)
     dinov2_img_mean = torch.tensor([0.485, 0.456, 0.406]).reshape([-1,1,1]).to(accelerator.device, dtype=weight_dtype)
@@ -2006,22 +1873,11 @@ def main(args):
         skip_final_steps: int = 0,
         skip_final_steps_pct: float = 0.0,
         return_z0_latents: bool = False,
-        return_hspace_loss: bool = False,
-        h_reference_text_encoder=None,
-        h_reference_unet=None,
+        return_eps_l2: bool = False,
+        eps_reference_text_encoder=None,
+        eps_reference_unet=None,
     ):
-        which_unet.train()
-        ref_is_same_unet = (h_reference_unet is which_unet)
-        if return_hspace_loss:
-            if h_reference_text_encoder is None or h_reference_unet is None:
-                raise ValueError(
-                    "return_hspace_loss=True requires h_reference_text_encoder and h_reference_unet."
-                )
-            # Keep checkpointing active when train_unet=False:
-            # in that case both handles point to the same `unet`, so calling eval()
-            # here would flip the training UNet to eval mode and disable gradient checkpointing.
-            if not ref_is_same_unet:
-                h_reference_unet.eval()
+        which_unet.train()  # <- 전역 unet 말고 which_unet로 맞추는 게 안전
 
         N = noises.shape[0]
         prompts = [prompt] * N
@@ -2035,10 +1891,13 @@ def main(args):
         prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds]).to(weight_dtype)
 
         ref_prompt_embeds = None
-        if return_hspace_loss:
+        eps_l2_terms = []
+        if return_eps_l2:
+            if eps_reference_text_encoder is None or eps_reference_unet is None:
+                raise ValueError("return_eps_l2=True requires eps_reference_text_encoder and eps_reference_unet.")
             with torch.no_grad():
                 ref_prompts_token = tokenizer(prompts, return_tensors="pt", padding=True).to(accelerator.device)
-                ref_prompt_embeds = h_reference_text_encoder(
+                ref_prompt_embeds = eps_reference_text_encoder(
                     ref_prompts_token["input_ids"], ref_prompts_token["attention_mask"]
                 )[0]
                 ref_uncond_input = tokenizer(
@@ -2048,7 +1907,7 @@ def main(args):
                     truncation=True,
                     return_tensors="pt",
                 ).to(accelerator.device)
-                ref_negative_prompt_embeds = h_reference_text_encoder(
+                ref_negative_prompt_embeds = eps_reference_text_encoder(
                     ref_uncond_input["input_ids"], ref_uncond_input["attention_mask"]
                 )[0]
                 ref_prompt_embeds = torch.cat([ref_negative_prompt_embeds, ref_prompt_embeds]).to(weight_dtype)
@@ -2084,118 +1943,86 @@ def main(args):
 
         steps_to_run = total_steps - skip_final_steps
         latents = noises
-        latents_ref = noises.detach().clone() if return_hspace_loss else None
-        hspace_terms = []
 
-        mid_capture_fine = MidBlockCapture().attach(which_unet) if return_hspace_loss else None
-        mid_capture_ref = None
-        if return_hspace_loss:
-            if ref_is_same_unet:
-                mid_capture_ref = mid_capture_fine
+        # 1) 앞부분 steps_to_run 만큼은 기존 step과 동일
+        for i, t in enumerate(timesteps[:steps_to_run]):
+            latent_model_input = torch.cat([latents.detach().to(weight_dtype)] * 2)
+            latent_model_input = noise_scheduler.scale_model_input(latent_model_input, t)
+
+            eps = which_unet(latent_model_input, t, encoder_hidden_states=prompt_embeds).sample
+            eps = eps.to(weight_dtype_high_precision)
+
+            eps_u, eps_c = eps.chunk(2)
+            eps = eps_u + args.guidance_scale * (eps_c - eps_u)
+
+            if return_eps_l2:
+                with torch.no_grad():
+                    ref_eps = eps_reference_unet(
+                        latent_model_input.detach(),
+                        t,
+                        encoder_hidden_states=ref_prompt_embeds,
+                    ).sample
+                    ref_eps = ref_eps.to(weight_dtype_high_precision)
+                    ref_eps_u, ref_eps_c = ref_eps.chunk(2)
+                    ref_eps = ref_eps_u + args.guidance_scale * (ref_eps_c - ref_eps_u)
+                eps_l2_terms.append(((eps - ref_eps.detach()) ** 2).mean(dim=(1, 2, 3)))
+
+            eps.register_hook(make_grad_hook(grad_coefs[i]))
+            latents = noise_scheduler.step(eps, t, latents).prev_sample
+        # 2) skip이 있으면: "현재 latents가 위치한 timestep"에서 eps를 다시 예측해 x0로 점프
+        if skip_final_steps > 0:
+            t_cur = timesteps[steps_to_run]  # <- 중요: steps_to_run-1가 아니라 steps_to_run
+
+            latent_model_input = torch.cat([latents.detach().to(weight_dtype)] * 2)
+            latent_model_input = noise_scheduler.scale_model_input(latent_model_input, t_cur)
+
+            eps = which_unet(latent_model_input, t_cur, encoder_hidden_states=prompt_embeds).sample
+            eps = eps.to(weight_dtype_high_precision)
+
+            eps_u, eps_c = eps.chunk(2)
+            eps = eps_u + args.guidance_scale * (eps_c - eps_u)
+
+            if return_eps_l2:
+                with torch.no_grad():
+                    ref_eps = eps_reference_unet(
+                        latent_model_input.detach(),
+                        t_cur,
+                        encoder_hidden_states=ref_prompt_embeds,
+                    ).sample
+                    ref_eps = ref_eps.to(weight_dtype_high_precision)
+                    ref_eps_u, ref_eps_c = ref_eps.chunk(2)
+                    ref_eps = ref_eps_u + args.guidance_scale * (ref_eps_c - ref_eps_u)
+                eps_l2_terms.append(((eps - ref_eps.detach()) ** 2).mean(dim=(1, 2, 3)))
+
+            eps.register_hook(make_grad_hook(grad_coefs[steps_to_run]))
+
+            step_out = noise_scheduler.step(eps, t_cur, latents)
+
+            # scheduler가 제공하면 이게 가장 안전 (clip/threshold 포함)
+            if hasattr(step_out, "pred_original_sample") and step_out.pred_original_sample is not None:
+                latents = step_out.pred_original_sample
             else:
-                mid_capture_ref = MidBlockCapture().attach(h_reference_unet)
-
-        try:
-            # compare h-space for every denoising step actually run (exclude skipped final tail)
-            for i, t in enumerate(timesteps[:steps_to_run]):
-                latent_model_input = torch.cat([latents.detach().to(weight_dtype)] * 2)
-                latent_model_input = noise_scheduler.scale_model_input(latent_model_input, t)
-                if return_hspace_loss:
-                    mid_capture_fine.last = None
-
-                eps = which_unet(latent_model_input, t, encoder_hidden_states=prompt_embeds).sample
-                h_fine = mid_capture_fine.last if return_hspace_loss else None
-                eps = eps.to(weight_dtype_high_precision)
-
-                eps_u, eps_c = eps.chunk(2)
-                eps = eps_u + args.guidance_scale * (eps_c - eps_u)
-                eps.register_hook(make_grad_hook(grad_coefs[i]))
-                latents = noise_scheduler.step(eps, t, latents).prev_sample
-
-                if return_hspace_loss:
-                    with torch.no_grad():
-                        latent_model_input_ref = torch.cat([latents_ref.to(weight_dtype)] * 2)
-                        latent_model_input_ref = noise_scheduler.scale_model_input(latent_model_input_ref, t)
-                        mid_capture_ref.last = None
-                        eps_ref = h_reference_unet(
-                            latent_model_input_ref,
-                            t,
-                            encoder_hidden_states=ref_prompt_embeds,
-                        ).sample
-                        h_ref = mid_capture_ref.last
-                        eps_ref = eps_ref.to(weight_dtype_high_precision)
-                        eps_ref_u, eps_ref_c = eps_ref.chunk(2)
-                        eps_ref = eps_ref_u + args.guidance_scale * (eps_ref_c - eps_ref_u)
-                        latents_ref = noise_scheduler.step(eps_ref, t, latents_ref).prev_sample
-
-                    if h_fine is None or h_ref is None:
-                        raise RuntimeError("Failed to capture mid_block h-space during denoising.")
-
-                    h_fine_cond = h_fine
-                    h_ref_cond = h_ref
-                    if h_fine_cond.shape[0] == 2 * N:
-                        h_fine_cond = h_fine_cond[N:]
-                    if h_ref_cond.shape[0] == 2 * N:
-                        h_ref_cond = h_ref_cond[N:]
-                    if h_fine_cond.shape != h_ref_cond.shape:
-                        raise RuntimeError(
-                            f"h-space shape mismatch: fine={tuple(h_fine_cond.shape)} ref={tuple(h_ref_cond.shape)}"
-                        )
-
-                    form = getattr(args, "h_loss_form", "raw")
-                    if form == "cos":
-                        loss_t = 1.0 - F.cosine_similarity(
-                            h_fine_cond.float().flatten(1),
-                            h_ref_cond.detach().float().flatten(1),
-                            dim=1,
-                        )
-                    else:
-                        loss_t = ((h_fine_cond.float() - h_ref_cond.detach().float()) ** 2).mean(dim=(1, 2, 3))
-                    hspace_terms.append(loss_t)
-
-            # keep original x0-jump behavior for image generation when final steps are skipped
-            if skip_final_steps > 0:
-                t_cur = timesteps[steps_to_run]
-
-                latent_model_input = torch.cat([latents.detach().to(weight_dtype)] * 2)
-                latent_model_input = noise_scheduler.scale_model_input(latent_model_input, t_cur)
-
-                eps = which_unet(latent_model_input, t_cur, encoder_hidden_states=prompt_embeds).sample
-                eps = eps.to(weight_dtype_high_precision)
-
-                eps_u, eps_c = eps.chunk(2)
-                eps = eps_u + args.guidance_scale * (eps_c - eps_u)
-                eps.register_hook(make_grad_hook(grad_coefs[steps_to_run]))
-
-                step_out = noise_scheduler.step(eps, t_cur, latents)
-                if hasattr(step_out, "pred_original_sample") and step_out.pred_original_sample is not None:
-                    latents = step_out.pred_original_sample
-                else:
-                    alpha_bar = noise_scheduler.alphas_cumprod[t_cur].to(device=latents.device, dtype=latents.dtype)
-                    latents = (latents - (1 - alpha_bar).sqrt() * eps.to(latents.dtype)) / alpha_bar.sqrt()
-        finally:
-            if mid_capture_fine is not None:
-                mid_capture_fine.detach()
-            if mid_capture_ref is not None and mid_capture_ref is not mid_capture_fine:
-                mid_capture_ref.detach()
+                # fallback: x0 공식
+                alpha_bar = noise_scheduler.alphas_cumprod[t_cur].to(device=latents.device, dtype=latents.dtype)
+                latents = (latents - (1 - alpha_bar).sqrt() * eps.to(latents.dtype)) / alpha_bar.sqrt()
 
         z0_latents = latents
         latents = latents / vae.config.scaling_factor
         images = vae.decode(latents.to(vae.dtype)).sample.clamp(-1, 1)
 
         att = None
-        hspace_loss = None
-        if return_hspace_loss:
-            if len(hspace_terms) == 0:
-                hspace_loss = torch.zeros([N], dtype=weight_dtype_high_precision, device=accelerator.device)
+        eps_l2 = None
+        if return_eps_l2:
+            if len(eps_l2_terms) == 0:
+                eps_l2 = torch.zeros([N], dtype=weight_dtype_high_precision, device=accelerator.device)
             else:
-                hspace_loss = torch.stack(hspace_terms, dim=0).mean(dim=0)
+                eps_l2 = torch.stack(eps_l2_terms, dim=0).mean(dim=0)
         if return_z0_latents:
-            if return_hspace_loss:
-                return images, att, z0_latents, hspace_loss
+            if return_eps_l2:
+                return images, att, z0_latents, eps_l2
             return images, att, z0_latents
-        if return_hspace_loss:
-            return images, att, hspace_loss
+        if return_eps_l2:
+            return images, att, eps_l2
         return images, att
 
     
@@ -2381,6 +2208,7 @@ def main(args):
         sds_scheduler=None,
         compute_realistic_sds: bool = False,
         return_attmap: bool = False,
+        diffusion_buffers_out: Optional[dict] = None,
     ):
         """
         - region_mask_mode == 'face': InsightFace로 검출된 얼굴 bbox를 latent/eps 해상도에 맞춰 이진 마스크 생성(미검출=full 1)
@@ -2403,6 +2231,18 @@ def main(args):
         alpha_bar = ddpm_forward.alphas_cumprod.to(device=accelerator.device, dtype=lat_exp.dtype)[t_vec]
         zt = alpha_bar.sqrt().view(-1,1,1,1) * lat_exp + (1.0 - alpha_bar).sqrt().view(-1,1,1,1) * eps
 
+        # Expose forward-diffusion buffers so the h-space loss can reuse t_idx / eps / zt
+        # without recomputing. Layout follows (B, K, num_eps) flattened (see lat_exp above).
+        if diffusion_buffers_out is not None:
+            diffusion_buffers_out["t_idx"] = t_idx          # [K]
+            diffusion_buffers_out["t_vec"] = t_vec           # [BKE]
+            diffusion_buffers_out["eps"] = eps               # [BKE, 4, 64, 64]
+            diffusion_buffers_out["zt"] = zt                 # [BKE, 4, 64, 64], grad through lat
+            diffusion_buffers_out["lat"] = lat               # [B, 4, 64, 64], grad through images
+            diffusion_buffers_out["B"] = B
+            diffusion_buffers_out["K"] = K
+            diffusion_buffers_out["num_eps"] = num_eps
+
         # --- 텍스트 임베딩 ---
         female_prompt = "a photo of a woman"
         male_prompt   = "a photo of a man"
@@ -2424,12 +2264,7 @@ def main(args):
         def _forward_with_optional_attn(prompt_embeds: torch.Tensor, token_positions: List[int]):
             capture = None
             att_bke = None
-            # Install the attention capture when the map is needed either as the SDS region
-            # weight (region_mask_mode == "attn") OR simply for saving/visualization
-            # (return_attmap). This lets --save_attmaps produce attmaps in every
-            # region_mask_mode ("none"/"face"/"attn") without changing the SDS loss.
-            want_attn_weight = (args.region_mask_mode == "attn" and args.use_attn_weight)
-            if (want_attn_weight or return_attmap) and len(token_positions) > 0:
+            if args.region_mask_mode == "attn" and args.use_attn_weight and len(token_positions) > 0:
                 capture = CrossAttnCapture(
                     token_indices=token_positions,
                     use_cpu=False,
@@ -2469,24 +2304,19 @@ def main(args):
                 # K, E 로 복제
                 w_map = face_mask_b.unsqueeze(1).unsqueeze(2).expand(B, K, num_eps, _H, _W).contiguous().view(BKE, _H, _W)
 
-        # woman/man 토큰 attmap 평균 계산 (어텐션이 캡처된 경우).
-        # region_mask_mode와 무관하게 계산해서 --save_attmaps 저장에 사용하고,
-        # 'attn' 모드에서는 아래에서 이 값을 그대로 SDS region weight(w_map)로 재사용한다.
-        if att_f_bke is not None and att_m_bke is not None:
-            a_f = att_f_bke.to(device=accelerator.device, dtype=torch.float32)
-            a_m = att_m_bke.to(device=accelerator.device, dtype=torch.float32)
-            if a_f.shape[-2:] != (_H, _W):
-                a_f = F.interpolate(a_f.unsqueeze(1), size=(_H, _W), mode="bilinear", align_corners=False).squeeze(1)
-            if a_m.shape[-2:] != (_H, _W):
-                a_m = F.interpolate(a_m.unsqueeze(1), size=(_H, _W), mode="bilinear", align_corners=False).squeeze(1)
-
-            att_f = a_f.reshape(B, K, num_eps, _H, _W).mean(dim=(1, 2))  # [B,H,W]
-            att_m = a_m.reshape(B, K, num_eps, _H, _W).mean(dim=(1, 2))  # [B,H,W]
-            attmap_mean = 0.5 * (att_f + att_m)
-
-        # region_mask_mode == 'attn': woman/man 토큰 attmap 평균을 SDS region weight로 사용
+        # region_mask_mode == 'attn': woman/man 토큰 attmap 평균 사용
         if args.region_mask_mode == "attn":
-            if args.use_attn_weight and attmap_mean is not None:
+            if args.use_attn_weight and att_f_bke is not None and att_m_bke is not None:
+                a_f = att_f_bke.to(device=accelerator.device, dtype=torch.float32)
+                a_m = att_m_bke.to(device=accelerator.device, dtype=torch.float32)
+                if a_f.shape[-2:] != (_H, _W):
+                    a_f = F.interpolate(a_f.unsqueeze(1), size=(_H, _W), mode="bilinear", align_corners=False).squeeze(1)
+                if a_m.shape[-2:] != (_H, _W):
+                    a_m = F.interpolate(a_m.unsqueeze(1), size=(_H, _W), mode="bilinear", align_corners=False).squeeze(1)
+
+                att_f = a_f.reshape(B, K, num_eps, _H, _W).mean(dim=(1, 2))  # [B,H,W]
+                att_m = a_m.reshape(B, K, num_eps, _H, _W).mean(dim=(1, 2))  # [B,H,W]
+                attmap_mean = 0.5 * (att_f + att_m)
                 w_map = (
                     attmap_mean.unsqueeze(1)
                     .unsqueeze(2)
@@ -2600,6 +2430,96 @@ def main(args):
         if return_attmap:
             return preds, probs32, logits32, sds_f32, sds_m32, sds_r32, attmap_mean
         return preds, probs32, logits32, sds_f32, sds_m32, sds_r32
+
+    def _pick_h_loss_indices(num_t_total: int, k_h: int, mode: str, step_idx: int = 0):
+        """Pick K_h timestep indices out of `num_t_total` SDS timesteps."""
+        if mode == "all" or k_h >= num_t_total:
+            return list(range(num_t_total))
+        k_h = max(1, k_h)
+        if mode == "first":
+            return list(range(k_h))
+        if mode == "random":
+            g = torch.Generator(device="cpu").manual_seed(int(step_idx))
+            perm = torch.randperm(num_t_total, generator=g).tolist()
+            return sorted(perm[:k_h])
+        # 'stratified' default: evenly spaced indices
+        positions = torch.linspace(0, num_t_total - 1, steps=k_h).round().long().tolist()
+        seen = set()
+        out = []
+        for p in positions:
+            if p not in seen:
+                out.append(p)
+                seen.add(p)
+        return out
+
+    def compute_h_loss(
+        images_ori_mb: torch.Tensor,    # [b, 3, H, W] in [-1,1], no_grad
+        diffusion_buffers: dict,        # populated by sds_logits_from_images for the LoRA branch
+        c_ori_mb: torch.Tensor,         # [b, 77, 768] original-text-encoder embeds for the prompt
+        ref_unet,                       # frozen original UNet (used for both branches)
+        mid_capture: MidBlockCapture,   # already attached to ref_unet
+        k_h: int,
+        select: str,
+        step_idx: int = 0,
+    ) -> torch.Tensor:
+        """h-space L2 loss between original and finetuned images.
+
+        Returns per-sample loss of shape [b]. Reuses zt and eps from the SDS pass on the
+        finetuned (LoRA) branch. Computes a fresh zt for the original branch with the same
+        eps so the only signal is x0 difference. Both branches are evaluated through the
+        SAME frozen UNet with the SAME (original) prompt embedding, and matched at the
+        mid_block bottleneck (full [B, 1280, 8, 8] tensor, elementwise L2).
+        """
+        device = accelerator.device
+        b = images_ori_mb.shape[0]
+        K = int(diffusion_buffers["K"])
+        E = int(diffusion_buffers["num_eps"])
+        t_idx_full = diffusion_buffers["t_idx"]            # [K]
+        eps_BKE = diffusion_buffers["eps"].view(b, K, E, *diffusion_buffers["eps"].shape[1:])
+        zt_BKE_fine = diffusion_buffers["zt"].view(b, K, E, *diffusion_buffers["zt"].shape[1:])
+
+        # encode original images (no_grad, no gradient needed for the anchor branch)
+        with torch.no_grad():
+            lat_ori = vae.encode(images_ori_mb.to(weight_dtype)).latent_dist.sample() * vae.config.scaling_factor
+            lat_ori = lat_ori.to(weight_dtype)
+
+        if c_ori_mb.shape[0] != b:
+            c_ori_mb = c_ori_mb.expand(b, *c_ori_mb.shape[1:]).to(weight_dtype)
+        else:
+            c_ori_mb = c_ori_mb.to(weight_dtype)
+
+        idx_list = _pick_h_loss_indices(K, k_h, select, step_idx=step_idx)
+        alphas_cumprod = ddpm_forward.alphas_cumprod.to(device=device, dtype=torch.float32)
+
+        losses_per_t = []
+        for k in idx_list:
+            # Use the first eps slot (e=0) for h-loss to keep the extra forwards bounded.
+            eps_k = eps_BKE[:, k, 0].to(weight_dtype)              # [b, 4, 64, 64]
+            zt_fine_k = zt_BKE_fine[:, k, 0].to(weight_dtype)      # [b, 4, 64, 64], with grad
+            t_k_scalar = int(t_idx_full[k].item())
+            t_vec_k = torch.full((b,), t_k_scalar, device=device, dtype=t_idx_full.dtype)
+
+            # zt_ori with the SAME eps as the SDS branch -> isolates the diff to x0
+            ab = alphas_cumprod[t_k_scalar]
+            ab_sqrt = ab.sqrt().to(weight_dtype)
+            one_m_ab_sqrt = (1.0 - ab).sqrt().to(weight_dtype)
+            zt_ori_k = ab_sqrt * lat_ori + one_m_ab_sqrt * eps_k
+
+            with torch.no_grad():
+                mid_capture.last = None
+                _ = ref_unet(zt_ori_k, t_vec_k, encoder_hidden_states=c_ori_mb).sample
+                h_ori = mid_capture.last
+            h_ori = h_ori.detach().float()
+
+            mid_capture.last = None
+            _ = ref_unet(zt_fine_k, t_vec_k, encoder_hidden_states=c_ori_mb).sample
+            h_fine = mid_capture.last.float()
+
+            # full tensor L2 (no spatial mean): mean over channel + spatial -> per-sample
+            loss_t = ((h_fine - h_ori) ** 2).mean(dim=(1, 2, 3))    # [b]
+            losses_per_t.append(loss_t)
+
+        return torch.stack(losses_per_t, dim=0).mean(dim=0)         # [b]
 
     def clip_gender_classifier(
         images: torch.Tensor,
@@ -2834,12 +2754,6 @@ def main(args):
         
             temp = probs_gender.max(dim=-1)
             preds_gender = temp.indices
-
-        # Pin to float32 so the gathered probs dtype never depends on whether a face
-        # was detected (no-face branch built fp16, has-face branch .float()->fp32);
-        # the mismatch silently DEADLOCKED all_gather until the NCCL watchdog timeout.
-        logits_gender = logits_gender.float()
-        probs_gender = probs_gender.float()
         
         if selector != None:
             preds_gender_new = torch.ones(
@@ -2923,13 +2837,8 @@ def main(args):
         dino_i_sims = []
         clip_t_sims = []
         to_pil_eval = T.ToPILImage()
-        # Enable attmap computation whenever the user wants to save them
-        # (--save_attmaps is now default on; pass --no_save_attmaps to disable).
-        # Producing the attmap uses an attention capture during the SDS forward pass, so
-        # we gate it on the save flag. The map is now built in EVERY region_mask_mode
-        # ("none"/"face"/"attn"); only if the woman/man tokens can't be located does
-        # attmap_* stay None and the save is skipped gracefully.
-        need_attmap_eval = bool(args.save_attmaps)
+        # Eval attmap saving is intentionally disabled.
+        need_attmap_eval = False
         need_sds_classifier_eval = bool(enable_sds_eval)
         need_sds_forward = need_sds_classifier_eval or need_attmap_eval
 
@@ -3065,7 +2974,7 @@ def main(args):
                     att_prefix = f"eval_{name}_{global_step}_{sanitize_filename(prompt_i)}_ori_att"
                     save_attmaps(attmap_ori_all, att_save_dir, att_prefix)
                     save_attmaps_with_overlay(attmap_ori_all, images_ori_all, att_save_dir, att_prefix, alpha=0.45)
-                    att_preview = os.path.join(att_save_dir, f"{att_prefix}_0_overlay.jpg")
+                    att_preview = os.path.join(att_save_dir, f"{att_prefix}_0_overlay.png")
                     if os.path.exists(att_preview):
                         log_imgs_i["attmap_ori_overlay"] = [att_preview]
 
@@ -3161,7 +3070,7 @@ def main(args):
                     att_prefix = f"eval_{name}_{global_step}_{sanitize_filename(prompt_i)}_generated_att"
                     save_attmaps(attmap_gen_all, att_save_dir, att_prefix)
                     save_attmaps_with_overlay(attmap_gen_all, images_all, att_save_dir, att_prefix, alpha=0.45)
-                    att_preview = os.path.join(att_save_dir, f"{att_prefix}_0_overlay.jpg")
+                    att_preview = os.path.join(att_save_dir, f"{att_prefix}_0_overlay.png")
                     if os.path.exists(att_preview):
                         log_imgs_i["attmap_generated_overlay"] = [att_preview]
             
@@ -3224,33 +3133,41 @@ def main(args):
             if accelerator.is_main_process:
                 log_imgs.append(log_imgs_i)
                 logs.append(logs_i)
-
-            # Keep all ranks aligned prompt-by-prompt during evaluation.
-            # Rank 0 performs extra CPU/GPU work (image saving, metric logging),
-            # so without this sync other ranks can run ahead and hit the next
-            # collective early, which may trigger NCCL watchdog timeouts.
-            accelerator.wait_for_everyone()
         
         if accelerator.is_main_process:
-            # wandb (eval): only the headline aggregate metric + the two image grids.
-            if logs and ("gender_gap_abs_mnet" in logs[0]):
-                _gg_mnet = float(np.nanmean(np.array([log["gender_gap_abs_mnet"] for log in logs], dtype=float)))
-                wandb_tracker.log({f"eval_{name}_gender_gap_abs_mnet": _gg_mnet}, step=current_global_step)
-            # [sds-gap] SDS-classifier gender gap on the SAME eval images (proxy vs mnet)
-            if logs and ("gender_gap_abs_sds" in logs[0]):
-                _gg_sds = float(np.nanmean(np.array([log["gender_gap_abs_sds"] for log in logs], dtype=float)))
-                wandb_tracker.log({f"eval_{name}_gender_gap_abs_sds": _gg_sds}, step=current_global_step)
+            for prompt_i, logs_i in itertools.zip_longest(prompts, logs):
+                for key, values in logs_i.items():
+                    if isinstance(values, list):
+                        wandb_tracker.log({f"eval_{name}_{key}_{prompt_i}": np.mean(values)}, step=current_global_step)
+                    else:
+                        wandb_tracker.log({f"eval_{name}_{key}_{prompt_i}": values.mean().item()}, step=current_global_step)
+                
+                for key in list(logs[0].keys()):
+                    avg = np.array([log[key] for log in logs]).mean()
+                    wandb_tracker.log({f"eval_{name}_{key}": avg}, step=current_global_step)
+                    if key == "bias_score":
+                        wandb_tracker.log({"bias_score": float(avg)}, step=current_global_step)
+                    if key == "bias_score_abs":
+                        wandb_tracker.log({"bias_score_abs": float(avg)}, step=current_global_step)
 
-            if args.log_wandb_images:
-                imgs_dict = {}
-                for prompt_i, log_imgs_i in itertools.zip_longest(prompts, log_imgs):
-                    for key in ("img_ori", "img_generated"):
-                        if key in log_imgs_i:
-                            imgs_dict.setdefault(key, []).append(
-                                wandb.Image(data_or_path=log_imgs_i[key][0], caption=prompt_i)
-                            )
-                for key, imgs in imgs_dict.items():
-                    wandb_tracker.log({f"eval_{name}_{key}": imgs}, step=current_global_step)
+            imgs_dict = {}
+            for prompt_i, log_imgs_i in itertools.zip_longest(prompts, log_imgs):
+                for key, values in log_imgs_i.items():
+                    if key not in imgs_dict.keys():
+                        imgs_dict[key] = [wandb.Image(
+                            data_or_path=values[0],
+                            caption=prompt_i,
+                        )]
+                    else:
+                        imgs_dict[key].append(wandb.Image(
+                            data_or_path=values[0],
+                            caption=prompt_i,
+                        ))
+            for key, imgs in imgs_dict.items():
+                wandb_tracker.log(
+                    {f"eval_{name}_{key}": imgs},
+                    step=current_global_step
+                    ) 
 
             if len(clip_i_sims) > 0:
                 wandb_tracker.log({f"eval_{name}_Clip-I": float(np.mean(clip_i_sims))}, step=current_global_step)
@@ -3266,10 +3183,6 @@ def main(args):
                 if logs and "gender_gap_abs_mnet" in logs[0]:
                     gg = np.array([log["gender_gap_abs_mnet"] for log in logs], dtype=float)
                     metrics_to_save["eval_EMA_gender_gap_abs_mnet"] = float(np.nanmean(gg))
-                # [sds-gap] persist SDS gap next to mnet gap for the proxy-mismatch test
-                if logs and "gender_gap_abs_sds" in logs[0]:
-                    metrics_to_save["eval_EMA_gender_gap_abs_sds"] = float(
-                        np.nanmean(np.array([log["gender_gap_abs_sds"] for log in logs], dtype=float)))
                 if len(clip_t_sims) > 0:
                     metrics_to_save["eval_EMA_Clip-T"] = float(np.mean(clip_t_sims))
                 if len(clip_i_sims) > 0:
@@ -3303,51 +3216,11 @@ def main(args):
                     f"(saved to {results_path})"
                 )
 
-        # Ensure every rank fully exits evaluation together.
-        accelerator.wait_for_everyone()
         return logs, log_imgs
     
     def apply_grad_hook_face(images, face_bboxs, face_bboxs_ori, targets, preds_gender_ori, probs_gender_ori, factor=0.1):
-        """apply gradient hook on the face region of the generated images.
-
-        target vs. ori-image class (preds_gender_ori) decides the scaling on the
-        detected face region (intersection of generated & ori face bboxes):
-            - target == -1                 : factor
-            - target == pred_gender_ori    : 1   (face already the target gender -> keep)
-            - target != pred_gender_ori    : factor  (face must change -> down-weight semantics grad)
-        (ported verbatim from 1-main-debias-ftdiff.py; only face detect is used, no mnet.)
-        """
-        images_new = []
-        for image, face_bbox, face_bbox_ori, target, pred_gender_ori, prob_gender_ori in itertools.zip_longest(images, face_bboxs, face_bboxs_ori, targets, preds_gender_ori, probs_gender_ori):
-            if (face_bbox == -1).all():
-                images_new.append(image.unsqueeze(dim=0))
-            else:
-                img_width, img_height = image.shape[1:]
-                idx_left = max(face_bbox[0], face_bbox_ori[0], 0)
-                idx_right = min(face_bbox[2], face_bbox_ori[2], img_width)
-                idx_bottom = max(face_bbox[1], face_bbox_ori[1], 0)
-                idx_top = min(face_bbox[3], face_bbox_ori[3], img_height)
-
-                img_face = image[:,idx_bottom:idx_top,idx_left:idx_right].clone()
-                if target==-1:
-                    grad_hook = make_grad_hook(factor)
-                elif target==pred_gender_ori:
-                    grad_hook = make_grad_hook(1)
-                elif target!=pred_gender_ori:
-                    grad_hook = make_grad_hook(factor)
-                img_face.register_hook(grad_hook)
-
-                img_add = torch.zeros_like(image)
-                img_add[:,idx_bottom:idx_top,idx_left:idx_right] = img_face
-
-                mask = torch.zeros_like(image)
-                mask[:,idx_bottom:idx_top,idx_left:idx_right] = 1
-
-                image = mask*img_add + (1-mask)*image
-                images_new.append(image.unsqueeze(dim=0))
-
-        images_new = torch.cat(images_new)
-        return images_new
+        """Deprecated in SDS mode (kept for compatibility)."""
+        return images
     
     def gen_dynamic_weights_sds(targets, preds_sds, factor=0.2, out_dtype=None):
         """
@@ -3395,11 +3268,8 @@ def main(args):
         return current_step % args.evaluate_every_n_iter == 0
 
     def should_enable_sds_eval(current_step: int) -> bool:
-        # Enable SDS-based evaluation: extra gender-gap metric (gender_gap_abs_sds)
-        # and SDS-labeled image grids (_ori_sds.jpg / _generated_sds.jpg).
-        # When --save_attmaps is on the SDS forward is already run for the attmap,
-        # so this shares that same forward (no extra UNet passes).
-        return True
+        # Disable SDS evaluation for all eval runs.
+        return False
 
     def evaluation_step(current_step):
         enable_sds_eval = should_enable_sds_eval(current_step)
@@ -3429,9 +3299,6 @@ def main(args):
             with torch.no_grad():
                 for p, p_from in itertools.zip_longest(list(unet_lora_layers.parameters()), list(unet_lora_layers_copy.parameters())):
                     p.data = p_from.data
-
-        # Keep train/eval phase boundary synchronized across ranks.
-        accelerator.wait_for_everyone()
     
     
     # Train!
@@ -3530,7 +3397,7 @@ def main(args):
                 logs_i = {
                     "loss_fair": [],
                     "loss_face_realistic": [],
-                    "loss_img_x0_clip_dino": [],
+                    "loss_hspace": [],
                     "loss": [],
                     "gender_gap": [],
                     "gender_gap_abs": [],
@@ -3678,32 +3545,6 @@ def main(args):
                     device=accelerator.device,
                 )
 
-                # SDS class of the ORI images (measured with SDS, same as the generated
-                # images in step 1). Used for the dynamic weight and the face grad hook,
-                # so both compare the ORI-image class against the target class.
-                preds_gender_ori_sds, probs_gender_ori_sds, logits_gender_ori_sds, _, _, _ = sds_logits_from_images(
-                    images_ori,
-                    tau=args.sds_tau,
-                    t_min=args.sds_t_min,
-                    t_max=args.sds_t_max,
-                    num_t=args.sds_num_t,
-                    num_eps=args.sds_num_eps,
-                    gate_grad=False,
-                    precomputed_attmaps=None,
-                    sds_text_encoder=eval_text_encoder,
-                    sds_unet=unet,
-                    sds_scheduler=ddpm_forward,
-                    compute_realistic_sds=False,
-                )
-
-                # Face detection on the ORI images (only face detect; the bbox is used by
-                # apply_grad_hook_face to locate the face region).
-                face_indicators_ori, face_bboxs_ori, _, _, _ = get_face(images_ori)
-
-                images_small_ori = transforms.Resize(args.img_size_small)(images_ori)
-                clip_feats_ori = get_clip_feat(images_small_ori, normalize=True, to_high_precision=True).detach()
-                DINO_feats_ori = get_dino_feat(images_small_ori, normalize=True, to_high_precision=True).detach()
-
                 images_ori_all = customized_all_gather(images_ori, accelerator, return_tensor_other_processes=False)
                 preds_gender_ori_all = customized_all_gather(preds_gender_ori, accelerator, return_tensor_other_processes=False)
                 probs_gender_ori_all = customized_all_gather(probs_gender_ori, accelerator, return_tensor_other_processes=False)
@@ -3723,109 +3564,123 @@ def main(args):
             # Step 4: compute loss
             loss_fair_i = torch.ones(targets.shape, dtype=weight_dtype, device=accelerator.device) *(-1)
             loss_face_realistic_i = torch.ones(targets.shape, dtype=weight_dtype, device=accelerator.device) *(-1)
-            loss_img_x0_clip_dino_i = torch.ones(targets.shape, dtype=weight_dtype, device=accelerator.device) *(-1)
+            loss_hspace_i = torch.ones(targets.shape, dtype=weight_dtype, device=accelerator.device) *(-1)
             loss_i = torch.ones(targets.shape, dtype=weight_dtype, device=accelerator.device) *(-1)
+
+            # Decide ref text encoder / unet (frozen anchors). Used by both trajectory-eps
+            # path (if ever re-enabled) and the new h-space loss.
+            if args.train_text_encoder and args.train_unet:
+                eps_reference_text_encoder = eval_text_encoder
+                eps_reference_unet = eval_unet
+            elif args.train_text_encoder and not args.train_unet:
+                eps_reference_text_encoder = eval_text_encoder
+                eps_reference_unet = unet
+            else:
+                eps_reference_text_encoder = text_encoder
+                eps_reference_unet = eval_unet
+
+            # h-space loss anchor prompt embedding (computed once per step; broadcast to mb).
+            with torch.no_grad():
+                c_ori_full = _text_embeds([prompt_i], eps_reference_text_encoder).to(weight_dtype)  # [1, 77, 768]
+
+            # Attach mid_block forward-hook on the frozen ref UNet for the duration of this step.
+            mid_capture = MidBlockCapture().attach(eps_reference_unet)
 
             idxs_i = list(range(targets.shape[0]))
             N_backward = math.ceil(targets.shape[0] / args.train_GPU_batch_size)
-            for j in range(N_backward):
-                idxs_ij = idxs_i[j*args.train_GPU_batch_size:(j+1)*args.train_GPU_batch_size]
-                noises_ij = noises_i[idxs_ij]
-                targets_ij = targets[idxs_ij]
-                clip_feats_ori_ij = clip_feats_ori[idxs_ij]
-                DINO_feats_ori_ij = DINO_feats_ori[idxs_ij]
-                preds_gender_ori_sds_ij = preds_gender_ori_sds[idxs_ij]
-                probs_gender_ori_sds_ij = probs_gender_ori_sds[idxs_ij]
-                face_bboxs_ori_ij = face_bboxs_ori[idxs_ij]
+            try:
+                for j in range(N_backward):
+                    idxs_ij = idxs_i[j*args.train_GPU_batch_size:(j+1)*args.train_GPU_batch_size]
+                    noises_ij = noises_i[idxs_ij]
+                    targets_ij = targets[idxs_ij]
 
-                images_ij, _att_ij = generate_image_w_gradient(
-                    prompt_i,
-                    noises_ij,
-                    num_denoising_steps,
-                    which_text_encoder=text_encoder,
-                    which_unet=unet,
-                    skip_final_steps=args.skip_final_steps,
-                    skip_final_steps_pct=args.skip_final_steps_pct,
-                )
+                    images_ij, _att_ij = generate_image_w_gradient(
+                        prompt_i,
+                        noises_ij,
+                        num_denoising_steps,
+                        which_text_encoder=text_encoder,
+                        which_unet=unet,
+                        skip_final_steps=args.skip_final_steps,
+                        skip_final_steps_pct=args.skip_final_steps_pct,
+                        return_eps_l2=False,
+                    )
 
-                # Face detection on the generated (w-gradient) images (only face detect).
-                # When the ORI-image SDS class differs from the target, down-weight (factor2)
-                # the CLIP/DINO gradient on the detected face region so the semantics loss
-                # does not fight the fairness loss where the face must change gender.
-                face_indicators_ij, face_bboxs_ij, _, _, _ = get_face(images_ij)
-                images_ij = apply_grad_hook_face(
-                    images_ij,
-                    face_bboxs_ij,
-                    face_bboxs_ori_ij,
-                    targets_ij,
-                    preds_gender_ori_sds_ij,
-                    probs_gender_ori_sds_ij,
-                    factor=args.factor2,
-                )
+                    # --- SDS classifier WITH gradient + region hard mask ---
+                    # Also: capture the forward-diffusion buffers (t, eps, zt) so the h-space
+                    # loss below can reuse them and avoid redundant noising.
+                    sds_buffers: dict = {}
+                    preds_gender_ij, probs_gender_ij, logits_gender_ij, _, _, sds_realistic_ij = sds_logits_from_images(
+                        images_ij,
+                        tau=args.sds_tau,
+                        t_min=args.sds_t_min,
+                        t_max=args.sds_t_max,
+                        num_t=args.sds_num_t,
+                        num_eps=args.sds_num_eps,
+                        gate_grad=True,
+                        precomputed_attmaps=None,
+                        sds_text_encoder=eval_text_encoder,
+                        sds_unet=unet,
+                        sds_scheduler=ddpm_forward,
+                        compute_realistic_sds=True,
+                        diffusion_buffers_out=sds_buffers,
+                    )
 
-                images_small_ij = transforms.Resize(args.img_size_small)(images_ij)
-                clip_feats_ij = get_clip_feat(images_small_ij, normalize=True, to_high_precision=True)
-                DINO_feats_ij = get_dino_feat(images_small_ij, normalize=True, to_high_precision=True)
-                loss_CLIP_ij = 1.0 - (clip_feats_ij * clip_feats_ori_ij).sum(dim=-1)
-                loss_DINO_ij = 1.0 - (DINO_feats_ij * DINO_feats_ori_ij).sum(dim=-1)
-                loss_img_x0_clip_dino_ij = (loss_CLIP_ij + loss_DINO_ij).to(weight_dtype)
+                    # --- h-space L2 loss (replaces trajectory eps L2 in the img-loss slot) ---
+                    images_ori_ij = images_ori[idxs_ij].to(weight_dtype)
+                    loss_hspace_ij = compute_h_loss(
+                        images_ori_mb=images_ori_ij,
+                        diffusion_buffers=sds_buffers,
+                        c_ori_mb=c_ori_full,
+                        ref_unet=eps_reference_unet,
+                        mid_capture=mid_capture,
+                        k_h=args.h_loss_num_t,
+                        select=args.h_loss_t_select,
+                        step_idx=int(global_step),
+                    ).to(weight_dtype)
 
-                # --- SDS classifier WITH gradient + region hard mask ---
-                preds_gender_ij, probs_gender_ij, logits_gender_ij, _, _, sds_realistic_ij = sds_logits_from_images(
-                    images_ij,
-                    tau=args.sds_tau,
-                    t_min=args.sds_t_min,
-                    t_max=args.sds_t_max,
-                    num_t=args.sds_num_t,
-                    num_eps=args.sds_num_eps,
-                    gate_grad=True,
-                    precomputed_attmaps=None,
-                    sds_text_encoder=eval_text_encoder,
-                    sds_unet=unet,
-                    sds_scheduler=ddpm_forward,
-                    compute_realistic_sds=True,
-                )
+                    # (Deprecated) face-based grad hook replaced by attention/face region hard-masking inside sds computation
 
-                loss_fair_ij = torch.ones(len(idxs_ij), dtype=weight_dtype, device=accelerator.device) *(-1)
-                idxs_valid = (targets_ij != -1).nonzero().view([-1])
-                logits_gender_ij = logits_gender_ij.half()
-                if idxs_valid.numel() > 0:
-                    loss_fair_ij[idxs_valid] = CE_loss(logits_gender_ij[idxs_valid], targets_ij[idxs_valid])
+                    loss_fair_ij = torch.ones(len(idxs_ij), dtype=weight_dtype, device=accelerator.device) *(-1)
+                    idxs_valid = (targets_ij != -1).nonzero().view([-1])
+                    logits_gender_ij = logits_gender_ij.half()
+                    if idxs_valid.numel() > 0:
+                        loss_fair_ij[idxs_valid] = CE_loss(logits_gender_ij[idxs_valid], targets_ij[idxs_valid])
 
-                loss_face_realistic_ij = torch.ones(len(idxs_ij), dtype=weight_dtype, device=accelerator.device) *(-1)
 
-                if sds_realistic_ij is None:
-                    loss_face_realistic_ij = torch.zeros(len(idxs_ij), dtype=weight_dtype, device=accelerator.device)
-                else:
-                    loss_face_realistic_ij = sds_realistic_ij.to(weight_dtype)
+                    loss_face_realistic_ij = torch.ones(len(idxs_ij), dtype=weight_dtype, device=accelerator.device) *(-1)
 
-                # Dynamic weight compares the ORI-image SDS class (preds_gender_ori_sds_ij)
-                # against the target class, instead of the generated-image class.
-                dynamic_weights = gen_dynamic_weights_sds(
-                    targets_ij,
-                    preds_gender_ori_sds_ij,
-                    factor=args.factor1,
-                    out_dtype=loss_img_x0_clip_dino_ij.dtype,
-                )
+                    if sds_realistic_ij is None:
+                        loss_face_realistic_ij = torch.zeros(len(idxs_ij), dtype=weight_dtype, device=accelerator.device)
+                    else:
+                        loss_face_realistic_ij = sds_realistic_ij.to(weight_dtype)
 
-                loss_ij = (
-                    loss_fair_ij
-                    + args.weight_loss_img * dynamic_weights * loss_img_x0_clip_dino_ij
-                    + args.weight_loss_face_realistic * loss_face_realistic_ij
-                )
-                accelerator.backward(loss_ij.mean())
+                    dynamic_weights = gen_dynamic_weights_sds(
+                        targets_ij,
+                        preds_gender_ij,
+                        factor=args.factor1,
+                        out_dtype=loss_hspace_ij.dtype,
+                    )
 
-                with torch.no_grad():
-                    loss_fair_i[idxs_ij] = loss_fair_ij.to(loss_fair_i.dtype)
-                    loss_face_realistic_i[idxs_ij] = loss_face_realistic_ij.to(loss_face_realistic_i.dtype)
-                    loss_img_x0_clip_dino_i[idxs_ij] = loss_img_x0_clip_dino_ij.to(loss_img_x0_clip_dino_i.dtype)
-                    loss_i[idxs_ij] = loss_ij.to(loss_i.dtype)
+                    loss_ij = (
+                        loss_fair_ij
+                        + args.weight_loss_img * dynamic_weights * loss_hspace_ij
+                        + args.weight_loss_face_realistic * loss_face_realistic_ij
+                    )
+                    accelerator.backward(loss_ij.mean())
+
+                    with torch.no_grad():
+                        loss_fair_i[idxs_ij] = loss_fair_ij.to(loss_fair_i.dtype)
+                        loss_face_realistic_i[idxs_ij] = loss_face_realistic_ij.to(loss_face_realistic_i.dtype)
+                        loss_hspace_i[idxs_ij] = loss_hspace_ij.to(loss_hspace_i.dtype)
+                        loss_i[idxs_ij] = loss_ij.to(loss_i.dtype)
+            finally:
+                mid_capture.detach()
                     
             # for logging purpose, gather all losses to main_process
             accelerator.wait_for_everyone()
             loss_fair_all = customized_all_gather(loss_fair_i, accelerator)
             loss_face_realistic_all = customized_all_gather(loss_face_realistic_i, accelerator)
-            loss_img_x0_clip_dino_all = customized_all_gather(loss_img_x0_clip_dino_i, accelerator)
+            loss_hspace_all = customized_all_gather(loss_hspace_i, accelerator)
             loss_all = customized_all_gather(loss_i, accelerator)
 
             loss_all = loss_all[loss_fair_all!=-1]
@@ -3835,12 +3690,12 @@ def main(args):
             if accelerator.is_main_process:
                 logs_i["loss_fair"].append(loss_fair_all)
                 logs_i["loss_face_realistic"].append(loss_face_realistic_all)
-                logs_i["loss_img_x0_clip_dino"].append(loss_img_x0_clip_dino_all)
+                logs_i["loss_hspace"].append(loss_hspace_all)
                 logs_i["loss"].append(loss_all)
             
             # process logs
             if accelerator.is_main_process:
-                for key in ["loss_fair", "loss_face_realistic", "loss_img_x0_clip_dino", "loss"]:
+                for key in ["loss_fair", "loss_face_realistic", "loss_hspace", "loss"]:
                     if logs_i[key] == []:
                         logs_i.pop(key)
                     else:
@@ -3862,15 +3717,14 @@ def main(args):
                 if "bias_score_abs" in logs_i:
                     wandb_tracker.log({"bias_score_abs": float(np.mean(logs_i["bias_score_abs"]))}, step=global_step)
 
-                if args.log_wandb_images:
-                    for key, values in log_imgs_i.items():
-                        wandb_tracker.log({f"train_{key}":wandb.Image(
-                                data_or_path=values[0],
-                                caption=prompt_i,
-                            )
-                            },
-                            step=global_step
-                            )
+                for key, values in log_imgs_i.items():
+                    wandb_tracker.log({f"train_{key}":wandb.Image(
+                            data_or_path=values[0],
+                            caption=prompt_i,
+                        )
+                        },
+                        step=global_step
+                        )
 
             if args.train_text_encoder:
                 model_sanity_print(text_encoder_lora_model, "check No.1, text_encoder: after accelerator.backward()")
@@ -3930,7 +3784,6 @@ def main(args):
 
             if should_trigger_evaluation(global_step):
                 evaluation_step(global_step)
-                accelerator.wait_for_everyone()
 
             if accelerator.is_main_process:
                 if global_step % args.checkpointing_steps == 0:
@@ -3953,14 +3806,6 @@ def main(args):
                     logger.info(f"Accelerator checkpoint saved to {save_path}")
 
             torch.cuda.empty_cache()
-
-            # Hard stop at max_train_steps. Without this the loop runs WHOLE epochs;
-            # here one epoch = len(occupations_train_set) prompts (e.g. 1000), so it would
-            # overshoot (e.g. to 1000) instead of stopping at max_train_steps (e.g. 400).
-            if global_step >= args.max_train_steps:
-                break
-        if global_step >= args.max_train_steps:
-            break
     accelerator.end_training()
 
 
