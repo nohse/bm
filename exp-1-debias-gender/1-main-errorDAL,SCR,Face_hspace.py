@@ -514,10 +514,18 @@ def parse_args(input_args=None):
 
     # loss weight
     parser.add_argument(
-        '--weight_loss_img', 
+        '--weight_loss_scr',
         default=8,
-        help="weight for the image semantics preserving loss", 
-        type=float, 
+        help="weight for the SCR image loss (scoring-space per-timestep MSE of the frozen UNet mid_block/h-space "
+             "outputs of the original vs finetuned latents)",
+        type=float,
+    )
+    parser.add_argument(
+        '--attn_gate_thr',
+        default=0.15,
+        help="min-max-normalized gender cross-attention threshold for the SCR flip-region hard mask "
+             "(face/gender region = gate >= this; SCR gradient there is multiplied by --factor2 for flip/uncertain samples)",
+        type=float,
     )
     parser.add_argument(
         '--weight_loss_face', 
@@ -756,7 +764,11 @@ def parse_args(input_args=None):
         with open(args.config, "r") as yaml_file:
             config_data = yaml.safe_load(yaml_file)
         args_dict = vars(args)
+        # backward-compat: the old CLIP+DINO image-loss weight key maps onto the SCR loss weight,
+        # so existing configs (e.g. debias-text-encoder.yaml with weight_loss_img) run unchanged.
+        _key_aliases = {"weight_loss_img": "weight_loss_scr"}
         for key, value in config_data.items():
+            key = _key_aliases.get(key, key)
             args_dict[key] = type(args_dict[key])(value)
         args = argparse.Namespace(**args_dict)
 
@@ -830,7 +842,7 @@ def main(args):
         f"_{_model_tag}"
         f"_tau-{args.tau:g}"
         f"_resT-{args.residual_num_timesteps}-{args.residual_t_min}-{args.residual_t_max}"
-        f"_wImg-{args.weight_loss_img}-{args.factor1}-{args.factor2}"
+        f"_wSCR-{args.weight_loss_scr}-{args.factor1}"
         f"_wFace-{args.weight_loss_face}"
         f"_Th-{args.uncertainty_threshold}"
         f"_loraR-{args.rank}_lr-{args.learning_rate}"
@@ -1305,10 +1317,12 @@ def main(args):
     #######################################################
     
     @torch.no_grad()
-    def generate_image_no_gradient(prompt, noises, num_denoising_steps, which_text_encoder, which_unet, return_latents=False):
+    def generate_image_no_gradient(prompt, noises, num_denoising_steps, which_text_encoder, which_unet, return_latents=False, capture_mid=False):
         """
         prompts: str
         noises: [N,4,64,64], N is number images to be generated for the prompt
+        capture_mid: if True, also return a per-timestep list of the UNet mid_block (h-space)
+            outputs (conditional/text half of the CFG batch), used as the SCR loss target.
         """
         N = noises.shape[0]
         prompts = [prompt] * N
@@ -1343,40 +1357,58 @@ def main(args):
 
         prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds])
         prompt_embeds = prompt_embeds.to(weight_dtype)
-        
+
+        # SCR: capture the UNet mid_block (h-space) output at each denoising step via a forward hook.
+        # We keep only the conditional (text) half of the CFG-doubled batch.
+        mid_hspace = [] if capture_mid else None
+        mid_hook_handle = None
+        if capture_mid:
+            def _mid_capture_hook(module, hook_input, hook_output):
+                mid_hspace.append(hook_output.chunk(2)[1])
+            mid_hook_handle = which_unet.mid_block.register_forward_hook(_mid_capture_hook)
+
         noise_scheduler.set_timesteps(num_denoising_steps)
         latents = noises
         for i, t in enumerate(noise_scheduler.timesteps):
-        
+
             # scale model input
             latent_model_input = torch.cat([latents.to(weight_dtype)] * 2)
             latent_model_input = noise_scheduler.scale_model_input(latent_model_input, t)
-            
+
             noises_pred = which_unet(
                 latent_model_input,
                 t,
                 encoder_hidden_states=prompt_embeds,
             ).sample
             noises_pred = noises_pred.to(weight_dtype_high_precision)
-            
+
             noises_pred_uncond, noises_pred_text = noises_pred.chunk(2)
             noises_pred = noises_pred_uncond + args.guidance_scale * (noises_pred_text - noises_pred_uncond)
-            
+
             latents = noise_scheduler.step(noises_pred, t, latents).prev_sample
+
+        if mid_hook_handle is not None:
+            mid_hook_handle.remove()
 
         z0 = latents  # clean latent z0 in the scheduler/UNet scale (before VAE-decode rescaling)
         latents = 1 / vae.config.scaling_factor * latents
         images = vae.decode(latents.to(vae.dtype)).sample.clamp(-1,1) # in range [-1,1]
 
+        if capture_mid:
+            if return_latents:
+                return images, z0, mid_hspace
+            return images, mid_hspace
         if return_latents:
             return images, z0
         return images
 
-    def generate_image_w_gradient(prompt, noises, num_denoising_steps, which_text_encoder, which_unet, return_latents=False):
+    def generate_image_w_gradient(prompt, noises, num_denoising_steps, which_text_encoder, which_unet, return_latents=False, capture_mid=False):
         """
         prompts: str
         noises: [N,4,64,64], N is number images to be generated for the prompt
         """
+        # capture_mid: if True, also return a per-timestep list of the UNet mid_block (h-space)
+        #   outputs (conditional/text half of the CFG batch), WITH gradient, for the SCR loss.
         # to enable gradient_checkpointing, unet must be set to train()
         unet.train()
         
@@ -1419,33 +1451,50 @@ def main(args):
             grad_coefs.append( noise_scheduler.alphas_cumprod[t].sqrt().item() * (1-noise_scheduler.alphas_cumprod[t]).sqrt().item() / (1-noise_scheduler.alphas[t].item()) )
         grad_coefs = np.array(grad_coefs)
         grad_coefs /= (math.prod(grad_coefs)**(1/len(grad_coefs)))
-            
+
+        # SCR: capture the finetuned UNet mid_block (h-space) output per denoising step, keeping the
+        # conditional (text) half of the CFG batch. The hook is removed before backward so that the
+        # gradient-checkpointing recomputation (unet.enable_gradient_checkpointing) does not re-fire it.
+        mid_hspace = [] if capture_mid else None
+        mid_hook_handle = None
+        if capture_mid:
+            def _mid_capture_hook(module, hook_input, hook_output):
+                mid_hspace.append(hook_output.chunk(2)[1])
+            mid_hook_handle = which_unet.mid_block.register_forward_hook(_mid_capture_hook)
+
         latents = noises
         for i, t in enumerate(noise_scheduler.timesteps):
-        
+
             # scale model input
             latent_model_input = torch.cat([latents.detach().to(weight_dtype)]*2)
             latent_model_input = noise_scheduler.scale_model_input(latent_model_input, t)
-            
+
             noises_pred = which_unet(
                 latent_model_input,
                 t,
                 encoder_hidden_states=prompt_embeds,
             ).sample
             noises_pred = noises_pred.to(weight_dtype_high_precision)
-            
+
             noises_pred_uncond, noises_pred_text = noises_pred.chunk(2)
             noises_pred = noises_pred_uncond + args.guidance_scale * (noises_pred_text - noises_pred_uncond)
-            
+
             hook_fn = make_grad_hook(grad_coefs[i])
             noises_pred.register_hook(hook_fn)
-            
+
             latents = noise_scheduler.step(noises_pred, t, latents).prev_sample
+
+        if mid_hook_handle is not None:
+            mid_hook_handle.remove()
 
         z0 = latents  # clean latent z0 in the scheduler/UNet scale; NOT detached so grad reaches the trainable model
         latents = 1 / vae.config.scaling_factor * latents
         images = vae.decode(latents.to(vae.dtype)).sample.clamp(-1,1) # in range [-1,1]
 
+        if capture_mid:
+            if return_latents:
+                return images, z0, mid_hspace
+            return images, mid_hspace
         if return_latents:
             return images, z0
         return images
@@ -1729,7 +1778,7 @@ def main(args):
         
         return face_indicators_app, face_bboxs_app, face_chips_app, face_landmarks_app, aligned_face_chips_app
                 
-    def residual_gender_logits(z0):
+    def residual_gender_logits(z0, return_attmap=False):
         """Prompt-conditioned diffusion residual-error gender scorer with cross-attention spatial weighting.
 
         z0: [n,4,H,W] clean latent in the scheduler/UNet scale. May require grad; it is NOT detached,
@@ -1817,8 +1866,10 @@ def main(args):
         E_man = (common_attn.unsqueeze(1) * residual_maps["man"]).sum(dim=(2, 3)).mean(dim=1)       # [n]
 
         logits_gender = torch.stack([-E_woman / args.tau, -E_man / args.tau], dim=1)    # [n, 2]
+        if return_attmap:
+            return logits_gender, common_attn   # common_attn: [n,H,W] detached, sum-to-1 gender localization
         return logits_gender
-    def get_face_gender(z0, selector=None, fill_value=-1):
+    def get_face_gender(z0, selector=None, fill_value=-1, return_attmap=False):
         """Drop-in replacement for the removed mnet classifier, now scoring the clean latent z0.
 
         z0: [B,4,64,64] clean latents (scheduler/UNet scale).
@@ -1832,12 +1883,17 @@ def main(args):
         else:
             z0_w_faces = z0
 
+        _H, _W = z0.shape[-2], z0.shape[-1]
         if z0_w_faces.shape[0] == 0:
             logits_gender = torch.empty([0,2], dtype=torch.float, device=z0.device)
             probs_gender = torch.empty([0,2], dtype=torch.float, device=z0.device)
             preds_gender = torch.empty([0], dtype=torch.int64, device=z0.device)
+            common_attn = torch.empty([0, _H, _W], dtype=torch.float, device=z0.device)
         else:
-            logits_gender = residual_gender_logits(z0_w_faces)
+            if return_attmap:
+                logits_gender, common_attn = residual_gender_logits(z0_w_faces, return_attmap=True)
+            else:
+                logits_gender = residual_gender_logits(z0_w_faces)
             probs_gender = torch.softmax(logits_gender, dim=-1)
             preds_gender = probs_gender.max(dim=-1).indices
 
@@ -1863,8 +1919,15 @@ def main(args):
                 ) * (fill_value)
             logits_gender_new[selector] = logits_gender
 
+            if return_attmap:
+                attmap_new = torch.zeros([selector.shape[0], _H, _W], dtype=torch.float, device=z0.device)
+                if z0_w_faces.shape[0] > 0:
+                    attmap_new[selector] = common_attn
+                return preds_gender_new, probs_gender_new, logits_gender_new, attmap_new
             return preds_gender_new, probs_gender_new, logits_gender_new
         else:
+            if return_attmap:
+                return preds_gender, probs_gender, logits_gender, common_attn
             return preds_gender, probs_gender, logits_gender
 
     @torch.no_grad()
@@ -2442,8 +2505,7 @@ def main(args):
                 logs_i = {
                     "loss_fair": [],
                     "loss_face": [],
-                    "loss_CLIP": [],
-                    "loss_DINO": [],
+                    "loss_SCR": [],
                     "loss": [],
                     "gender_gap": [],
                     "gender_gap_abs": [],
@@ -2544,9 +2606,9 @@ def main(args):
                 face_indicators_ori, face_bboxs_ori, face_chips_ori, face_landmarks_ori, aligned_face_chips_ori = get_face(images_ori)
                 preds_gender_ori, probs_gender_ori, logits_gender_ori = get_face_gender(z0_ori, selector=face_indicators_ori, fill_value=-1)
                 
-                images_small_ori = transforms.Resize(args.img_size_small)(images_ori)
-                clip_feats_ori = get_clip_feat(images_small_ori, normalize=True, to_high_precision=True)
-                DINO_feats_ori = get_dino_feat(images_small_ori, normalize=True, to_high_precision=True)
+                # SCR: the image loss no longer uses CLIP/DINO features; it is computed in Step 4 from the
+                # FROZEN scoring UNet's mid_block (h-space) on re-noised z0_ori vs z0_ft. (CLIP-I / DINO-I are
+                # still computed as eval metrics.) z0_ori is the detached SCR target.
 
                 images_ori_all = customized_all_gather(images_ori, accelerator, return_tensor_other_processes=False)
                 face_indicators_ori_all = customized_all_gather(face_indicators_ori, accelerator, return_tensor_other_processes=False)
@@ -2567,18 +2629,21 @@ def main(args):
             # Step 4: compute loss
             loss_fair_i = torch.ones(targets.shape, dtype=weight_dtype, device=accelerator.device) *(-1)
             loss_face_i = torch.ones(targets.shape, dtype=weight_dtype, device=accelerator.device) *(-1)
-            loss_CLIP_i = torch.ones(targets.shape, dtype=weight_dtype, device=accelerator.device) *(-1)
-            loss_DINO_i = torch.ones(targets.shape, dtype=weight_dtype, device=accelerator.device) *(-1)
+            loss_SCR_i = torch.ones(targets.shape, dtype=weight_dtype, device=accelerator.device) *(-1)
             loss_i = torch.ones(targets.shape, dtype=weight_dtype, device=accelerator.device) *(-1)
             
             idxs_i = list(range(targets.shape[0]))
             N_backward = math.ceil(targets.shape[0] / args.train_GPU_batch_size)
+            # SCR: fixed feature-extractor conditioning = generation prompt encoded by the FROZEN original TE,
+            # and the shared residual-scorer timestep grid (both ori & ft re-noised to these same t).
+            scr_gen_embeds = _encode_scoring_prompt(prompt_i)                                     # [1, L, D], frozen
+            scr_timesteps = torch.linspace(
+                args.residual_t_min, args.residual_t_max, steps=args.residual_num_timesteps, device=accelerator.device
+            ).round().long()
             for j in range(N_backward):
                 idxs_ij = idxs_i[j*args.train_GPU_batch_size:(j+1)*args.train_GPU_batch_size]
                 noises_ij = noises_i[idxs_ij]
                 targets_ij = targets[idxs_ij]
-                clip_feats_ori_ij = clip_feats_ori[idxs_ij]
-                DINO_feats_ori_ij = DINO_feats_ori[idxs_ij]
                 preds_gender_ori_ij = preds_gender_ori[idxs_ij]
                 probs_gender_ori_ij = probs_gender_ori[idxs_ij]
                 face_bboxs_ori_ij = face_bboxs_ori[idxs_ij]
@@ -2587,18 +2652,51 @@ def main(args):
                 images_ij, z0_ij = generate_image_w_gradient(prompt_i, noises_ij, num_denoising_steps, which_text_encoder=text_encoder, which_unet=unet, return_latents=True)
                 face_indicators_ij, face_bboxs_ij, face_chips_ij, face_landmarks_ij, aligned_face_chips_ij = get_face(images_ij)
                 # Branch B: residual-error gender logits from z0 directly (grad flows z0 -> trainable model).
-                # Computed on z0_ij before the RGB grad-hook below, which only affects Branch A (image loss).
-                preds_gender_ij, probs_gender_ij, logits_gender_ij = get_face_gender(z0_ij, selector=face_indicators_ij, fill_value=-1)
+                # Reuse this fairness scorer call to also thread out the (finetune-image) gender cross-attention
+                # map, which the SCR flip mask uses (no extra scorer forward).
+                preds_gender_ij, probs_gender_ij, logits_gender_ij, common_attn_ij = get_face_gender(z0_ij, selector=face_indicators_ij, fill_value=-1, return_attmap=True)
 
-                # Branch A: RGB image losses (CLIP/DINO) use the decoded x0 with the existing face grad-hook.
-                images_ij = apply_grad_hook_face(images_ij, face_bboxs_ij, face_bboxs_ori_ij, targets_ij, preds_gender_ori_ij, probs_gender_ori_ij, factor=args.factor2)
-                images_small_ij = transforms.Resize(args.img_size_small)(images_ij)
-                clip_feats_ij = get_clip_feat(images_small_ij, normalize=True, to_high_precision=True)
-                DINO_feats_ij = get_dino_feat(images_small_ij, normalize=True, to_high_precision=True)
+                # SCR image loss (scoring-space, FROZEN feature extractor):
+                #   re-noise the ORIGINAL (z0_ori) and FINETUNE (z0_ij) latents to the SAME zt (shared eps & t)
+                #   and MSE the FROZEN scoring UNet's mid_block (h-space) output under the frozen generation prompt.
+                #   grad: h_ft -> zt_ft -> z0_ij -> generation (reaches up_blocks); h_ori is a detached target.
+                #   FLIP RELEASE: for flip/uncertain samples (targets_ij != preds_gender_ori_ij), multiply the SCR
+                #   gradient by --factor2 inside the face/gender region (min-max attn >= --attn_gate_thr), x1 else.
+                #   Applied via a hook on the SCR-only tensor zt_ft, so loss_fair/loss_face gradients are untouched.
+                z0_ori_ij = z0_ori[idxs_ij]
+                scr_gen_embeds_ij = scr_gen_embeds.expand(len(idxs_ij), -1, -1)
 
-                loss_CLIP_ij = - (clip_feats_ij * clip_feats_ori_ij).sum(dim=-1) + 1
-                loss_DINO_ij = - (DINO_feats_ij * DINO_feats_ori_ij).sum(dim=-1) + 1
-                
+                cmin = common_attn_ij.amin(dim=(1, 2), keepdim=True)
+                cmax = common_attn_ij.amax(dim=(1, 2), keepdim=True)
+                attn_gate = ((common_attn_ij - cmin) / (cmax - cmin + 1e-8)).clamp(0, 1)          # [chunk,64,64] min-max
+                release_ij = (targets_ij != preds_gender_ori_ij)                                   # flip OR uncertain(-1)
+                scr_grad_mask = torch.ones_like(attn_gate)
+                scr_grad_mask = torch.where((attn_gate >= args.attn_gate_thr) & release_ij[:, None, None],
+                                            torch.full_like(scr_grad_mask, args.factor2), scr_grad_mask)
+                scr_grad_mask = scr_grad_mask[:, None, :, :].to(z0_ij.dtype)                        # [chunk,1,64,64]
+
+                scr_mid_store = []
+                def _scr_mid_hook(_m, _in, _out):
+                    scr_mid_store.append(_out)
+                _scr_h = scoring_unet.mid_block.register_forward_hook(_scr_mid_hook)
+                scr_per_t = []
+                for _t in scr_timesteps:
+                    _tb = _t.repeat(len(idxs_ij))
+                    _eps = torch.randn_like(z0_ij)
+                    zt_ft = noise_scheduler.add_noise(z0_ij, _eps, _tb)                             # grad -> z0_ij
+                    zt_ft.register_hook(lambda g, mm=scr_grad_mask: g * mm)                         # SCR-only spatial gate
+                    zt_ori = noise_scheduler.add_noise(z0_ori_ij, _eps, _tb)                        # detached target input
+                    scr_mid_store.clear()
+                    _ = scoring_unet(zt_ft.to(weight_dtype), _tb, encoder_hidden_states=scr_gen_embeds_ij).sample
+                    h_ft = scr_mid_store[-1]
+                    scr_mid_store.clear()
+                    with torch.no_grad():
+                        _ = scoring_unet(zt_ori.to(weight_dtype), _tb, encoder_hidden_states=scr_gen_embeds_ij).sample
+                        h_ori = scr_mid_store[-1].detach()
+                    scr_per_t.append(((h_ft.to(weight_dtype_high_precision) - h_ori.to(weight_dtype_high_precision)) ** 2).mean(dim=[1, 2, 3]))
+                _scr_h.remove()
+                loss_SCR_ij = torch.stack(scr_per_t, dim=0).mean(dim=0).to(weight_dtype)
+
                 loss_fair_ij = torch.ones(len(idxs_ij), dtype=weight_dtype, device=accelerator.device) *(-1)
                 idxs_w_face_loss = ((face_indicators_ij == True) * (targets_ij != -1)).nonzero().view([-1])
                 loss_fair_ij_w_face_loss = CE_loss(logits_gender_ij[idxs_w_face_loss], targets_ij[idxs_w_face_loss])
@@ -2619,22 +2717,20 @@ def main(args):
                     loss_face_ij[idxs_w_face_feats_from_search] = (1 - (face_feats_2*face_feats_target_2).sum(dim=-1)).to(loss_face_ij.dtype)
 
                 dynamic_weights = gen_dynamic_weights(face_indicators_ij, targets_ij, preds_gender_ori_ij, probs_gender_ori_ij, factor=args.factor1)
-                loss_ij = loss_fair_ij + args.weight_loss_img * dynamic_weights * (loss_CLIP_ij + loss_DINO_ij) + args.weight_loss_face * loss_face_ij
+                loss_ij = loss_fair_ij + args.weight_loss_scr * dynamic_weights * loss_SCR_ij + args.weight_loss_face * loss_face_ij
                 accelerator.backward(loss_ij.mean())
 
                 with torch.no_grad():
                     loss_fair_i[idxs_ij] = loss_fair_ij.to(loss_fair_i.dtype)
                     loss_face_i[idxs_ij] = loss_face_ij.to(loss_face_i.dtype)
-                    loss_CLIP_i[idxs_ij] = loss_CLIP_ij.to(loss_CLIP_i.dtype)
-                    loss_DINO_i[idxs_ij] = loss_DINO_ij.to(loss_DINO_i.dtype)
+                    loss_SCR_i[idxs_ij] = loss_SCR_ij.to(loss_SCR_i.dtype)
                     loss_i[idxs_ij] = loss_ij.to(loss_i.dtype)
                     
             # for logging purpose, gather all losses to main_process
             accelerator.wait_for_everyone()
             loss_fair_all = customized_all_gather(loss_fair_i, accelerator)
             loss_face_all = customized_all_gather(loss_face_i, accelerator)
-            loss_CLIP_all = customized_all_gather(loss_CLIP_i, accelerator)
-            loss_DINO_all = customized_all_gather(loss_DINO_i, accelerator)
+            loss_SCR_all = customized_all_gather(loss_SCR_i, accelerator)
             loss_all = customized_all_gather(loss_i, accelerator)
 
             loss_all = loss_all[loss_fair_all!=-1]
@@ -2644,13 +2740,12 @@ def main(args):
             if accelerator.is_main_process:
                 logs_i["loss_fair"].append(loss_fair_all)
                 logs_i["loss_face"].append(loss_face_all)
-                logs_i["loss_CLIP"].append(loss_CLIP_all)
-                logs_i["loss_DINO"].append(loss_DINO_all)
+                logs_i["loss_SCR"].append(loss_SCR_all)
                 logs_i["loss"].append(loss_all)
             
             # process logs
             if accelerator.is_main_process:
-                for key in ["loss_fair", "loss_face", "loss_CLIP", "loss_DINO", "loss"]:
+                for key in ["loss_fair", "loss_face", "loss_SCR", "loss"]:
                     if logs_i[key] == []:
                         logs_i.pop(key)
                     else:
@@ -2689,12 +2784,23 @@ def main(args):
             with torch.no_grad():
                 if args.train_text_encoder:
                     for p in text_encoder_lora_model.parameters():
+                        # SCR: the h-space loss does not reach every trainable param (it targets
+                        # mid_block, so up_blocks get no grad; a no-face rank also loses loss_fair/
+                        # loss_face grad). Zero-fill None grads so every rank all_reduces every param
+                        # in the same order -> no NCCL desync/deadlock (grads sync manually here).
+                        if p.grad is None:
+                            p.grad = torch.zeros_like(p)
                         if not torch.isfinite(p.grad).all():
                             grad_is_finite = False
                         torch.distributed.all_reduce(p.grad, torch.distributed.ReduceOp.SUM)
                         p.grad = p.grad / accelerator.num_processes / N_backward
                 if args.train_unet:
                     for p in unet_lora_layers.parameters():
+                        # SCR: see note above -- up_block LoRA params receive no SCR gradient, so on a
+                        # rank whose batch has no valid face they hold p.grad=None. Zero-fill to keep
+                        # the per-parameter all_reduce collective aligned across ranks.
+                        if p.grad is None:
+                            p.grad = torch.zeros_like(p)
                         if not torch.isfinite(p.grad).all():
                             grad_is_finite = False
                         torch.distributed.all_reduce(p.grad, torch.distributed.ReduceOp.SUM)

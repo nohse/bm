@@ -438,7 +438,7 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--resume_from_checkpoint",
         type=str,
-        default=None,
+        default="./outputs/gender-debias-text-encoder-again/BS-24_TE_tau-0.0001_resT-15-400-800_wImg-8-0.2-0.2_wFace-1_skipFrac-0.5_Th-0.2_loraR-50_lr-5e-05_07081250/ckpts/checkpoint_tmp-160",
         help="provide the checkpoint path to resume from checkpoint",
     )
     parser.add_argument(
@@ -480,7 +480,7 @@ def parse_args(input_args=None):
     parser.add_argument(
         '--save_attn_maps',
         action="store_true",
-        default=False,
+        default=True,
         help="if set, at every --train_plot_every_n_iter step save the woman/man/common cross-attention "
              "maps used by the residual gender scorer, overlaid on the generated images",
         )
@@ -636,6 +636,20 @@ def parse_args(input_args=None):
         default="a photo of a man",
         type=str,
         help="text prompt for the man class (index 1) in the residual-error gender scorer",
+    )
+    parser.add_argument(
+        '--skip_denoise_frac',
+        default=0.5,
+        type=float,
+        help="fraction of the denoising trajectory to skip when generating images. "
+             "0.0 (default) = full sequential denoising, identical to the original behavior. "
+             "If >0, only the first round((1-frac)*num_denoising_steps) scheduler steps run "
+             "sequentially; at the last of those steps we jump straight to a predicted clean "
+             "latent x0 via the closed-form epsilon->x0 formula "
+             "x0 = (z_t - sqrt(1-abar_t)*eps) / sqrt(abar_t) (no extra UNet call). "
+             "Applied identically to every image-generation pass (current-model, original/frozen "
+             "model, and the gradient pass), so reference and trained images stay on equal footing. "
+             "NOTE: the resulting x0 is an approximation (blurrier than full denoising).",
     )
     parser.add_argument(
         '--residual_woman_word',
@@ -832,6 +846,7 @@ def main(args):
         f"_resT-{args.residual_num_timesteps}-{args.residual_t_min}-{args.residual_t_max}"
         f"_wImg-{args.weight_loss_img}-{args.factor1}-{args.factor2}"
         f"_wFace-{args.weight_loss_face}"
+        f"{('_skipFrac-'+format(args.skip_denoise_frac, 'g')) if args.skip_denoise_frac>0 else ''}"
         f"_Th-{args.uncertainty_threshold}"
         f"_loraR-{args.rank}_lr-{args.learning_rate}"
         f"_{timestring}"
@@ -1305,7 +1320,7 @@ def main(args):
     #######################################################
     
     @torch.no_grad()
-    def generate_image_no_gradient(prompt, noises, num_denoising_steps, which_text_encoder, which_unet, return_latents=False):
+    def generate_image_no_gradient(prompt, noises, num_denoising_steps, which_text_encoder, which_unet, return_latents=False, skip_denoise_frac=None):
         """
         prompts: str
         noises: [N,4,64,64], N is number images to be generated for the prompt
@@ -1345,23 +1360,38 @@ def main(args):
         prompt_embeds = prompt_embeds.to(weight_dtype)
         
         noise_scheduler.set_timesteps(num_denoising_steps)
+        # Optional truncated denoising: run only the first `n_run` scheduler steps sequentially,
+        # then at the last of those jump straight to a predicted clean latent x0 via the
+        # closed-form epsilon->x0 formula (reuses the current step's eps, no extra UNet call).
+        # skip_denoise_frac == 0 -> n_run == full trajectory -> unchanged behavior.
+        # The `skip_denoise_frac` argument overrides args.skip_denoise_frac; evaluation passes 0.0
+        # so eval/validation metrics are always computed on fully-denoised images (comparable to baselines).
+        skip_frac = float(args.skip_denoise_frac if skip_denoise_frac is None else skip_denoise_frac)
+        n_total = len(noise_scheduler.timesteps)
+        n_run = max(1, int(round(n_total * (1.0 - skip_frac)))) if skip_frac > 0.0 else n_total
         latents = noises
         for i, t in enumerate(noise_scheduler.timesteps):
-        
+
             # scale model input
             latent_model_input = torch.cat([latents.to(weight_dtype)] * 2)
             latent_model_input = noise_scheduler.scale_model_input(latent_model_input, t)
-            
+
             noises_pred = which_unet(
                 latent_model_input,
                 t,
                 encoder_hidden_states=prompt_embeds,
             ).sample
             noises_pred = noises_pred.to(weight_dtype_high_precision)
-            
+
             noises_pred_uncond, noises_pred_text = noises_pred.chunk(2)
             noises_pred = noises_pred_uncond + args.guidance_scale * (noises_pred_text - noises_pred_uncond)
-            
+
+            if skip_frac > 0.0 and i == n_run - 1:
+                # one-shot jump z_t -> x0:  x0 = (z_t - sqrt(1-abar_t)*eps) / sqrt(abar_t)
+                abar_t = noise_scheduler.alphas_cumprod[t].to(device=latents.device, dtype=noises_pred.dtype)
+                latents = (latents - (1 - abar_t).sqrt() * noises_pred) / abar_t.sqrt()
+                break
+
             latents = noise_scheduler.step(noises_pred, t, latents).prev_sample
 
         z0 = latents  # clean latent z0 in the scheduler/UNet scale (before VAE-decode rescaling)
@@ -1414,32 +1444,47 @@ def main(args):
         prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds]).to(weight_dtype)
         
         noise_scheduler.set_timesteps(num_denoising_steps)
+        # Optional truncated denoising (see generate_image_no_gradient). When skip_denoise_frac>0
+        # only the first `n_run` steps run and we finish with a closed-form eps->x0 jump. The SDS
+        # grad_coefs are computed over the executed steps only, so their geometric mean stays 1
+        # (the same normalization the full trajectory uses). skip_denoise_frac==0 -> unchanged.
+        skip_frac = float(getattr(args, "skip_denoise_frac", 0.0))
+        n_total = len(noise_scheduler.timesteps)
+        n_run = max(1, int(round(n_total * (1.0 - skip_frac)))) if skip_frac > 0.0 else n_total
+        timesteps_run = noise_scheduler.timesteps[:n_run]
         grad_coefs = []
-        for i, t in enumerate(noise_scheduler.timesteps):
+        for i, t in enumerate(timesteps_run):
             grad_coefs.append( noise_scheduler.alphas_cumprod[t].sqrt().item() * (1-noise_scheduler.alphas_cumprod[t]).sqrt().item() / (1-noise_scheduler.alphas[t].item()) )
         grad_coefs = np.array(grad_coefs)
         grad_coefs /= (math.prod(grad_coefs)**(1/len(grad_coefs)))
-            
+
         latents = noises
         for i, t in enumerate(noise_scheduler.timesteps):
-        
+
             # scale model input
             latent_model_input = torch.cat([latents.detach().to(weight_dtype)]*2)
             latent_model_input = noise_scheduler.scale_model_input(latent_model_input, t)
-            
+
             noises_pred = which_unet(
                 latent_model_input,
                 t,
                 encoder_hidden_states=prompt_embeds,
             ).sample
             noises_pred = noises_pred.to(weight_dtype_high_precision)
-            
+
             noises_pred_uncond, noises_pred_text = noises_pred.chunk(2)
             noises_pred = noises_pred_uncond + args.guidance_scale * (noises_pred_text - noises_pred_uncond)
-            
+
             hook_fn = make_grad_hook(grad_coefs[i])
             noises_pred.register_hook(hook_fn)
-            
+
+            if skip_frac > 0.0 and i == n_run - 1:
+                # one-shot jump z_t -> x0; grad flows through both `latents` (earlier steps) and
+                # `noises_pred` (current UNet), mirroring a normal scheduler.step gradient path.
+                abar_t = noise_scheduler.alphas_cumprod[t].to(device=latents.device, dtype=noises_pred.dtype)
+                latents = (latents - (1 - abar_t).sqrt() * noises_pred) / abar_t.sqrt()
+                break
+
             latents = noise_scheduler.step(noises_pred, t, latents).prev_sample
 
         z0 = latents  # clean latent z0 in the scheduler/UNet scale; NOT detached so grad reaches the trainable model
@@ -2081,11 +2126,11 @@ def main(args):
             for j in range(N):
                 noises_ij = noises_i[args.val_GPU_batch_size*j:args.val_GPU_batch_size*(j+1)]
                 if args.train_text_encoder and args.train_unet:
-                    images_ij = generate_image_no_gradient(prompt_i, noises_ij, num_denoising_steps, which_text_encoder=eval_text_encoder, which_unet=eval_unet)
+                    images_ij = generate_image_no_gradient(prompt_i, noises_ij, num_denoising_steps, which_text_encoder=eval_text_encoder, which_unet=eval_unet, skip_denoise_frac=0.0)
                 elif args.train_text_encoder and not args.train_unet:
-                    images_ij = generate_image_no_gradient(prompt_i, noises_ij, num_denoising_steps, which_text_encoder=eval_text_encoder, which_unet=unet)
+                    images_ij = generate_image_no_gradient(prompt_i, noises_ij, num_denoising_steps, which_text_encoder=eval_text_encoder, which_unet=unet, skip_denoise_frac=0.0)
                 elif not args.train_text_encoder and args.train_unet:
-                    images_ij = generate_image_no_gradient(prompt_i, noises_ij, num_denoising_steps, which_text_encoder=text_encoder, which_unet=eval_unet)
+                    images_ij = generate_image_no_gradient(prompt_i, noises_ij, num_denoising_steps, which_text_encoder=text_encoder, which_unet=eval_unet, skip_denoise_frac=0.0)
                 images_ori.append(images_ij)
             images_ori = torch.cat(images_ori)
             face_indicators_ori, face_bboxs_ori, face_chips_ori, face_landmarks_ori, aligned_face_chips_ori = get_face(images_ori)
@@ -2127,7 +2172,7 @@ def main(args):
             N = math.ceil(noises_i.shape[0] / args.val_GPU_batch_size)
             for j in range(N):
                 noises_ij = noises_i[args.val_GPU_batch_size*j:args.val_GPU_batch_size*(j+1)]
-                images_ij = generate_image_no_gradient(prompt_i, noises_ij, num_denoising_steps, which_text_encoder=which_text_encoder, which_unet=which_unet)
+                images_ij = generate_image_no_gradient(prompt_i, noises_ij, num_denoising_steps, which_text_encoder=which_text_encoder, which_unet=which_unet, skip_denoise_frac=0.0)
                 images.append(images_ij)
             images = torch.cat(images)
             
