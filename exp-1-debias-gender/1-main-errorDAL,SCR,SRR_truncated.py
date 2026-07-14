@@ -438,7 +438,7 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--resume_from_checkpoint",
         type=str,
-        default="./outputs/gender-debias-text-encoder-again/BS-24_TE_tau-0.0001_resT-15-400-800_wImg-8-0.2-0.2_wFace-1_skipFrac-0.5_Th-0.2_loraR-50_lr-5e-05_07081250/ckpts/checkpoint_tmp-160",
+        default="./outputs/gender-debias-text-encoder-again/BS-24_TE_tau-0.0001_resT-15-400-800_wImg-8-0.2-0.2_wFace-1_skipFrac-0.5_Th-0.2_loraR-50_lr-5e-05_07081409/ckpts/checkpoint_tmp-1180",
         help="provide the checkpoint path to resume from checkpoint",
     )
     parser.add_argument(

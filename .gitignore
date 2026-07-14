@@ -169,3 +169,17 @@ outputs/
 original-SD-generated-images/
 **/2-export-checkpoint_old.py
 **/eval-commands.txt
+
+# experiment outputs — keep CODE only in git (images/arrays/logs excluded)
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.npz
+*.npy
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+__pycache__/
+*.pyc

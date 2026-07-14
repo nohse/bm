@@ -438,8 +438,11 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--resume_from_checkpoint",
         type=str,
-        default="./outputs/gender-debias-text-encoder-again/BS-24_TE_tau-0.0001_resT-15-400-800_wImg-8-0.2-0.2_wSRR-4_Th-0.2_loraR-50_lr-5e-05_07081407/ckpts/checkpoint-200",
-        help="provide the checkpoint path to resume from checkpoint",
+        default=None,
+        help="provide the checkpoint path to resume from checkpoint. NOTE: kept None for the SRR_person "
+             "experiment so it starts fresh from pretrained SD -- resuming from a face-prompt SRR checkpoint "
+             "would carry over weights trained on the old 'a photo of a realistic face' prompt and "
+             "contaminate this run. Pass an explicit path only to resume an interrupted SRR_person run.",
     )
     parser.add_argument(
         "--mixed_precision",
@@ -522,14 +525,14 @@ def parse_args(input_args=None):
     parser.add_argument(
         '--weight_loss_face',
         default=1,
-        help="weight for the SRR (realistic-face SDS) loss. NOTE: kept named --weight_loss_face so the "
+        help="weight for the SRR (realistic-person SDS) loss. NOTE: kept named --weight_loss_face so the "
              "shared debias-*.yaml configs (which set weight_loss_face) apply to this SRR experiment too; "
              "it no longer weights the old face-feature realism-preserving loss (removed).",
         type=float,
     )
     parser.add_argument(
         '--srr_prompt',
-        default="a photo of a realistic face",
+        default="a photo of a realistic person",
         type=str,
         help="text prompt whose frozen-SD diffusion residual error is used directly as the SRR realism "
              "loss. Scored by the fused residual scorer, sharing eps/zt with the woman/man gender scorer "
@@ -538,9 +541,11 @@ def parse_args(input_args=None):
     parser.add_argument(
         '--attn_gate_thr',
         default=0.15,
-        help="min-max-normalized gender cross-attention threshold used to RESTRICT the SRR realism loss "
-             "to the face/gender region (region = gate >= this). The SRR residual is masked-mean-reduced "
-             "over that region only, so SRR gradient flows to the face region and not the whole image "
+        help="min-max-normalized gender (woman/man) cross-attention threshold defining the person/subject "
+             "region (region = gate >= this). The SRR realism loss keeps its VALUE over the WHOLE image "
+             "(every pixel contributes to E_realistic), but its GRADIENT is restricted to this region by "
+             "input-masking z0 outside it (non-region z0 is detached), so d(E_realistic)/dz0 is exactly "
+             "zero outside the region while the value stays the true whole-image residual "
              "(attmap reused from the woman/man scorer, min-max-normalized as in the hspace SCR gate).",
         type=float,
     )
@@ -844,6 +849,9 @@ def main(args):
     now = datetime.now(my_timezone)
     timestring = f"{now.month:02}{now.day:02}{now.hour:02}{now.minute:02}"
     _model_tag = f"{'TE' if args.train_text_encoder else ''}{'UNet' if args.train_unet else ''}"
+    # short SRR-prompt slug (last word of --srr_prompt) so person-vs-face SRR runs are distinguishable
+    # by folder name, not just timestamp: "a photo of a realistic person" -> srr-person, ...face -> srr-face.
+    _srr_tag = args.srr_prompt.strip().split()[-1] if args.srr_prompt.strip() else "none"
     folder_name = (
         f"BS-{args.train_images_per_prompt_GPU*accelerator.num_processes}"
         f"_{_model_tag}"
@@ -851,6 +859,7 @@ def main(args):
         f"_resT-{args.residual_num_timesteps}-{args.residual_t_min}-{args.residual_t_max}"
         f"_wImg-{args.weight_loss_img}-{args.factor1}-{args.factor2}"
         f"_wSRR-{args.weight_loss_face}"
+        f"_srr-{_srr_tag}"
         f"_Th-{args.uncertainty_threshold}"
         f"_loraR-{args.rank}_lr-{args.learning_rate}"
         f"_{timestring}"
@@ -1842,11 +1851,11 @@ def main(args):
         """Fused residual-error scorer used by the training loss (SCR gender + SRR realism).
 
         A single eps/zt is sampled per timestep and scored under THREE frozen-SD text conditions:
-        woman / man (the SCR gender fair loss) and args.srr_prompt = "a photo of a realistic face"
+        woman / man (the SCR gender fair loss) and args.srr_prompt = "a photo of a realistic person"
         (the SRR realism loss). The three passes share the same per-timestep eps (and identical zt
-        VALUES); the realism pass additionally masks the z0 gradient to the face region (see E_realistic).
+        VALUES); the realism pass additionally masks the z0 gradient to the person region (see E_realistic).
         Gradient flows z0 -> trainable model; the scorer (scoring_unet / scoring_text_encoder) stays
-        frozen, so E_realistic pulls z0 onto the frozen model's "realistic face" manifold (score
+        frozen, so E_realistic pulls z0 onto the frozen model's "realistic person" manifold (score
         distillation on the realism prompt).
 
         z0: [n,4,H,W] clean latent in the scheduler/UNet scale (NOT detached).
@@ -1857,7 +1866,7 @@ def main(args):
               modulo the fresh random eps draw).
           E_realistic [n], the SRR loss per sample: squared residual for the realism prompt, meaned over
               the WHOLE image (every pixel contributes to the VALUE), then averaged over timesteps. RAW
-              error -- NOT divided by tau. The GRADIENT is localized to the face/gender region by masking
+              error -- NOT divided by tau. The GRADIENT is localized to the person/gender region by masking
               the SCORER INPUT: non-region z0 pixels are detached before the realism UNet pass, so
               d(E_realistic)/dz0 is exactly zero outside the min-max-normalized common_attn >=
               args.attn_gate_thr region, while the value stays the true whole-image residual. (Masking the
@@ -1930,8 +1939,8 @@ def main(args):
         E_man = (common_attn.unsqueeze(1) * residual_maps["man"]).sum(dim=(2, 3)).mean(dim=1)       # [n]
         logits_gender = torch.stack([-E_woman / args.tau, -E_man / args.tau], dim=1)    # [n, 2]
 
-        # -------- SRR realism: VALUE over the WHOLE image, GRADIENT only in the face/gender region --------
-        # Face/gender region = min-max-normalized common_attn hard-thresholded at args.attn_gate_thr.
+        # -------- SRR realism: VALUE over the WHOLE image, GRADIENT only in the person/gender region --------
+        # Person/gender region = min-max-normalized common_attn hard-thresholded at args.attn_gate_thr.
         cmin = common_attn.amin(dim=(1, 2), keepdim=True)                               # [n,1,1]
         cmax = common_attn.amax(dim=(1, 2), keepdim=True)                               # [n,1,1]
         attn_gate = ((common_attn - cmin) / (cmax - cmin + 1e-8)).clamp(0, 1)           # [n,H,W] min-max, detached
@@ -2712,7 +2721,7 @@ def main(args):
                 face_indicators_ij, face_bboxs_ij, face_chips_ij, face_landmarks_ij, aligned_face_chips_ij = get_face(images_ij)
                 # Branch B: fused residual scorer on z0_ij (grad flows z0 -> trainable model).
                 #   - logits_gender_ij [n,2]: woman/man residual-error gender logits (SCR fair loss).
-                #   - loss_SRR_ij [n]: "a photo of a realistic face" residual error (SRR realism loss).
+                #   - loss_SRR_ij [n]: "a photo of a realistic person" residual error (SRR realism loss).
                 # Both share the same per-timestep eps/zt. Computed on z0_ij before the RGB grad-hook
                 # below, which only affects Branch A (image loss).
                 logits_gender_ij, loss_SRR_ij = residual_gender_and_realism(z0_ij)

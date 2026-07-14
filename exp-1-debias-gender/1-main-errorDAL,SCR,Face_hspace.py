@@ -260,6 +260,27 @@ def attmap_overlay_on_image(att_map, image, alpha=0.45):
     return Image.alpha_composite(base, heat).convert("RGB")
 
 
+def mask_overlay_on_image(mask, image, alpha=0.5, color=(255, 165, 0)):
+    """Overlay a (near-)binary HxW mask onto one 3xHxW image tensor in [-1,1] as a solid-color tint.
+
+    Unlike attmap_overlay_on_image this does NOT contrast-stretch, so the min-max hard mask
+    (attn_gate >= thr) and the applied gradient-gate region are rendered faithfully (a pixel is
+    tinted iff mask>0, with opacity proportional to the mask value). Returns a PIL RGB image.
+    """
+    img_pil = transforms.ToPILImage()(image.detach().cpu().mul(0.5).add(0.5).clamp(0, 1))
+    m = mask.detach().float().cpu()
+    m = torch.nan_to_num(m, nan=0.0, posinf=0.0, neginf=0.0).clamp(0.0, 1.0)
+    if m.shape[-2:] != (img_pil.size[1], img_pil.size[0]):
+        m = torch.nn.functional.interpolate(
+            m.unsqueeze(0).unsqueeze(0), size=(img_pil.size[1], img_pil.size[0]), mode="nearest",
+        ).squeeze(0).squeeze(0)
+    base = img_pil.convert("RGBA")
+    tint = Image.new("RGBA", base.size, color + (0,))
+    alpha_mask = Image.fromarray(m.mul(255 * alpha).clamp(0, 255).to(torch.uint8).numpy(), mode="L")
+    tint.putalpha(alpha_mask)
+    return Image.alpha_composite(base, tint).convert("RGB")
+
+
 def make_grad_hook(coef):
     return lambda x: coef * x
 
@@ -438,7 +459,7 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--resume_from_checkpoint",
         type=str,
-        default=None,
+        default="",
         help="provide the checkpoint path to resume from checkpoint",
     )
     parser.add_argument(
@@ -480,9 +501,12 @@ def parse_args(input_args=None):
     parser.add_argument(
         '--save_attn_maps',
         action="store_true",
-        default=False,
-        help="if set, at every --train_plot_every_n_iter step save the woman/man/common cross-attention "
-             "maps used by the residual gender scorer, overlaid on the generated images",
+        default=True,
+        help="ON by default. At every --train_plot_every_n_iter step, save two visualizations overlaid on the "
+             "generated images: (1) train-<step>_attmap.jpg = the woman/man/common cross-attention weighting "
+             "maps multiplied into the residual error by the gender scorer; (2) train-<step>_gradgate.jpg = the "
+             "SCR flip gradient-gate, i.e. the min-max normalized common-attn hard-masked at --attn_gate_thr "
+             "(0.15) and the region actually scaled by --factor2 for flip/uncertain samples this step",
         )
     parser.add_argument(
         "--report_to",
@@ -842,7 +866,7 @@ def main(args):
         f"_{_model_tag}"
         f"_tau-{args.tau:g}"
         f"_resT-{args.residual_num_timesteps}-{args.residual_t_min}-{args.residual_t_max}"
-        f"_wSCR-{args.weight_loss_scr}-{args.factor1}"
+        f"_wSCR-{args.weight_loss_scr}-{args.factor1}-{args.factor2}"
         f"_wFace-{args.weight_loss_face}"
         f"_Th-{args.uncertainty_threshold}"
         f"_loraR-{args.rank}_lr-{args.learning_rate}"
@@ -2013,6 +2037,61 @@ def main(args):
             os.makedirs(os.path.dirname(save_to), exist_ok=True)
         grid.save(save_to, quality=92)
 
+    def save_grad_gate_panels(images, common_attn, attn_gate, scr_grad_mask, release, targets,
+                              preds_gender_ori, save_to, thr, factor2, max_imgs=16):
+        """Save the SCR flip gradient-gate visualization = the min-max-normalized, hard-masked (>= thr)
+        region whose SCR gradient is scaled by factor2. These are the EXACT tensors that gate the gradient
+        in the training loop (already detached), so the panel shows what actually happened this step.
+
+        Each row = [ generated | common-attn (scoring weight, sum-to-1) | min-max gate | hard-mask (>= thr) |
+                     applied damp (x factor2) ].
+          - common-attn: the attention map multiplied into the residual error inside the gender scorer.
+          - min-max gate: (common-attn - min)/(max - min), the value thresholded at thr.
+          - hard-mask: gate >= thr (where damping WOULD apply for a released sample), regardless of release.
+          - applied damp: the region actually multiplied by factor2 this step = (hard-mask AND released);
+            empty for kept (agree) samples. A per-row caption prints t=target, p_ori=pred_gender_ori, release.
+        """
+        n = min(images.shape[0], common_attn.shape[0], max_imgs)
+        if n == 0:
+            return
+        imgs = images[:n].detach().cpu()
+        common = common_attn[:n].detach().float().cpu()
+        gate = attn_gate[:n].detach().float().cpu()
+        hard = (gate >= thr).float()                                        # [n,H,W] min-max hard mask
+        gmask = scr_grad_mask[:n].detach().float().cpu()
+        if gmask.dim() == 4:
+            gmask = gmask[:, 0]                                             # [n,1,H,W] -> [n,H,W]
+        applied = (gmask < (1.0 - 1e-4)).float()                            # damped iff mask < 1 (== factor2 region)
+        labels = ["generated", "common-attn", "min-max gate", f"hard >= {thr:g}", f"applied x{factor2:g}"]
+        rows = []
+        for i in range(n):
+            t = int(targets[i].item()) if targets is not None else -9
+            p = int(preds_gender_ori[i].item()) if preds_gender_ori is not None else -9
+            rel = bool(release[i].item()) if release is not None else False
+            base_pil = transforms.ToPILImage()(imgs[i].mul(0.5).add(0.5).clamp(0, 1))
+            panels = [
+                base_pil,
+                attmap_overlay_on_image(common[i], imgs[i]),
+                attmap_overlay_on_image(gate[i], imgs[i]),
+                mask_overlay_on_image(hard[i], imgs[i], color=(255, 165, 0)),
+                mask_overlay_on_image(applied[i], imgs[i], color=(0, 220, 255)),
+            ]
+            w, h = base_pil.size
+            row = Image.new("RGB", (w * len(panels), h))
+            for jj, (pl, lab) in enumerate(zip(panels, labels)):
+                pl = pl.resize((w, h)).copy()
+                ImageDraw.Draw(pl).text((5, 5), f"{lab} #{i}", fill="white")
+                row.paste(pl, (jj * w, 0))
+            ImageDraw.Draw(row).text((5, h - 14), f"t={t} p_ori={p} release={rel} damp=x{factor2:g}", fill="yellow")
+            rows.append(row)
+        gw, gh = rows[0].size
+        grid = Image.new("RGB", (gw, gh * len(rows)))
+        for i, r in enumerate(rows):
+            grid.paste(r, (0, i * gh))
+        if os.path.dirname(save_to) and not os.path.exists(os.path.dirname(save_to)):
+            os.makedirs(os.path.dirname(save_to), exist_ok=True)
+        grid.save(save_to, quality=92)
+
     def get_face_gender_test(face_chips, selector=None, fill_value=-1):
         """for the separately-trained CelebA gender *test* classifier (evaluation only).
 
@@ -2660,20 +2739,39 @@ def main(args):
                 #   re-noise the ORIGINAL (z0_ori) and FINETUNE (z0_ij) latents to the SAME zt (shared eps & t)
                 #   and MSE the FROZEN scoring UNet's mid_block (h-space) output under the frozen generation prompt.
                 #   grad: h_ft -> zt_ft -> z0_ij -> generation (reaches up_blocks); h_ori is a detached target.
-                #   FLIP RELEASE: for flip/uncertain samples (targets_ij != preds_gender_ori_ij), multiply the SCR
-                #   gradient by --factor2 inside the face/gender region (min-max attn >= --attn_gate_thr), x1 else.
-                #   Applied via a hook on the SCR-only tensor zt_ft, so loss_fair/loss_face gradients are untouched.
+                #   FLIP RELEASE: for flip OR uncertain samples, multiply the SCR gradient by --factor2 inside
+                #   the face/gender region (min-max attn >= --attn_gate_thr), x1 else. Applied via a hook on the
+                #   SCR-only tensor zt_ft, so loss_fair/loss_face gradients are untouched.
+                #   The release set MATCHES the debias apply_grad_hook_face decision exactly:
+                #     debias damps when {target == -1} OR {target != pred_gender_ori}   (the `if target==-1`
+                #     branch fires first/unconditionally), and keeps only when {target != -1 AND target == pred_ori}.
+                #   So release_ij = (target != pred_ori) | (target == -1). The extra `| (target == -1)` term (vs the
+                #   plain `!=`) covers the {target==-1 AND pred_ori==-1} corner, which `-1 != -1 == False` would
+                #   otherwise (wrongly) treat as "agree -> keep". No-face FINETUNE samples are auto-excluded because
+                #   get_face_gender fills their attmap with zeros -> attn_gate==0 < thr -> no damping (mirrors
+                #   debias's `if (face_bbox == -1): skip`).
                 z0_ori_ij = z0_ori[idxs_ij]
                 scr_gen_embeds_ij = scr_gen_embeds.expand(len(idxs_ij), -1, -1)
 
                 cmin = common_attn_ij.amin(dim=(1, 2), keepdim=True)
                 cmax = common_attn_ij.amax(dim=(1, 2), keepdim=True)
                 attn_gate = ((common_attn_ij - cmin) / (cmax - cmin + 1e-8)).clamp(0, 1)          # [chunk,64,64] min-max
-                release_ij = (targets_ij != preds_gender_ori_ij)                                   # flip OR uncertain(-1)
+                release_ij = (targets_ij != preds_gender_ori_ij) | (targets_ij == -1)               # debias-aligned: flip OR uncertain(-1)
                 scr_grad_mask = torch.ones_like(attn_gate)
                 scr_grad_mask = torch.where((attn_gate >= args.attn_gate_thr) & release_ij[:, None, None],
                                             torch.full_like(scr_grad_mask, args.factor2), scr_grad_mask)
                 scr_grad_mask = scr_grad_mask[:, None, :, :].to(z0_ij.dtype)                        # [chunk,1,64,64]
+
+                # Visualize/save the flip gradient-gate: min-max normalized attn + 0.15 hard mask (--attn_gate_thr)
+                # and the region actually damped by --factor2 this step. Uses the exact gating tensors above.
+                if accelerator.is_main_process and args.save_attn_maps and (step % args.train_plot_every_n_iter == 0) and j == 0:
+                    grad_gate_save_to = os.path.join(args.imgs_save_dir, f"train-{global_step}_gradgate.jpg")
+                    save_grad_gate_panels(
+                        images_ij, common_attn_ij, attn_gate, scr_grad_mask, release_ij,
+                        targets_ij, preds_gender_ori_ij, grad_gate_save_to,
+                        thr=args.attn_gate_thr, factor2=args.factor2,
+                    )
+                    log_imgs_i["grad_gate"] = [grad_gate_save_to]
 
                 scr_mid_store = []
                 def _scr_mid_hook(_m, _in, _out):

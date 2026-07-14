@@ -8,7 +8,7 @@ factor2: 0.2
 uncertainty_threshold: 0.2
 train_images_per_prompt_GPU: 12
 train_GPU_batch_size: 3
-val_images_per_prompt_GPU: 8
+val_images_per_prompt_GPU: 30
 val_GPU_batch_size: 8
 val_images_per_prompt_total: 60   # 8 GPU * 8 = 64 generated, keep exactly 60 per occupation
 learning_rate: 5e-5
