@@ -20,6 +20,24 @@ import sys
 import shlex
 from pathlib import Path
 
+# ===========================================================================
+# NCCL hang diagnostics (part 1/2: env vars — MUST run before `import torch`
+# so they are picked up when the process group is created). See
+# start_hang_watchdog() below for the Python-side stall/stack dumper.
+# Disable everything with HANG_DIAG=0.
+# ===========================================================================
+if os.environ.get("HANG_DIAG", "1") != "0":
+    # Flight Recorder: keep a ring buffer of recent collectives per rank and dump
+    # it to disk on a collective timeout, so the EXACT stuck NCCL op (and which
+    # ranks reached it) survives the watchdog SIGABRT.
+    os.environ.setdefault("TORCH_NCCL_TRACE_BUFFER_SIZE", "2000")
+    os.environ.setdefault("TORCH_NCCL_DUMP_ON_TIMEOUT", "1")
+    os.environ.setdefault("TORCH_NCCL_DESYNC_DEBUG", "1")
+    os.environ.setdefault(
+        "TORCH_NCCL_DEBUG_INFO_TEMP_FILE",
+        os.path.abspath("./hang_diag_nccl_trace_rank_"),
+    )
+
 import argparse
 import itertools
 import logging
@@ -58,6 +76,114 @@ from accelerate.utils import ProjectConfiguration, set_seed, GradScalerKwargs
 from transformers import CLIPModel, CLIPProcessor
 import torch.nn.functional as F
 import torchvision.transforms as T  # PIL 변환용 (없으면 추가)
+
+# ===========================================================================
+# NCCL hang diagnostics (part 2/2: Python-side stall watchdog).
+#
+# The NCCL watchdog only SIGABRTs the rank that is WAITING at a collective; it
+# never shows what the OTHER rank was busy/stuck doing. This fills that gap:
+#   * `_hang_hb("phase")` is called at each eval milestone to record where this
+#     rank is (cheap, no I/O) and (re)arm a GIL-safe C-level timer.
+#   * If a rank makes no progress for HANG_STALL_SEC (default 480s, < the 600s
+#     NCCL timeout) it dumps EVERY thread's Python stack to a per-rank file
+#     BEFORE NCCL aborts -> you see the stuck rank's stack AND its phase label.
+#   * `kill -USR1 <pid>` dumps live stacks on demand (works even under the GIL).
+#   * faulthandler.enable() prints a Python traceback on the SIGABRT itself.
+# Tunables (env): HANG_DIAG=0 disables; HANG_STALL_SEC, HANG_POLL_SEC.
+# ===========================================================================
+import faulthandler as _faulthandler
+import threading as _threading
+import time as _time
+import signal as _signal
+
+_HANG = {"t": _time.time(), "phase": "startup", "rank": -1, "dir": None, "fh": None,
+         "enabled": os.environ.get("HANG_DIAG", "1") != "0"}
+_HANG_LOCK = _threading.Lock()
+_HANG_STALL_SEC = float(os.environ.get("HANG_STALL_SEC", "480"))
+_HANG_POLL_SEC = float(os.environ.get("HANG_POLL_SEC", "20"))
+
+
+def _hang_hb(phase):
+    """Heartbeat: record the phase this rank just entered and re-arm the timer."""
+    if not _HANG["enabled"]:
+        return
+    with _HANG_LOCK:
+        _HANG["t"] = _time.time()
+        _HANG["phase"] = phase
+    fh = _HANG["fh"]
+    if fh is not None:
+        try:
+            # GIL-safe: a C timer dumps all-thread stacks to `fh` if no new
+            # heartbeat arrives within _HANG_STALL_SEC. Re-arming cancels the prev.
+            _faulthandler.dump_traceback_later(
+                _HANG_STALL_SEC, repeat=False, file=fh, exit=False)
+        except Exception:
+            pass
+
+
+def _hang_write_dump(reason):
+    d = _HANG["dir"] or os.getcwd()
+    try:
+        os.makedirs(d, exist_ok=True)
+    except Exception:
+        d = os.getcwd()
+    with _HANG_LOCK:
+        phase, age, rank = _HANG["phase"], _time.time() - _HANG["t"], _HANG["rank"]
+    path = os.path.join(d, f"hang_stack_rank{rank}_{int(_time.time())}.txt")
+    try:
+        with open(path, "w") as f:
+            f.write(f"[HANG-DIAG] reason={reason} rank={rank} phase={phase!r} "
+                    f"no-progress={age:.0f}s pid={os.getpid()}\n\n")
+            _faulthandler.dump_traceback(file=f, all_threads=True)
+        print(f"[HANG-DIAG] rank={rank} {reason}: stuck at phase={phase!r} for "
+              f"{age:.0f}s -> {path}", flush=True)
+    except Exception as e:
+        print(f"[HANG-DIAG] rank={rank} dump failed: {e}", flush=True)
+
+
+def _hang_watchdog_loop():
+    warned = False
+    while True:
+        _time.sleep(_HANG_POLL_SEC)
+        with _HANG_LOCK:
+            age = _time.time() - _HANG["t"]
+        if age > _HANG_STALL_SEC:
+            if not warned:
+                _hang_write_dump(f"no-progress>{int(_HANG_STALL_SEC)}s")
+                warned = True
+        else:
+            warned = False
+
+
+def start_hang_watchdog(rank, out_dir):
+    """Arm the stall watchdog for this rank. Call once, after Accelerator init."""
+    if not _HANG["enabled"]:
+        return
+    _HANG["rank"] = rank
+    _HANG["dir"] = out_dir
+    try:
+        os.makedirs(out_dir, exist_ok=True)
+    except Exception:
+        out_dir = os.getcwd()
+        _HANG["dir"] = out_dir
+    try:
+        _HANG["fh"] = open(os.path.join(out_dir, f"hang_timer_rank{rank}.txt"), "a")
+    except Exception:
+        _HANG["fh"] = None
+    try:
+        _faulthandler.enable()  # Python traceback on SIGABRT/SIGSEGV (NCCL abort)
+    except Exception:
+        pass
+    try:
+        _faulthandler.register(_signal.SIGUSR1, all_threads=True, chain=True)
+    except Exception:
+        pass
+    _threading.Thread(target=_hang_watchdog_loop, name="hang-watchdog",
+                      daemon=True).start()
+    _hang_hb("watchdog-armed")
+    print(f"[HANG-DIAG] armed on rank {rank}: dumps to {out_dir} if a phase "
+          f"stalls >{int(_HANG_STALL_SEC)}s (NCCL timeout is 600s); "
+          f"`kill -USR1 {os.getpid()}` for an on-demand dump.", flush=True)
 import diffusers
 from diffusers import (
     AutoencoderKL,
@@ -972,7 +1098,7 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--resume_from_checkpoint",
         type=str,
-        default="./outputs/gender_aaai/20260707-1144_gender_aaai_region-attn_skip-50pct_wImg-4_wRealFace-4.0_Th-0.2_lr-5e-05/ckpts/checkpoint_tmp-260",
+        default="./outputs/gender_aaai/20260707-1518_gender_aaai_region-attn_skip-50pct_wImg-4_wRealFace-4.0_Th-0.2_lr-5e-05/ckpts/checkpoint_tmp-580",
         help="provide the checkpoint path to resume from checkpoint",
     )
     parser.add_argument(
@@ -1574,6 +1700,9 @@ def main(args):
         project_config=accelerator_project_config,
         kwargs_handlers=[kwargs]
     )
+
+    # Start the per-rank stall watchdog now that our global rank is known.
+    start_hang_watchdog(accelerator.process_index, os.path.join(args.output_dir, "hang_diag"))
 
     if args.report_to == "wandb":
         if not is_wandb_available():
@@ -3059,7 +3188,8 @@ def main(args):
                 feats = F.normalize(feats.float(), dim=-1)
             return feats
 
-        for prompt_i, noises_i in itertools.zip_longest(prompts, noises):
+        for _hang_pi, (prompt_i, noises_i) in enumerate(itertools.zip_longest(prompts, noises)):
+            _hang_hb(f"eval[{name}] p{_hang_pi} ori-forward")
             if accelerator.is_main_process:
                 logs_i = {
                     "gender_gap": [],
@@ -3124,6 +3254,7 @@ def main(args):
                 text_features=gender_text_features,
                 device=accelerator.device,
             )
+            _hang_hb(f"eval[{name}] p{_hang_pi} ori-GATHER")
             images_ori_all = customized_all_gather(images_ori, accelerator, return_tensor_other_processes=False)
             face_indicators_ori_all = customized_all_gather(face_indicators_ori, accelerator, return_tensor_other_processes=False)
             face_bboxs_ori_all = customized_all_gather(face_bboxs_ori, accelerator, return_tensor_other_processes=False)
@@ -3137,6 +3268,7 @@ def main(args):
             if need_attmap_eval and attmap_ori is not None:
                 attmap_ori_all = customized_all_gather(attmap_ori, accelerator, return_tensor_other_processes=False)
 
+            _hang_hb(f"eval[{name}] p{_hang_pi} ori-save(main-heavy)")
             if accelerator.is_main_process:
                 save_to = os.path.join(args.imgs_save_dir, f"eval_{name}_{global_step}_{prompt_i}_ori.jpg")
                 plot_in_grid(
@@ -3175,6 +3307,7 @@ def main(args):
                         log_imgs_i["attmap_ori_overlay"] = [att_preview]
 
             
+            _hang_hb(f"eval[{name}] p{_hang_pi} gen-forward")
             images = []
             N = math.ceil(noises_i.shape[0] / args.val_GPU_batch_size)
             for j in range(N):
@@ -3217,6 +3350,7 @@ def main(args):
                 text_features=gender_text_features,
                 device=accelerator.device,
             )
+            _hang_hb(f"eval[{name}] p{_hang_pi} gen-GATHER")
             images_all = customized_all_gather(images, accelerator, return_tensor_other_processes=False)
             face_indicators_all = customized_all_gather(face_indicators, accelerator, return_tensor_other_processes=False)
             face_bboxs_all = customized_all_gather(face_bboxs, accelerator, return_tensor_other_processes=False)
@@ -3230,6 +3364,7 @@ def main(args):
             if need_attmap_eval and attmap_gen is not None:
                 attmap_gen_all = customized_all_gather(attmap_gen, accelerator, return_tensor_other_processes=False)
 
+            _hang_hb(f"eval[{name}] p{_hang_pi} gen-save(main-heavy)")
             if accelerator.is_main_process:
                 save_to = os.path.join(args.imgs_save_dir, f"eval_{name}_{global_step}_{prompt_i}_generated.jpg")
                 plot_in_grid(
@@ -3334,6 +3469,7 @@ def main(args):
             # Rank 0 performs extra CPU/GPU work (image saving, metric logging),
             # so without this sync other ranks can run ahead and hit the next
             # collective early, which may trigger NCCL watchdog timeouts.
+            _hang_hb(f"eval[{name}] p{_hang_pi} barrier-wait")
             accelerator.wait_for_everyone()
         
         if accelerator.is_main_process:
@@ -3615,6 +3751,7 @@ def main(args):
 
             # get prompt, should be identical across processes
             prompt_i = train_dataset.__getitem__(data_idx)
+            _hang_hb(f"train e{epoch} s{step}")
             
             # generate noises, should differ by processes
             noises_i = torch.randn(
