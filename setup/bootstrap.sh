@@ -21,6 +21,15 @@ REQ="$SCRIPT_DIR/requirements_lock.txt"
 
 log(){ printf '\n\033[1;36m%s\033[0m\n' "$*"; }
 
+# URL 다운로드: curl -> wget -> 시스템 python3 순으로 폴백 (셋 중 하나만 있으면 됨)
+fetch(){  # $1=url  $2=출력경로
+  if command -v curl >/dev/null 2>&1; then curl -fsSL "$1" -o "$2"
+  elif command -v wget >/dev/null 2>&1; then wget -q "$1" -O "$2"
+  elif command -v python3 >/dev/null 2>&1; then python3 -c "import urllib.request,sys; urllib.request.urlretrieve(sys.argv[1],sys.argv[2])" "$1" "$2"
+  else echo "  ERROR: curl/wget/python3 중 하나가 필요합니다 (Miniconda 다운로드용)." >&2; return 1
+  fi
+}
+
 log "[0/4] GPU/드라이버 점검"
 if command -v nvidia-smi >/dev/null 2>&1; then
   nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader | sed 's/^/  GPU: /'
@@ -39,7 +48,7 @@ find_conda() {
 if ! find_conda; then
   echo "  → Miniconda 설치 중..."
   MC="$HOME/miniconda3"
-  curl -fsSL "https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh" -o /tmp/miniconda_bm.sh
+  fetch "https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh" /tmp/miniconda_bm.sh
   bash /tmp/miniconda_bm.sh -b -p "$MC"
   rm -f /tmp/miniconda_bm.sh
   . "$MC/etc/profile.d/conda.sh"
