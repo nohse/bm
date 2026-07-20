@@ -14,36 +14,23 @@
 # See the License for the specific language governing permissions and
 
 # =====================================================================================
-# ATTMAP = NODETECTOR + a switch on the SPATIAL REDUCTION of the woman/man class error:
-#     --gender_attn_weight {attn, none}     (default: attn == the original NODETECTOR file)
-# The woman/man gender error E_c is the per-pixel squared eps-residual of the frozen scoring UNet
-# under the "woman"/"man" text condition. The original file always reduces it with the COMMON
-# woman/man cross-attention map (sum-to-1 normalized) as a spatial weight, i.e. E_c = sum_{u,v}
-# attn(u,v) * res_c(u,v) -- re-weighting the error toward the gender/person region. This file makes
-# that weighting OPTIONAL:
-#   attn : E_c = sum_{u,v} common_attn(u,v) * res_c(u,v)        (attention-weighted SUM; original)
-#   none : E_c = mean_{u,v} res_c(u,v)                          (the FULL error, uniform over space)
-# The 'none' branch is exactly the 'attn' branch with a FLAT weight map 1/(H*W), which also sums to
-# 1 -- so E_c keeps the same normalization/scale and --tau does NOT need to be re-tuned a priori.
-# HOW BIG IS THE DIFFERENCE? Measured on 8 real generated images (K=15, t 400-800): this gender attn
-# map is DIFFUSE, not a face mask (values 1.7e-4..4.7e-4 around the 2.44e-4 uniform value, ~2.8x
-# max/min, participation ratio ~3900 of 4096 px). So 'attn' is a MILD re-weighting: E_woman
-# none/attn = 1.04, the class GAP |E_man - E_woman| none/attn = 0.83, and the argmax gender preds
-# agree 8/8. The flag mainly rescales the class-error GAP (hence the fair-loss gradient), and does
-# NOT make the z0 gradient uniform (it flows through the scoring UNet's global receptive field:
-# top-10% |grad| energy 0.225 attn -> 0.196 none, vs 0.10 for a truly uniform field).
-# The flag applies to BOTH places the class error is computed: residual_gender_and_realism (the SCR
-# fair loss) and residual_gender_logits (the training-time gender predictor behind get_face_gender).
-# What the flag does NOT change (the cross-attention map is still computed in BOTH modes):
-#   - the SRR realism gradient region  (min-max common_attn >= --attn_gate_thr, input-masked z0)
-#   - the h-space SCR flip gradient gate (same region, scaled by --factor2)
-#   - the attention/grad-gate visualizations (--save_attn_maps)
-# Only the gender-error reduction switches; everything else is byte-for-byte the original file.
-# Run-folder tag: the mode is ALWAYS written into the output folder / wandb run name --
-#   _gAttn-attn = attmap weighting ON (original behaviour) , _gAttn-none = attmap weighting OFF
-# so a run's own folder states whether the attmap multiply was used (an absent tag would be
-# ambiguous with the original _nodetector.py runs, which carry no _gAttn tag at all). Example:
-#   ..._wSRR-4_srr-person_errFD-8-50-950_gAttn-none_skipFrac-0.5_Th-0.2_loraR-50_lr-5e-05_07131530
+# EPSILON = SRR_person_truncated_hspace_nodetector with the SCR image loss's COMPARISON SPACE made
+# selectable via --scr_space {hspace,epsilon}. Nothing else differs from the parent file.
+#   --scr_space hspace  (DEFAULT): the parent's behavior, bit-for-bit. The SCR loss is the MSE of the
+#       FROZEN scoring UNet's mid_block (h-space) activations, h_ft vs h_ori -- [chunk,1280,8,8].
+#   --scr_space epsilon (NEW): the SCR loss is the MSE of the FROZEN scoring UNet's EPS PREDICTIONS,
+#       eps_ft vs eps_ori (i.e. scoring_unet(...).sample) -- [chunk,4,64,64]. No forward hook is
+#       registered in this mode; the UNet's own output is used directly.
+# BOTH modes are ORIGINAL-vs-FINETUNED PRESERVATION losses and are identical in every other respect:
+# z0_ori and z0_ft are re-noised to the same zt with a SHARED eps draw, over the same
+# --scr_t_min/max/--scr_num_timesteps grid, under the same frozen generation-prompt conditioning
+# (scr_gen_embeds), with the same flip gradient-gate hooked on zt_ft (min-max gender attn >=
+# --attn_gate_thr scaled by --factor2 on flip/uncertain samples), and the original branch (h_ori /
+# eps_ori) is a detached target computed under torch.no_grad. Only the compared tensor changes.
+# NOTE (SCALE): the eps-space MSE and the h-space MSE have very different magnitudes, so
+# --weight_loss_scr must be RE-TUNED for --scr_space epsilon; reusing the h-space value (default 8)
+# will mis-weight the SCR term against loss_fair / loss_SRR. The output folder name carries the mode
+# as an extra tag: _scrSpc-<hspace|epsilon>.
 # =====================================================================================
 # NODETECTOR = SRR_person_truncated_hspace with the insightface FACE DETECTOR REPLACED -- in the
 # TRAINING branch points ONLY -- by a diffusion residual-error face/no-face classifier:
@@ -563,7 +550,7 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--resume_from_checkpoint",
         type=str,
-        default="./outputs/gender-debias-text-encoder-again/BS-24_TE_tau-0.0001_resT-15-400-800_scrT-15-400-800_wSCR-4-0.2-0.2_wSRR-4_srr-person_errFD-8-50-950_gAttn-none_Th-0.2_loraR-50_lr-5e-05_07132336/ckpts/checkpoint_tmp-1720",
+        default="",
         help="provide the checkpoint path to resume from checkpoint. NOTE: kept None for the SRR_person "
              "experiment so it starts fresh from pretrained SD -- resuming from a face-prompt SRR checkpoint "
              "would carry over weights trained on the old 'a photo of a realistic face' prompt and "
@@ -658,9 +645,10 @@ def parse_args(input_args=None):
         '--weight_loss_scr',
         default=8,
         help="weight for the SCR image loss (scoring-space per-timestep MSE of the FROZEN scoring UNet's "
-             "mid_block / h-space outputs of the original vs finetuned latents). Replaces the old CLIP+DINO "
-             "image-semantics loss (--weight_loss_img); configs that still set weight_loss_img are aliased to "
-             "this key (see parse_args).",
+             "outputs on the original vs finetuned latents; --scr_space selects mid_block/h-space or eps). "
+             "Replaces the old CLIP+DINO image-semantics loss (--weight_loss_img); configs that still set "
+             "weight_loss_img are aliased to this key (see parse_args). The default 8 was tuned for "
+             "--scr_space hspace -- RE-TUNE it for --scr_space epsilon (different loss scale).",
         type=float,
     )
     parser.add_argument(
@@ -678,28 +666,6 @@ def parse_args(input_args=None):
         help="text prompt whose frozen-SD diffusion residual error is used directly as the SRR realism "
              "loss. Scored by the fused residual scorer, sharing eps/zt with the woman/man gender scorer "
              "over the same --residual_t_min/max and --residual_num_timesteps (no separate timestep args).",
-    )
-    parser.add_argument(
-        '--gender_attn_weight',
-        default="none",
-        type=str,
-        choices=["attn", "none"],
-        help="spatial reduction of the woman/man class error E_c (the per-pixel squared eps-residual of "
-             "the frozen scoring UNet under the woman/man text condition). 'attn' (default, identical to "
-             "the original NODETECTOR file): weight the residual by the sum-to-1 common woman/man "
-             "cross-attention map and spatially SUM, i.e. re-weight pixels toward the gender/person region. "
-             "'none': use the FULL error, a UNIFORM spatial mean over all H*W pixels -- i.e. the same "
-             "weighted sum with a FLAT 1/(H*W) map, which also sums to 1, so E_c keeps the same scale and "
-             "--tau needs no a-priori re-tuning. MEASURED (8 real gen. images, K=15, t400-800): the gender "
-             "attn map is DIFFUSE, not a face mask (1.7e-4..4.7e-4 vs the 2.44e-4 uniform value, ~2.8x "
-             "max/min, participation ratio ~3900/4096 px), so 'attn' is a MILD re-weighting, not a hard "
-             "localization: E_woman none/attn = 1.04, |E_man - E_woman| none/attn = 0.83, argmax preds "
-             "agree 8/8. Expect the two modes to differ mostly in the class-error GAP (hence the fair-loss "
-             "gradient scale), not in the predicted labels. Applies to BOTH the SCR fair loss "
-             "(residual_gender_and_realism) and the training-time gender predictor (residual_gender_logits "
-             "-> get_face_gender). The attention map is still computed in BOTH modes: it keeps driving the "
-             "SRR realism gradient region and the h-space SCR flip gate (--attn_gate_thr/--factor2) and the "
-             "attmap visualizations, which are unaffected by this flag.",
     )
     parser.add_argument(
         '--attn_gate_thr',
@@ -813,11 +779,28 @@ def parse_args(input_args=None):
         help="maximum timestep (inclusive) for the residual-error gender scorer",
     )
     parser.add_argument(
+        '--scr_space',
+        default="epsilon",
+        type=str,
+        choices=["hspace", "epsilon"],
+        help="which FROZEN scoring-UNet output the SCR image loss compares between the ORIGINAL (z0_ori) "
+             "and FINETUNED (z0_ft) latents, after re-noising both to the same zt with a shared eps. "
+             "'hspace' (default, = the original _hspace_nodetector behavior): MSE of the mid_block "
+             "activations, h_ft vs h_ori -- a [n,1280,8,8] bottleneck-semantics target. "
+             "'epsilon': MSE of the eps predictions, eps_ft vs eps_ori (scoring_unet(...).sample) -- a "
+             "[n,4,64,64] full-resolution target in noise space. Both are ORIGINAL-vs-FINETUNED "
+             "preservation losses over the SAME --scr_t_min/max/--scr_num_timesteps grid, under the same "
+             "frozen generation-prompt conditioning, with the same flip gradient-gate on zt_ft; only the "
+             "compared tensor differs. NOTE: the two live on very different scales (eps MSE is O(1e-2..1) "
+             "vs h-space O(1e0..1e2) depending on t), so --weight_loss_scr almost certainly needs "
+             "RE-TUNING when switching to 'epsilon' -- do not reuse the h-space weight as-is.",
+    )
+    parser.add_argument(
         '--scr_num_timesteps',
         default=15,
         type=int,
-        help="number of timesteps used by the h-space SCR image loss (independent of the gender/realism "
-             "scorer's --residual_num_timesteps)",
+        help="number of timesteps used by the SCR image loss (independent of the gender/realism "
+             "scorer's --residual_num_timesteps). Applies to both --scr_space modes.",
     )
     parser.add_argument(
         '--scr_t_min',
@@ -1018,10 +1001,32 @@ def parse_args(input_args=None):
         # backward-compat: the old CLIP+DINO image-loss weight key maps onto the SCR loss weight,
         # so existing configs (e.g. debias-text-encoder.yaml with weight_loss_img) run unchanged.
         _key_aliases = {"weight_loss_img": "weight_loss_scr"}
+        # Cast each config value with the type argparse DECLARED for the option, falling back to
+        # type(current_value) only for options that declare no type= (e.g. store_true flags), which
+        # preserves the previous behavior for those.
+        # WHY: argparse does not apply type= to non-string defaults, so an option declared
+        # `type=float, default=8` still holds a python INT here -- and the old
+        # `type(args_dict[key])(value)` would then evaluate int(0.5) == 0, SILENTLY ZEROING a
+        # fractional weight coming from a config. That hits --weight_loss_scr and --weight_loss_face
+        # (the only two float options with int-literal defaults). It never bit the existing configs
+        # because they all pass integers, but --scr_space epsilon needs a RE-TUNED (very likely
+        # fractional) weight_loss_scr, where `weight_loss_scr: 0.5` would have silently become 0 and
+        # disabled the SCR loss outright. Declared types cast exactly.
+        _declared_types = {a.dest: a.type for a in parser._actions if a.type is not None}
         for key, value in config_data.items():
             key = _key_aliases.get(key, key)
-            args_dict[key] = type(args_dict[key])(value)
+            caster = _declared_types.get(key) or type(args_dict[key])
+            args_dict[key] = caster(value)
         args = argparse.Namespace(**args_dict)
+
+    # The yaml loader above bypasses argparse's choices= validation (it just casts to the default's
+    # type), so an unrecognized --scr_space from a config would silently fall through to the epsilon
+    # branch (scr_use_hspace = (scr_space == "hspace") is False for ANY other string). Re-validate here
+    # so a typo fails loudly instead of quietly training the wrong loss.
+    if args.scr_space not in ("hspace", "epsilon"):
+        raise ValueError(
+            f"--scr_space must be one of ['hspace', 'epsilon'], got {args.scr_space!r}"
+        )
 
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
     if env_local_rank != -1 and env_local_rank != args.local_rank:
@@ -1097,15 +1102,14 @@ def main(args):
         f"_tau-{args.tau:g}"
         f"_resT-{args.residual_num_timesteps}-{args.residual_t_min}-{args.residual_t_max}"
         f"_scrT-{args.scr_num_timesteps}-{args.scr_t_min}-{args.scr_t_max}"
-        f"_wSCR-{args.weight_loss_scr}-{args.factor1}-{args.factor2}"
-        f"_wSRR-{args.weight_loss_face}"
+        f"_scrSpc-{args.scr_space}"
+        # :g on the two weights so the config-cast fix (which makes them true floats rather than the
+        # ints argparse left them as) does not rename folders: 8 and 8.0 both render as "8", while a
+        # retuned fractional weight still renders exactly (0.5 -> "0.5").
+        f"_wSCR-{args.weight_loss_scr:g}-{args.factor1}-{args.factor2}"
+        f"_wSRR-{args.weight_loss_face:g}"
         f"_srr-{_srr_tag}"
         f"_errFD-{args.face_residual_num_timesteps}-{args.face_residual_t_min}-{args.face_residual_t_max}"
-        # gender class-error spatial reduction, ALWAYS tagged (both modes) so a run's folder says outright
-        # whether the attmap weighting was on: _gAttn-attn = attention-weighted, _gAttn-none = full error.
-        # Deliberately not a "tag only when non-default" suffix like _skipFrac: an absent tag would be
-        # ambiguous with the original _nodetector.py runs, which have no _gAttn at all.
-        f"_gAttn-{args.gender_attn_weight}"
         f"{('_skipFrac-'+format(args.skip_denoise_frac, 'g')) if args.skip_denoise_frac>0 else ''}"
         f"_Th-{args.uncertainty_threshold}"
         f"_loraR-{args.rank}_lr-{args.learning_rate}"
@@ -2063,23 +2067,6 @@ def main(args):
         
         return face_indicators_app, face_bboxs_app, face_chips_app, face_landmarks_app, aligned_face_chips_app
                 
-    def reduce_gender_residual(residual_map, common_attn):
-        """Spatially reduce a per-pixel woman/man squared residual [n,K,H,W] to a per-image error [n].
-
-        Controlled by --gender_attn_weight:
-          'attn' (default): weighted SUM with the sum-to-1 common woman/man cross-attention map,
-              E_c = sum_{u,v} common_attn(u,v) * res_c(u,v)  -- the error only counts the gender/person
-              region. This is the original NODETECTOR behaviour.
-          'none': UNIFORM spatial MEAN over all H*W pixels, E_c = mean_{u,v} res_c(u,v) -- the FULL error,
-              every pixel counts equally. Identical to the 'attn' formula with a FLAT weight map 1/(H*W),
-              which ALSO sums to 1, so E_c keeps the same normalization/scale as 'attn' (--tau comparable).
-        The timestep axis K is always reduced by a uniform mean, in both modes. common_attn is detached in
-        both callers, so this only changes WHERE the gradient d E_c / d z0 is weighted, never the graph.
-        """
-        if args.gender_attn_weight == "none":
-            return residual_map.mean(dim=(2, 3)).mean(dim=1)                                    # [n]
-        return (common_attn.unsqueeze(1) * residual_map).sum(dim=(2, 3)).mean(dim=1)            # [n]
-
     def residual_gender_logits(z0):
         """Prompt-conditioned diffusion residual-error gender scorer with cross-attention spatial weighting.
 
@@ -2163,10 +2150,9 @@ def main(args):
         common_attn = common_attn / (common_attn.sum(dim=(1, 2), keepdim=True) + 1e-8)
         common_attn = common_attn.detach()                                             # weighting mask only
 
-        # spatial reduction per --gender_attn_weight: 'attn' = attention-weighted SUM (original),
-        # 'none' = uniform mean over all pixels (the FULL error). Then uniform mean over timesteps.
-        E_woman = reduce_gender_residual(residual_maps["woman"], common_attn)           # [n]
-        E_man = reduce_gender_residual(residual_maps["man"], common_attn)               # [n]
+        # attention-weighted spatial SUM per timestep, then uniform mean over timesteps
+        E_woman = (common_attn.unsqueeze(1) * residual_maps["woman"]).sum(dim=(2, 3)).mean(dim=1)   # [n]
+        E_man = (common_attn.unsqueeze(1) * residual_maps["man"]).sum(dim=(2, 3)).mean(dim=1)       # [n]
 
         logits_gender = torch.stack([-E_woman / args.tau, -E_man / args.tau], dim=1)    # [n, 2]
         return logits_gender
@@ -2305,12 +2291,8 @@ def main(args):
         common_attn = attn_accum / max(attn_count, 1)                                   # [n,H,W]
         common_attn = common_attn / (common_attn.sum(dim=(1, 2), keepdim=True) + 1e-8)
         common_attn = common_attn.detach()
-        # spatial reduction per --gender_attn_weight: 'attn' = attention-weighted SUM (original),
-        # 'none' = uniform mean over all pixels (the FULL error). common_attn is still computed above
-        # regardless, because the SRR region mask below (and the h-space SCR flip gate, via the returned
-        # map) use it in BOTH modes -- only the CLASS-ERROR weighting is switched off by 'none'.
-        E_woman = reduce_gender_residual(residual_maps["woman"], common_attn)           # [n]
-        E_man = reduce_gender_residual(residual_maps["man"], common_attn)               # [n]
+        E_woman = (common_attn.unsqueeze(1) * residual_maps["woman"]).sum(dim=(2, 3)).mean(dim=1)   # [n]
+        E_man = (common_attn.unsqueeze(1) * residual_maps["man"]).sum(dim=(2, 3)).mean(dim=1)       # [n]
         logits_gender = torch.stack([-E_woman / args.tau, -E_man / args.tau], dim=1)    # [n, 2]
 
         # -------- SRR realism: VALUE over the WHOLE image, GRADIENT only in the person/gender region --------
@@ -3218,10 +3200,17 @@ def main(args):
                     )
                     log_imgs_i["grad_gate"] = [grad_gate_save_to]
 
+                # --scr_space picks WHICH frozen scoring-UNet output is compared; everything else (the shared
+                # eps/zt, the scr_timesteps grid, the frozen conditioning, the zt_ft gradient gate, the
+                # detached z0_ori target) is identical between the two modes.
+                #   hspace  : f = mid_block activations  [chunk,1280,8,8]  (captured via a forward hook)
+                #   epsilon : f = eps prediction .sample [chunk,4,64,64]   (the UNet's own output; no hook)
+                scr_use_hspace = (args.scr_space == "hspace")
                 scr_mid_store = []
-                def _scr_mid_hook(_m, _in, _out):
-                    scr_mid_store.append(_out)
-                _scr_h = scoring_unet.mid_block.register_forward_hook(_scr_mid_hook)
+                if scr_use_hspace:
+                    def _scr_mid_hook(_m, _in, _out):
+                        scr_mid_store.append(_out)
+                    _scr_h = scoring_unet.mid_block.register_forward_hook(_scr_mid_hook)
                 scr_per_t = []
                 for _t in scr_timesteps:
                     _tb = _t.repeat(len(idxs_ij))
@@ -3229,15 +3218,21 @@ def main(args):
                     zt_ft = noise_scheduler.add_noise(z0_ij, _eps, _tb)                             # grad -> z0_ij
                     zt_ft.register_hook(lambda g, mm=scr_grad_mask: g * mm)                         # SCR-only spatial gate
                     zt_ori = noise_scheduler.add_noise(z0_ori_ij, _eps, _tb)                        # detached target input
-                    scr_mid_store.clear()
-                    _ = scoring_unet(zt_ft.to(weight_dtype), _tb, encoder_hidden_states=scr_gen_embeds_ij).sample
-                    h_ft = scr_mid_store[-1]
-                    scr_mid_store.clear()
-                    with torch.no_grad():
-                        _ = scoring_unet(zt_ori.to(weight_dtype), _tb, encoder_hidden_states=scr_gen_embeds_ij).sample
-                        h_ori = scr_mid_store[-1].detach()
-                    scr_per_t.append(((h_ft.to(weight_dtype_high_precision) - h_ori.to(weight_dtype_high_precision)) ** 2).mean(dim=[1, 2, 3]))
-                _scr_h.remove()
+                    if scr_use_hspace:
+                        scr_mid_store.clear()
+                        _ = scoring_unet(zt_ft.to(weight_dtype), _tb, encoder_hidden_states=scr_gen_embeds_ij).sample
+                        f_ft = scr_mid_store[-1]
+                        scr_mid_store.clear()
+                        with torch.no_grad():
+                            _ = scoring_unet(zt_ori.to(weight_dtype), _tb, encoder_hidden_states=scr_gen_embeds_ij).sample
+                            f_ori = scr_mid_store[-1].detach()
+                    else:
+                        f_ft = scoring_unet(zt_ft.to(weight_dtype), _tb, encoder_hidden_states=scr_gen_embeds_ij).sample
+                        with torch.no_grad():
+                            f_ori = scoring_unet(zt_ori.to(weight_dtype), _tb, encoder_hidden_states=scr_gen_embeds_ij).sample.detach()
+                    scr_per_t.append(((f_ft.to(weight_dtype_high_precision) - f_ori.to(weight_dtype_high_precision)) ** 2).mean(dim=[1, 2, 3]))
+                if scr_use_hspace:
+                    _scr_h.remove()
                 loss_SCR_ij = torch.stack(scr_per_t, dim=0).mean(dim=0).to(weight_dtype)
                 
                 loss_fair_ij = torch.ones(len(idxs_ij), dtype=weight_dtype, device=accelerator.device) *(-1)

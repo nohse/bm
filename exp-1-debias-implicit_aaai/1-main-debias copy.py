@@ -14,8 +14,134 @@
 # See the License for the specific language governing permissions and
 
 # =====================================================================================
-# ATTMAP = NODETECTOR + a switch on the SPATIAL REDUCTION of the woman/man class error:
-#     --gender_attn_weight {attn, none}     (default: attn == the original NODETECTOR file)
+# MULTIPROMPT_VALENCE_AXISATTN = the MULTIPROMPT_VALENCE file with PER-AXIS cross-attention weighting added
+# back (--valence_axis_attn peraxis, default). Each axis's error is scored in its own content region (see
+# CROSS-ATTENTION MAP below); --valence_axis_attn uniform reproduces the no-attmap valence file bit-for-bit.
+# The CLASS is no longer gender
+# (ONE prompt pair: "a photo of a woman" vs "a photo of a man"); it is POSITIVE vs NEGATIVE valence,
+# defined JOINTLY by P=4 CONTRASTIVE PROMPT PAIRS (--valence_axes), each a minimal contrast in which
+# only the polarity word differs:
+#   expr  : "A photo of positive facial expressions"              vs "... negative facial expressions"
+#   cloth : "A photo of positive clothing and actions"            vs "... negative clothing and actions"
+#   bg    : "A photo of a background with a positive atmosphere"  vs "... a negative atmosphere"
+#   tone  : "A photo of a scene with an overall positive tone"    vs "... an overall negative tone"
+# The objective is unchanged in spirit: drive the generated distribution to 50/50 positive/negative.
+#
+# ------------------------------------------------------------------------------------------------
+# HOW THE 4 PAIRS ARE POOLED   (--valence_pooling, default gap_mean)
+# ------------------------------------------------------------------------------------------------
+# Per axis p the frozen scoring UNet gives two errors E_p^pos, E_p^neg (eps-MSE under each prompt).
+# The per-axis signed GAP is   g_p = E_p^neg - E_p^pos     (g_p > 0  <=>  the image reads POSITIVE).
+#
+# THE KEY MATH RESULT (verified in float64: max abs diff 4.6e-14):
+#       mean-of-ERRORS  ==  mean-of-LOGITS  ==  mean-of-LOG-PROBS
+# These are NOT three options -- they are ONE estimator. logit_c = -E_c/tau is AFFINE in E with a
+# shared tau, so averaging over p commutes with it; and mean_p log_softmax(l_p) differs from
+# mean_p l_p only by a CLASS-INDEPENDENT term (the per-axis log-partition), which softmax/CE are
+# invariant to. All three give the same posterior AND the same gradient:
+#       p(pos) = sigmoid( (1/P) * sum_p g_p / tau )
+# Two consequences:
+#   (+) each axis's BASELINE difficulty (prompt length, rarity, absolute error level) CANCELS EXACTLY,
+#       because g_p is a WITHIN-pair difference. This is why minimal-contrast pairs matter.
+#   (-) each axis's GAP SCALE does NOT cancel. An unweighted mean of raw gaps is dominated by whichever
+#       axis has the largest dynamic range (in simulation one axis took 66% of the decision budget), so
+#       a "4-axis" scorer silently collapses into a 1-axis scorer.  ->  --valence_axis_scale
+#       But 1/std ALONE is a noise amplifier: it equalises VARIANCE, not DISCRIMINABILITY, so a DEAD
+#       axis (pure Monte-Carlo noise) gets inflated to unit variance and injected at weight 1/P.
+#       ->  --valence_axis_weight, set proportional to each axis's OFFLINE-MEASURED discriminability,
+#           with any axis below the AUC floor set to 0.
+#
+# mean-of-PROBABILITIES is the ONE genuinely different pooling, and it is the one that BREAKS. It is
+# reachable as --valence_pooling prob_mean for the ablation, but it is not the default because:
+#   (a) it is a MIXTURE of experts, so one confident axis cannot be outvoted by the rest, and a
+#       saturated axis contributes ~zero gradient (dp/dg ∝ p(1-p) -> 0);
+#   (b) under a small tau each per-axis sigmoid becomes a hard 0/1 VOTE, so the mean lands on the
+#       discrete grid {0, .25, .5, .75, 1} -- and generate_dynamic_targets ranks that with argsort, so
+#       the massively-tied images get their 50/50 targets assigned by ARRIVAL ORDER rather than by
+#       valence. Worse, argsort still emits a PERFECT 50/50 count, so the failure is invisible in wandb.
+#
+# RANKING (step 2): targets are ranked on the CONTINUOUS pooled score, never on softmax probs. The two
+# are mathematically equivalent (probs[:,1] = sigmoid(score/tau) is strictly increasing), but fp32
+# sigmoid returns EXACTLY 1.0 once score/tau > ~16.6, manufacturing ties out of thin air. The score
+# cannot saturate. This also retires the -1 fill-value hack from the ranking population.
+#
+# NOISE (--valence_axis_eps, default independent): eps is shared WITHIN a pair (the paired difference
+# is what makes g_p low-variance) but drawn INDEPENDENTLY ACROSS axes. Sharing one eps across all 8
+# prompts -- the obvious port of the old 2-prompt code -- would correlate the P gap estimates through a
+# single noise draw, so averaging them would reduce no Monte-Carlo noise at all and the entire point of
+# pooling would be lost.
+#
+# ------------------------------------------------------------------------------------------------
+# WHAT HAPPENS TO THE FACE MACHINERY (the concept is now SCENE-LEVEL, not face-bound)
+# ------------------------------------------------------------------------------------------------
+# FACE DETECTOR (--valence_face_gate, DEFAULT errfd): KEPT. This file changes ONLY the spatial SCR gate
+#   (mechanism 4, --factor2); the FACE-based gates are deliberately left intact. So by default:
+#     (1) a sample joins the fair/DAL loss only if the residual-error detector says it has a face, and
+#     (2) a no-face sample keeps SCR weight 1 (bypasses the flip/uncertain damping).
+#   Rationale for keeping them here: the class axes include face-bound content (expr = "facial expressions"),
+#   so a faceless generation's valence is partly ill-defined; the design decision was to touch only the
+#   whole-frame spatial gate, not the participation gate. SAFETY: get_valence scatters non-face rows to
+#   fill_value so gathered SHAPES stay uniform (no NCCL shape-split), and pins fp32/int64 dtypes in BOTH the
+#   empty and non-empty branches (no dtype-split deadlock -- the bug that bit this project twice). The
+#   OPPOSITE ablation --valence_face_gate none makes every image participate (a faceless grim alleyway HAS a
+#   valence), which aligns training with the whole-image CLIP eval head and drops the detector dependency, at
+#   the cost of face-axis noise on faceless images (multi-axis pooling mitigates it). Measure the faceless
+#   fraction and compare both on eval before committing.
+# CROSS-ATTENTION MAP (AXISATTN, --valence_axis_attn peraxis, DEFAULT): REINSTATED, but PER AXIS, not as a
+#   single common map. Each axis p weights its per-pixel error by the sum-to-1, DETACHED cross-attention of
+#   that axis's own CONTENT phrases (--valence_axes 4th field): expr -> "facial expressions" (face);
+#   cloth -> "clothing,actions" (body); bg -> "background,atmosphere" (scene); tone -> (empty) => uniform.
+#   Each aspect is thus scored WHERE IT LIVES. This is DIFFERENT from the gender file's single COMMON map,
+#   and that difference answers the four objections that (correctly) killed a common map for valence:
+#   1. NON-CONTIGUOUS content ("clothing ... actions"): handled by UNIONING the token run of each phrase
+#      (_find_content_token_indices), so the function word "and" is never averaged in.
+#   2. INCOMMENSURABLE prompt lengths: each axis's map is normalised to sum-to-1 on ITS OWN, so a longer
+#      prompt's larger raw columns cannot dominate -- the weighted error keeps a uniform-mean scale.
+#   3. AXES LOCALISE ELSEWHERE (the fatal one for a common map): here the maps are NEVER averaged across
+#      axes. Pooling happens only AFTER each axis's spatial reduction, so nothing smears toward uniform.
+#   4. AXIS WITH NO NOUN (tone): given an empty content field, so it stays a uniform whole-image mean --
+#      exactly right for a global axis.
+#   THE MAP IS SHARED BY THE PAIR (averaged over the pos & neg forwards, detached) so the gap g_p = E_neg -
+#   E_pos stays a clean paired difference -- the analogue of the woman/man common map, kept per axis.
+#   COST: 'peraxis' installs CrossAttnCaptureProcessor, which forces the explicit get_attention_scores + bmm
+#   path on the scoring UNet (no SDPA). --valence_axis_attn uniform reproduces the no-attmap file bit-for-bit
+#   (processor NOT installed, SDPA kept). EMPIRICAL RISK: whether SD attention localises abstract nouns
+#   ("atmosphere","actions") is unproven -- validate per-axis localisation offline (see BEFORE YOU TRAIN); a
+#   diffuse map degrades gracefully to ~uniform, but a map that localises to the WRONG place can hurt.
+# SRR REALISM LOSS: --srr_prompt default becomes "a realistic photo" (was "a photo of a realistic
+#   person"), and its gradient is no longer input-masked to the person region -- it now covers the WHOLE
+#   image. The realism anchor must constrain the same support the fair loss pushes on; the fair loss now
+#   edits expression AND clothing AND background AND global tone, so a person-region-only anchor would
+#   leave the model free to wreck the background in order to win the valence objective.
+# SCR FLIP GATE: the SPATIAL gate is OFF by default (--factor2 1.0, was 0.2). Its meaning was "damp the
+#   preservation loss WHERE the class lives, so that region is free to change" -- but for a scene-level
+#   class that is the whole frame, so the mask is vacuous. NOTE the ATTMAP file damped the SAME release
+#   set TWICE (factor1 globally AND factor2 inside the region = 0.2 x 0.2 = 0.04 of the kept gradient);
+#   factor1 alone is kept as the single, explicit release damping.
+# EVALUATION: the CelebA MobileNet gender classifier consumes 224x224 FACE CROPS and cannot be repointed
+#   at a scene-level concept even in principle. It (and insightface) are replaced by a ZERO-SHOT CLIP
+#   VALENCE HEAD on the open_clip ViT-bigG-14 this file ALREADY loads on rank 0 for CLIP-I/CLIP-T. It
+#   scores the FULL image, never a face chip, and is INDEPENDENT of the training signal (CLIP is not in
+#   this file's training loss). The per-class text prompts are prompt-ensembled in EMBEDDING space (the
+#   canonical CLIP zero-shot recipe -- and exactly "average within a class", done where it is correct).
+#
+# ------------------------------------------------------------------------------------------------
+# BEFORE YOU TRAIN: run valence_exp/valence_separation.py.
+# This project has TWICE shipped a plausible-looking prompt-based residual scorer that carried NO signal
+# (a fair loss pinned at ln 2; a "realistic face" gate with face/no-face AUC 0.504). "positive"/"negative"
+# are ABSTRACT ADJECTIVES and SD's CLIP text encoder may barely move on them. The harness measures
+# per-axis ROC-AUC, the per-axis gap scale (who dominates), the axis correlation matrix and the pooled
+# AUC, on latents produced the SAME truncated way training scores them, and prints the
+# --valence_axis_scale / --valence_axis_weight constants to paste in.
+# AXISATTN adds a SECOND thing to validate: does each axis's content attention actually LOCALISE to its
+# region (face / body / scene)? Measure the AUC with vs without the per-axis map and eyeball the maps; if a
+# map is diffuse the weighting is a harmless ~no-op, but if it localises to the WRONG place set that axis's
+# content field empty (-> uniform). Do NOT assume "atmosphere"/"actions" localise just because they parse.
+# GATE: per-axis AUC >= 0.60 and pooled AUC >= 0.75. Do not spend a GPU-hour on training before it passes.
+# Run-folder tag: _val-<P>ax-<pooling>[-uncal]_vAttn-<peraxis|uniform>  (uncal = calibration left at default).
+# =====================================================================================
+# Inherited from ATTMAP: a switch on the SPATIAL REDUCTION of the class error:
+#     --gender_attn_weight {attn, none}   (kept only for the gender ablation; IGNORED for valence)
 # The woman/man gender error E_c is the per-pixel squared eps-residual of the frozen scoring UNet
 # under the "woman"/"man" text condition. The original file always reduces it with the COMMON
 # woman/man cross-attention map (sum-to-1 normalized) as a spatial weight, i.e. E_c = sum_{u,v}
@@ -104,6 +230,7 @@ import shutil
 import json
 import pytz
 import random
+import hashlib
 from datetime import datetime
 from tqdm.auto import tqdm
 import copy
@@ -229,53 +356,48 @@ def image_grid(imgs, rows, cols):
         grid.paste(img, box=(i%cols*w, i//cols*h))
     return grid
 
-def plot_in_grid(images, save_to, face_indicators=None, face_bboxs=None, preds_gender=None, pred_class_probs_gender=None):
+def plot_in_grid(images, save_to, preds_class=None, pred_class_probs=None):
+    """Grid of generated images, sorted and colour-coded by the predicted VALENCE class.
+
+    images: torch tensor [N,3,H,W], in range [-1,1]
+    preds_class: [N] int64, class order [negative=0, positive=1]; -1 == not scored (only possible under
+        --valence_face_gate errfd, where unscored images exist at all).
+    pred_class_probs: [N] the probability of the PREDICTED class (i.e. probs.max(-1).values), used both to
+        sort within a class and to draw the confidence bar.
+
+    The face bbox / face-indicator drawing is GONE: valence is a scene-level property, so there is no box to
+    draw, and images are no longer partitioned into face / no-face.
     """
-    images: torch tensor in shape of [N,3,H,W], in range [-1,1]
-    """
-    images_w_face = images[face_indicators]
-    images_wo_face = images[face_indicators.logical_not()]
+    idxs_pos = (preds_class == 1).nonzero(as_tuple=False).view([-1])
+    idxs_pos = idxs_pos[pred_class_probs[idxs_pos].argsort(descending=True)]
 
-    # first reorder everything from most to least male, from most to least female, and finally images without faces
-    idxs_male = (preds_gender == 1).nonzero(as_tuple=False).view([-1])
-    probs_male = pred_class_probs_gender[idxs_male]
-    idxs_male = idxs_male[probs_male.argsort(descending=True)]
+    idxs_neg = (preds_class == 0).nonzero(as_tuple=False).view([-1])
+    idxs_neg = idxs_neg[pred_class_probs[idxs_neg].argsort(descending=True)]
 
-    idxs_female = (preds_gender == 0).nonzero(as_tuple=False).view([-1])
-    probs_female = pred_class_probs_gender[idxs_female]
-    idxs_female = idxs_female[probs_female.argsort(descending=True)]
-
-    idxs_no_face = (preds_gender == -1).nonzero(as_tuple=False).view([-1])
+    idxs_unscored = (preds_class == -1).nonzero(as_tuple=False).view([-1])
 
     images_to_plot = []
-    idxs_reordered = torch.torch.cat([idxs_male, idxs_female, idxs_no_face])
-    
+    # most-positive -> least-positive, then most-negative -> least-negative, then unscored
+    idxs_reordered = torch.cat([idxs_pos, idxs_neg, idxs_unscored])
+
     for idx in idxs_reordered:
         img = images[idx]
-        face_indicator = face_indicators[idx]
-        face_bbox = face_bboxs[idx]
-        pred_gender = preds_gender[idx]
-        pred_class_prob_gender = pred_class_probs_gender[idx]
-        
-        if pred_gender == 1:
-            pred = "Male"
-            border_color = "blue"
-        elif pred_gender == 0:
-            pred = "Female"
-            border_color = "red"
-        elif pred_gender == -1:
-            pred = "Undetected"
-            border_color = "white"
-        
-        img_pil = transforms.ToPILImage()(img*0.5+0.5)
-        img_pil_draw = ImageDraw.Draw(img_pil)  
-        img_pil_draw.rectangle(face_bbox.tolist(), fill =None, outline =border_color, width=4)
+        pred_class = preds_class[idx]
+        pred_class_prob = pred_class_probs[idx]
 
+        if pred_class == 1:
+            border_color = "green"      # positive
+        elif pred_class == 0:
+            border_color = "purple"     # negative
+        else:
+            border_color = "white"      # unscored
+
+        img_pil = transforms.ToPILImage()(img*0.5+0.5)
         img_pil = ImageOps.expand(img_pil, border=(50,0,0,0),fill=border_color)
 
         img_pil_draw = ImageDraw.Draw(img_pil)
-        if pred_class_prob_gender.item() < 1:
-            img_pil_draw.rectangle([(0,0),(50,(1-pred_class_prob_gender.item())*512)], fill ="white", outline =None)
+        if pred_class_prob.item() < 1:
+            img_pil_draw.rectangle([(0,0),(50,(1-pred_class_prob.item())*512)], fill ="white", outline =None)
 
         fnt = ImageFont.truetype(font="../data/0-utils/arial-bold.ttf", size=100)
         img_pil_draw.text((400, 400), f"{idx.item()}", align ="left", font=fnt)
@@ -563,7 +685,7 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--resume_from_checkpoint",
         type=str,
-        default="./outputs/gender-debias-text-encoder-again/BS-24_TE_tau-0.0001_resT-15-400-800_scrT-15-400-800_wSCR-4-0.2-0.2_wSRR-4_srr-person_errFD-8-50-950_gAttn-none_Th-0.2_loraR-50_lr-5e-05_07132336/ckpts/checkpoint_tmp-1720",
+        default="",
         help="provide the checkpoint path to resume from checkpoint. NOTE: kept None for the SRR_person "
              "experiment so it starts fresh from pretrained SD -- resuming from a face-prompt SRR checkpoint "
              "would carry over weights trained on the old 'a photo of a realistic face' prompt and "
@@ -608,12 +730,11 @@ def parse_args(input_args=None):
     parser.add_argument(
         '--save_attn_maps',
         action="store_true",
-        default=True,
-        help="ON by default. At every --train_plot_every_n_iter step, save two visualizations overlaid on the "
-             "generated images: (1) train-<step>_attmap.jpg = the woman/man/common cross-attention weighting "
-             "maps used by the residual gender scorer; (2) train-<step>_gradgate.jpg = the SCR flip gradient-gate, "
-             "i.e. the min-max normalized gender-attn hard-masked at --attn_gate_thr (0.15) and the region "
-             "actually scaled by --factor2 for flip/uncertain samples this step",
+        default=False,
+        help="UNUSED FOR VALENCE (kept so existing yaml configs still load). It saved the class cross-attention "
+             "maps and the SCR gradient-gate panels. Neither exists for a scene-level class; the per-axis GAP "
+             "metrics logged to wandb (gap_<axis>_mean / _std / _corr_pooled) are the replacement diagnostic, "
+             "and they are the ones that actually reveal a dead or dominating axis.",
         )
     parser.add_argument(
         '--save_noface_imgs',
@@ -673,43 +794,42 @@ def parse_args(input_args=None):
     )
     parser.add_argument(
         '--srr_prompt',
-        default="a photo of a realistic person",
+        default="a photo of a realistic photo",
         type=str,
         help="text prompt whose frozen-SD diffusion residual error is used directly as the SRR realism "
-             "loss. Scored by the fused residual scorer, sharing eps/zt with the woman/man gender scorer "
-             "over the same --residual_t_min/max and --residual_num_timesteps (no separate timestep args).",
+             "loss. Scored by the fused residual scorer over --residual_t_min/max and "
+             "--residual_num_timesteps (no separate timestep args). VALENCE: the default changed from "
+             "'a photo of a realistic person' to 'a realistic photo', and the loss's gradient is no "
+             "longer masked to the person region (see --srr_grad_region). The realism anchor has to "
+             "constrain the same support the fair loss pushes on, and the valence fair loss edits "
+             "expression AND clothing AND background AND global tone -- a person-region-only anchor "
+             "would leave the model free to wreck the background to win the valence objective.",
     )
+    # NOTE (removed on purpose): the gender file input-masked the SRR gradient to the person region and
+    # spatially damped the SCR gradient inside it. Both regions came from the class-prompt cross-attention
+    # map, which CANNOT BE BUILT for these axes (non-contiguous content words, incommensurable prompt
+    # lengths, and 4 axes whose supports average to ~uniform -- see the header). Rather than keep a
+    # half-dead --srr_grad_region/--valence_attn_capture pair that nothing can correctly satisfy, the
+    # region machinery is gone: the SRR gradient covers the whole image, and factor1 is the single release
+    # damping. --attn_gate_thr / --factor2 survive ONLY so existing yaml configs still load (see below).
     parser.add_argument(
         '--gender_attn_weight',
         default="none",
         type=str,
         choices=["attn", "none"],
-        help="spatial reduction of the woman/man class error E_c (the per-pixel squared eps-residual of "
-             "the frozen scoring UNet under the woman/man text condition). 'attn' (default, identical to "
-             "the original NODETECTOR file): weight the residual by the sum-to-1 common woman/man "
-             "cross-attention map and spatially SUM, i.e. re-weight pixels toward the gender/person region. "
-             "'none': use the FULL error, a UNIFORM spatial mean over all H*W pixels -- i.e. the same "
-             "weighted sum with a FLAT 1/(H*W) map, which also sums to 1, so E_c keeps the same scale and "
-             "--tau needs no a-priori re-tuning. MEASURED (8 real gen. images, K=15, t400-800): the gender "
-             "attn map is DIFFUSE, not a face mask (1.7e-4..4.7e-4 vs the 2.44e-4 uniform value, ~2.8x "
-             "max/min, participation ratio ~3900/4096 px), so 'attn' is a MILD re-weighting, not a hard "
-             "localization: E_woman none/attn = 1.04, |E_man - E_woman| none/attn = 0.83, argmax preds "
-             "agree 8/8. Expect the two modes to differ mostly in the class-error GAP (hence the fair-loss "
-             "gradient scale), not in the predicted labels. Applies to BOTH the SCR fair loss "
-             "(residual_gender_and_realism) and the training-time gender predictor (residual_gender_logits "
-             "-> get_face_gender). The attention map is still computed in BOTH modes: it keeps driving the "
-             "SRR realism gradient region and the h-space SCR flip gate (--attn_gate_thr/--factor2) and the "
-             "attmap visualizations, which are unaffected by this flag.",
+        help="UNUSED FOR VALENCE (kept so existing yaml configs still load). It selected the spatial reduction of "
+             "the woman/man class error. The valence class error always uses a UNIFORM spatial mean: there "
+             "is no coherent region to weight a scene-level class by, and the cross-attention map cannot "
+             "even be built for these axes (see the header). Note this flag ALREADY defaulted to \'none\' in "
+             "the gender file, so a uniform mean is also what that file was actually doing.",
     )
     parser.add_argument(
         '--attn_gate_thr',
         default=0.15,
-        help="min-max-normalized gender (woman/man) cross-attention threshold defining the person/subject "
-             "region (region = gate >= this). The SRR realism loss keeps its VALUE over the WHOLE image "
-             "(every pixel contributes to E_realistic), but its GRADIENT is restricted to this region by "
-             "input-masking z0 outside it (non-region z0 is detached), so d(E_realistic)/dz0 is exactly "
-             "zero outside the region while the value stays the true whole-image residual "
-             "(attmap reused from the woman/man scorer, min-max-normalized as in the hspace SCR gate).",
+        help="UNUSED FOR VALENCE (kept so existing yaml configs still load). It was the min-max cross-attention "
+             "threshold defining the person region that gated the SRR gradient and the SCR flip damping. "
+             "Both regions are gone: the SRR gradient now covers the whole image and the spatial SCR gate is "
+             "removed (see --factor2).",
         type=float,
     )
     parser.add_argument(
@@ -718,8 +838,211 @@ def parse_args(input_args=None):
         type=float, 
         default=0.2
         )
-    parser.add_argument('--factor1', help="train, val, test batch size", type=float, default=0.2)
-    parser.add_argument('--factor2', help="train, val, test batch size", type=float, default=0.2)
+    parser.add_argument(
+        '--factor1', type=float, default=0.2,
+        help="GLOBAL damping of the SCR image-preservation loss for RELEASED samples (flip or uncertain), "
+             "applied as a per-sample scalar by gen_dynamic_weights. This is the single, explicit release "
+             "damping for valence.",
+        )
+    parser.add_argument(
+        '--factor2', type=float, default=1.0,
+        help="IGNORED FOR VALENCE (accepted so the existing debias-*.yaml configs still load; a non-1.0 "
+             "value is warned about at startup). It used to be the SPATIAL damping of the SCR gradient "
+             "inside the class cross-attention region for released samples. That region does not exist for "
+             "a scene-level class -- 'where the class lives' is the whole frame, so the mask is vacuous. "
+             "Note the gender file also damped the SAME release set TWICE: factor1 globally AND factor2 "
+             "inside the region (0.2 x 0.2 = 0.04 of the kept gradient). factor1 is now the single, "
+             "explicit release damping.",
+        )
+
+    # ------------------------------------------------------------------ multi-prompt VALENCE class
+    parser.add_argument(
+        '--valence_axes',
+        type=str,
+        nargs='+',
+        default=[
+            "expr::A photo of positive facial expressions::A photo of negative facial expressions::facial expressions",
+            "cloth::A photo of positive clothing and actions::A photo of negative clothing and actions::clothing,actions",
+            "bg::A photo of a background with a positive atmosphere::A photo of a background with a negative atmosphere::background,atmosphere",
+            "tone::A photo of a scene with an overall positive tone::A photo of a scene with an overall negative tone::",
+        ],
+        help="the P contrastive prompt PAIRS that jointly define the binary class, each as "
+             "'name::POSITIVE prompt::NEGATIVE prompt[::CONTENT phrases]'. Use MINIMAL CONTRASTS (only the "
+             "polarity word differs): the per-axis gap g_p = E_neg - E_pos is a WITHIN-pair difference, so "
+             "each axis's baseline error level (prompt length, rarity) cancels EXACTLY -- but only if the "
+             "pair is otherwise identical. Class order is [negative=0, positive=1]. The optional 4th field is "
+             "a comma-separated list of CONTENT PHRASES (AXISATTN variant): under --valence_axis_attn peraxis "
+             "that axis's per-pixel error is spatially weighted by the sum-to-1 cross-attention of these "
+             "phrases (facial expressions -> face; clothing,actions -> body; background,atmosphere -> scene), "
+             "so each aspect is scored WHERE IT LIVES. Each phrase must appear verbatim in BOTH prompts. An "
+             "EMPTY 4th field (e.g. the 'tone' axis) => UNIFORM whole-image mean, correct for a global axis "
+             "with no localisable content noun.",
+    )
+    parser.add_argument(
+        '--valence_axis_attn',
+        type=str,
+        default="peraxis",
+        choices=["peraxis", "uniform"],
+        help="AXISATTN: spatial reduction of each axis's per-class error. 'peraxis' (default, the point of "
+             "this file): weight axis p's per-pixel squared eps-residual by the sum-to-1, DETACHED "
+             "cross-attention map of that axis's CONTENT phrases (4th field of --valence_axes), averaged over "
+             "the pos & neg forwards so the gap g_p = E_neg - E_pos stays a clean paired difference (both "
+             "classes weighted by the SAME mask). Axes with no content phrases fall back to uniform. Because "
+             "the map SUMS TO 1, the weighted error keeps the same scale as a uniform mean, so per-axis "
+             "commensurability (and --valence_axis_scale) is unaffected. 'uniform': whole-image mean for "
+             "every axis -- identical to the _multiprompt_valence.py (no-attmap) file, and it does NOT install "
+             "the capturing attention processor, so the scoring UNet keeps its fast SDPA path. NOTE this is a "
+             "DIFFERENT construction from the gender file's single COMMON map (which smeared 4 supports toward "
+             "uniform); here each axis keeps its OWN map and is pooled only AFTER the spatial reduction, so no "
+             "averaging-across-axes smearing occurs. RISK: whether SD cross-attention actually localises "
+             "abstract nouns ('atmosphere','actions') is EMPIRICAL -- validate with valence_exp before "
+             "trusting it; a diffuse map degrades gracefully to ~uniform, a WRONG map can hurt.",
+    )
+    parser.add_argument(
+        '--valence_pooling',
+        type=str,
+        default="gap_mean",
+        choices=["gap_mean", "prob_mean"],
+        help="how the P axes are combined. 'gap_mean' (default): pool BEFORE the softmax -- "
+             "score = sum_p w_p * (g_p - m_p)/s_p, one softmax at the end. This is simultaneously the "
+             "'average the errors', 'average the logits' and 'average the log-probs' options, which are "
+             "PROVABLY THE SAME ESTIMATOR (logit_c = -E_c/tau is affine in E with a shared tau, so the "
+             "mean commutes with it; the log-prob variant differs only by a class-independent term that "
+             "softmax/CE ignore). 'prob_mean': per-axis softmax, then AVERAGE THE PROBABILITIES -- the "
+             "one genuinely different pooling, and the one that breaks (it is a mixture, so one confident "
+             "axis cannot be outvoted and saturated axes contribute no gradient; and under a small tau "
+             "each axis becomes a hard 0/1 vote, so the mean collapses onto the grid {0,.25,.5,.75,1} and "
+             "the 50/50 target ranking degenerates into argsort tie-breaking by ARRIVAL ORDER). Provided "
+             "for the ablation only.",
+    )
+    parser.add_argument(
+        '--valence_tau',
+        type=float,
+        default=1.0,
+        help="temperature of the pooled valence logits: logit_pos - logit_neg = score / valence_tau. "
+             "SEPARATE from --tau (which stays 1e-4 for the gender scorer) because the pooled score is "
+             "STANDARDISED (O(1)) once --valence_axis_scale is calibrated, so a 1e-4 temperature would "
+             "saturate the softmax into a binary loss.",
+    )
+    parser.add_argument(
+        '--valence_axis_scale',
+        type=float,
+        nargs='+',
+        default=None,
+        help="per-axis gap scale s_p (one float per axis, same order as --valence_axes). Divides each "
+             "axis's gap so no axis dominates the pooled score. MEASURE IT OFFLINE with "
+             "valence_exp/valence_separation.py (it prints the constants) -- these are FROZEN constants, "
+             "never live batch statistics: an EMA of the current model's own batch would chase the model "
+             "and erase the very population shift that IS the bias signal. Default None = all 1.0 "
+             "(UNCALIBRATED -- the run is tagged _uncal, and the largest-scale axis will own the decision).",
+    )
+    parser.add_argument(
+        '--valence_axis_center',
+        type=float,
+        nargs='+',
+        default=None,
+        help="per-axis gap offset m_p subtracted before scaling (same order as --valence_axes). Frozen "
+             "offline constant, from valence_exp/valence_separation.py. Default None = all 0.0. Note this "
+             "only shifts the decision boundary; it does NOT change the ranking, so the 50/50 split is "
+             "unaffected by it -- it matters for the reported pred/prob metrics.",
+    )
+    parser.add_argument(
+        '--valence_axis_weight',
+        type=float,
+        nargs='+',
+        default=None,
+        help="per-axis pooling weight w_p (same order as --valence_axes); renormalised to sum to 1. Set it "
+             "PROPORTIONAL TO EACH AXIS'S MEASURED DISCRIMINABILITY (d' or AUC-0.5), and set a dead axis to "
+             "0. WHY NOT just 1/P over the scaled gaps: dividing by s_p equalises each axis's VARIANCE, not "
+             "its SIGNAL, so an axis that is pure Monte-Carlo noise gets inflated to unit variance and then "
+             "injected at full 1/P weight -- actively destroying the pooled signal. Default None = uniform "
+             "1/P (only safe once every axis has passed the offline AUC floor).",
+    )
+    parser.add_argument(
+        '--valence_axis_eps',
+        type=str,
+        default="independent",
+        choices=["independent", "shared"],
+        help="eps draw across axes. 'independent' (default): a fresh eps per (axis, timestep), SHARED by "
+             "that axis's positive/negative prompts. Sharing WITHIN a pair is what makes the gap a "
+             "low-variance paired difference and is mandatory. Sharing ACROSS axes ('shared', the naive "
+             "port of the old 2-prompt code) correlates the P gap estimates through a single noise draw, "
+             "so averaging them reduces NO Monte-Carlo noise and the entire point of pooling is lost.",
+    )
+    parser.add_argument(
+        '--valence_face_gate',
+        type=str,
+        default="errfd",
+        choices=["none", "errfd"],
+        help="whether the residual-error FACE detector gates the training loss (DAL participation + the SCR "
+             "no-face preservation bypass). 'errfd' (DEFAULT, chosen for this file): KEEP the gender file's "
+             "face gating -- (1) a sample only joins the fair/DAL loss if it has a face, and (2) a no-face "
+             "sample keeps SCR weight 1 (bypasses flip/uncertain damping). This is the deliberate choice to "
+             "change only the SPATIAL SCR gate (--factor2, mechanism 4) while leaving the face-based "
+             "participation gate intact: the class axes include face-bound content (expr), so scoring valence "
+             "on a faceless generation is partly ill-defined. Uses residual_face_indicators; get_valence "
+             "scatters non-face rows to fill_value so gathered shapes stay uniform (no NCCL shape-split), and "
+             "get_valence pins fp32/int64 dtypes in both branches (no dtype-split deadlock). 'none': the "
+             "OPPOSITE ablation -- every image participates (a faceless grim alleyway HAS a valence), which "
+             "aligns training with the whole-image CLIP eval head and drops the detector dependency, at the "
+             "cost of feeding face-axis noise on faceless images (mitigated by multi-axis pooling). Run both "
+             "and compare on eval; measure the faceless fraction first.",
+    )
+    parser.add_argument(
+        '--eval_err_valence',
+        type=str,
+        default="generated",
+        choices=["none", "generated", "both"],
+        help="EVAL-TIME readout of the TRAINING scorer (the diffusion residual-error valence head, "
+             "get_valence / _valence_axis_errors) on the validation generations, scored over ALL IMAGES -- "
+             "the errFD face gate is NOT applied here, unlike the training loop (see --valence_face_gate, "
+             "default errfd, which restricts the train_* valence metrics to face-detected rows). Keys are "
+             "logged under eval_<name>_errVal/*. 'generated' (DEFAULT): score the finetuned generations only. "
+             "'both': ALSO score the frozen/original generations -- these are constant in expectation across "
+             "training, so errVal/gap_ori is the MONTE-CARLO NOISE FLOOR that makes the finetuned number "
+             "interpretable (the scorer draws fresh eps every call, so it is stochastic even on fixed images). "
+             "'none': skip entirely. COST: the scorer runs 2*P forwards at batch n*K "
+             "(--residual_num_timesteps, default 15) per chunk, which roughly DOUBLES eval wall-clock for "
+             "'generated' and TRIPLES it for 'both'. "
+             "READ THE CAVEAT: this is the training objective re-evaluated, i.e. a number the optimiser is "
+             "directly pushing on. It is a DIAGNOSTIC (reward-hacking / per-axis health / calibration drift), "
+             "NEVER a debias result -- every bias claim must come from the independent CLIP head "
+             "(eval_<name>_valence_gap; see the get_valence_test docstring).",
+    )
+    parser.add_argument(
+        '--valence_allow_uncalibrated',
+        action="store_true",
+        default=False,
+        help="permit training without --valence_axis_scale / --valence_axis_weight. Without calibration "
+             "the pooled score is dominated by whichever axis has the largest raw gap, and a dead axis is "
+             "weighted like a good one -- the exact configuration that produced this project's previous "
+             "dead losses. Required to proceed uncalibrated; the run folder is tagged _uncal.",
+    )
+    parser.add_argument(
+        '--valence_eval_pos_prompts',
+        type=str,
+        nargs='+',
+        default=[
+            "a photo of a happy positive person in a cheerful bright scene",
+            "a positive, uplifting, cheerful photo",
+        ],
+        help="text prompts for the POSITIVE class of the zero-shot CLIP valence head used at EVALUATION. "
+             "They are prompt-ensembled in EMBEDDING space (mean of the unit text vectors, renormalised) -- "
+             "the canonical CLIP zero-shot recipe, and 'average within a class' done where it is correct. "
+             "Deliberately WORDED DIFFERENTLY from --valence_axes: the eval metric must be independent of "
+             "the training scorer, not a paraphrase of it.",
+    )
+    parser.add_argument(
+        '--valence_eval_neg_prompts',
+        type=str,
+        nargs='+',
+        default=[
+            "a photo of a sad negative person in a gloomy dark scene",
+            "a negative, depressing, gloomy photo",
+        ],
+        help="text prompts for the NEGATIVE class of the zero-shot CLIP valence head (see "
+             "--valence_eval_pos_prompts).",
+    )
 
     # batch size, properly set to max out GPU
     parser.add_argument(
@@ -792,7 +1115,10 @@ def parse_args(input_args=None):
         '--tau',
         default=1e-4,
         type=float,
-        help="temperature for the residual-error gender logits: logit_c = -E_c / tau",
+        help="UNUSED FOR VALENCE (kept so existing yaml configs still load). It was the temperature of the "
+             "woman/man residual-error gender logits. The valence scorer has its own --valence_tau, which is "
+             "O(1) rather than 1e-4 because the pooled score is STANDARDISED -- feeding a standardised score "
+             "through a 1e-4 temperature would saturate the softmax into a binary loss.",
     )
     parser.add_argument(
         '--residual_num_timesteps',
@@ -1091,21 +1417,96 @@ def main(args):
     # short SRR-prompt slug (last word of --srr_prompt) so person-vs-face SRR runs are distinguishable
     # by folder name, not just timestamp: "a photo of a realistic person" -> srr-person, ...face -> srr-face.
     _srr_tag = args.srr_prompt.strip().split()[-1] if args.srr_prompt.strip() else "none"
+
+    # ---------------------------------------------------------------- parse & validate the valence axes
+    # Each --valence_axes entry is  'name::POSITIVE prompt::NEGATIVE prompt[::CONTENT phrases]'.
+    # Class order [neg=0, pos=1]. The optional 4th field is a comma-separated list of CONTENT PHRASES whose
+    # cross-attention defines THIS axis's spatial region (AXISATTN variant). Each phrase must appear VERBATIM
+    # in BOTH the positive and the negative prompt (it is the shared, non-polarity part of the pair), and is
+    # located independently in each prompt's own token stream (the polarity word can tokenize to a different
+    # length, shifting the content tokens). An EMPTY / absent 4th field => this axis is scored with a UNIFORM
+    # whole-image mean (correct for a global axis like "overall tone", which has no localisable content noun).
+    valence_axes = []
+    for spec in args.valence_axes:
+        parts = [p.strip() for p in spec.split("::")]
+        if len(parts) not in (3, 4) or not all(parts[:3]):
+            raise ValueError(
+                "--valence_axes entry must be 'name::POSITIVE prompt::NEGATIVE prompt[::CONTENT phrases]', "
+                f"got {spec!r}"
+            )
+        content = []
+        if len(parts) == 4 and parts[3]:
+            content = [w.strip() for w in parts[3].split(",") if w.strip()]
+        valence_axes.append({"name": parts[0], "pos": parts[1], "neg": parts[2], "content": content})
+    P_axes = len(valence_axes)
+    if P_axes == 0:
+        raise ValueError("--valence_axes is empty; at least one contrastive pair is required")
+
+    def _axis_vec(values, default, what):
+        """Broadcast a per-axis CLI list to a [P] float32 tensor (frozen, never a batch statistic)."""
+        if values is None:
+            return torch.full([P_axes], float(default), dtype=torch.float)
+        if len(values) != P_axes:
+            raise ValueError(
+                f"--valence_axis_{what} has {len(values)} values but there are {P_axes} axes "
+                f"({[a['name'] for a in valence_axes]})"
+            )
+        return torch.tensor([float(v) for v in values], dtype=torch.float)
+
+    valence_center = _axis_vec(args.valence_axis_center, 0.0, "center")     # [P] m_p
+    valence_scale = _axis_vec(args.valence_axis_scale, 1.0, "scale")        # [P] s_p
+    valence_weight = _axis_vec(args.valence_axis_weight, 1.0, "weight")     # [P] w_p (pre-normalisation)
+    if (valence_scale <= 0).any():
+        raise ValueError(f"--valence_axis_scale must be strictly positive, got {valence_scale.tolist()}")
+    if valence_weight.sum() <= 0:
+        raise ValueError("--valence_axis_weight must have a positive sum (at least one live axis)")
+    valence_weight = valence_weight / valence_weight.sum()                  # sum-to-1
+
+    # UNCALIBRATED = the exact configuration that produced this project's previous DEAD losses: the
+    # largest-raw-gap axis owns the pooled decision, and a pure-noise axis is weighted like a good one.
+    _valence_uncal = (args.valence_axis_scale is None) or (args.valence_axis_weight is None)
+    if _valence_uncal and not args.valence_allow_uncalibrated:
+        raise ValueError(
+            "REFUSING TO TRAIN UNCALIBRATED.\n"
+            "  --valence_axis_scale and --valence_axis_weight are not set, so every axis gets scale 1.0 and\n"
+            "  weight 1/P. The per-axis gaps do NOT share a scale (their baselines cancel, their SCALES do\n"
+            "  not), so the axis with the largest dynamic range will own the pooled decision and you will\n"
+            "  ship a 1-axis debiaser believing you shipped a 4-axis one. A DEAD axis would be injected at\n"
+            "  full weight.\n"
+            "  FIX: run  python valence_exp/valence_separation.py  (it measures per-axis ROC-AUC and prints\n"
+            "  the --valence_axis_scale / --valence_axis_weight constants to paste in).\n"
+            "  To proceed anyway (the folder will be tagged _uncal): --valence_allow_uncalibrated"
+        )
+    if _valence_uncal:
+        logger.warning(
+            "VALENCE: running UNCALIBRATED (--valence_allow_uncalibrated). Pooled score is dominated by "
+            "whichever axis has the largest raw gap; a dead axis carries full weight. Run "
+            "valence_exp/valence_separation.py."
+        )
+
+    _val_tag = (
+        f"_val-{P_axes}ax-{args.valence_pooling}{'-uncal' if _valence_uncal else ''}"
+        # AXISATTN: always tag the spatial reduction so a run's folder says whether per-axis attention
+        # weighting was on. _vAttn-peraxis = content-token weighted, _vAttn-uniform = whole-image mean.
+        f"_vAttn-{args.valence_axis_attn}"
+    )
     folder_name = (
         f"BS-{args.train_images_per_prompt_GPU*accelerator.num_processes}"
         f"_{_model_tag}"
-        f"_tau-{args.tau:g}"
+        # VALENCE: the multi-prompt class is ALWAYS tagged (axis count + pooling + calibration state), so a
+        # run's own folder says what class it optimised and whether the axes were calibrated.
+        f"{_val_tag}"
+        f"_vTau-{args.valence_tau:g}"
+        f"_vEps-{args.valence_axis_eps}"
+        f"{'_vFace-errfd' if args.valence_face_gate == 'errfd' else ''}"
         f"_resT-{args.residual_num_timesteps}-{args.residual_t_min}-{args.residual_t_max}"
         f"_scrT-{args.scr_num_timesteps}-{args.scr_t_min}-{args.scr_t_max}"
         f"_wSCR-{args.weight_loss_scr}-{args.factor1}-{args.factor2}"
         f"_wSRR-{args.weight_loss_face}"
         f"_srr-{_srr_tag}"
-        f"_errFD-{args.face_residual_num_timesteps}-{args.face_residual_t_min}-{args.face_residual_t_max}"
-        # gender class-error spatial reduction, ALWAYS tagged (both modes) so a run's folder says outright
-        # whether the attmap weighting was on: _gAttn-attn = attention-weighted, _gAttn-none = full error.
-        # Deliberately not a "tag only when non-default" suffix like _skipFrac: an absent tag would be
-        # ambiguous with the original _nodetector.py runs, which have no _gAttn at all.
-        f"_gAttn-{args.gender_attn_weight}"
+        # errFD is only tagged when the face gate is actually ON (--valence_face_gate errfd); for valence
+        # the detector does not run in the training path at all, so tagging it would be a lie.
+        f"{f'_errFD-{args.face_residual_num_timesteps}-{args.face_residual_t_min}-{args.face_residual_t_max}' if args.valence_face_gate == 'errfd' else ''}"
         f"{('_skipFrac-'+format(args.skip_denoise_frac, 'g')) if args.skip_denoise_frac>0 else ''}"
         f"_Th-{args.uncertainty_threshold}"
         f"_loraR-{args.rank}_lr-{args.learning_rate}"
@@ -1234,6 +1635,29 @@ def main(args):
     residual_woman_embeds = _encode_scoring_prompt(args.residual_woman_prompt)  # [1, L, D]
     residual_man_embeds = _encode_scoring_prompt(args.residual_man_prompt)      # [1, L, D]
     residual_realistic_embeds = _encode_scoring_prompt(args.srr_prompt)         # [1, L, D], SRR realism prompt
+
+    # VALENCE: cache the 2P class-prompt embeddings, one POSITIVE and one NEGATIVE per axis. Encoded with
+    # the SAME (with-attention-mask) convention as the woman/man scorer they replace -- these prompts live
+    # in the same scorer, so they must share its convention. (The face/faceless pair deliberately uses the
+    # no-mask convention instead; see _encode_scoring_prompt_nomask below. Mixing the two silently flipped
+    # that classifier's margins once, so the two conventions are kept explicitly separate.)
+    for _ax in valence_axes:
+        _ax["pos_embeds"] = _encode_scoring_prompt(_ax["pos"])                 # [1, L, D]
+        _ax["neg_embeds"] = _encode_scoring_prompt(_ax["neg"])                 # [1, L, D]
+    valence_center = valence_center.to(accelerator.device)                     # [P] frozen
+    valence_scale = valence_scale.to(accelerator.device)                       # [P] frozen
+    valence_weight = valence_weight.to(accelerator.device)                     # [P] frozen, sums to 1
+    logger.info(
+        "VALENCE class = %d contrastive pairs (order [neg=0, pos=1]):\n%s",
+        P_axes,
+        "\n".join(
+            f"  [{i}] {a['name']:>6s}  w={valence_weight[i].item():.3f} s={valence_scale[i].item():.4g} "
+            f"m={valence_center[i].item():.4g}\n"
+            f"          pos: {a['pos']}\n"
+            f"          neg: {a['neg']}"
+            for i, a in enumerate(valence_axes)
+        ),
+    )
     # NODETECTOR: frozen-TE embeddings of the face/no-face classifier prompts (replaces the
     # insightface detector in the training branch points; see residual_face_indicators).
     # IMPORTANT: encoded WITHOUT attention_mask -- the standard SD text-encoding convention.
@@ -1333,12 +1757,60 @@ def main(args):
     residual_woman_token_idxs = _find_word_token_indices(args.residual_woman_prompt, args.residual_woman_word)
     residual_man_token_idxs = _find_word_token_indices(args.residual_man_prompt, args.residual_man_word)
 
-    # install the capturing processor on the scoring UNet's cross-attention (attn2) layers only
-    _scoring_attn_procs = dict(scoring_unet.attn_processors)
-    for _name in list(_scoring_attn_procs.keys()):
-        if _name.endswith("attn2.processor"):
-            _scoring_attn_procs[_name] = CrossAttnCaptureProcessor(attn_capture_ctx)
-    scoring_unet.set_attn_processor(_scoring_attn_procs)
+    # AXISATTN: per-axis CONTENT-token indices, located INDEPENDENTLY in the pos and neg prompt token
+    # streams (the polarity word "positive"/"negative" can tokenize to a different length, shifting the
+    # shared content tokens). A phrase list is UNIONED across phrases -- this is how NON-CONTIGUOUS content
+    # ("clothing" ... "actions", separated by "and") is expressed, which the single contiguous-run gender
+    # helper could not. None => this axis has no region and is scored with a uniform whole-image mean.
+    def _find_content_token_indices(prompt, phrases):
+        idxs = []
+        for ph in phrases:
+            idxs += _find_word_token_indices(prompt, ph)      # each phrase a contiguous run; raises if absent
+        return sorted(set(idxs))
+    _valence_use_attn = (args.valence_axis_attn == "peraxis")
+    for _ax in valence_axes:
+        if _valence_use_attn and _ax["content"]:
+            _ax["pos_content_idxs"] = _find_content_token_indices(_ax["pos"], _ax["content"])
+            _ax["neg_content_idxs"] = _find_content_token_indices(_ax["neg"], _ax["content"])
+        else:
+            _ax["pos_content_idxs"] = None
+            _ax["neg_content_idxs"] = None
+
+    # AXISATTN: install the capturing attention processor ONLY when at least one axis uses per-axis attmap.
+    #  - peraxis + >=1 content axis: install CrossAttnCaptureProcessor on the scoring UNet's attn2 layers so
+    #    _valence_axis_errors can read the content-token cross-attention. This forces the explicit
+    #    get_attention_scores + bmm path (no SDPA) on the scoring UNet -- the real, unavoidable cost of
+    #    spatial localisation (the capture side-effect itself is under no_grad and free).
+    #  - uniform (or no content axes): do NOT install it, so diffusers keeps its fast SDPA attention. That
+    #    path is byte-identical to the _multiprompt_valence.py (no-attmap) file.
+    # WHY PER-AXIS MAPS ARE VALID where a single COMMON map was rejected: each axis keeps its OWN map and is
+    # pooled only AFTER the spatial reduction, so nothing averages 4 different supports toward uniform; the
+    # sum-to-1 map preserves each axis's error scale (so --valence_axis_scale still means what it did); and
+    # non-contiguous content is handled by unioning per-phrase token runs above. The tone axis (no content)
+    # stays uniform by construction -- a global axis has no region.
+    _valence_attn_installed = _valence_use_attn and any(a["pos_content_idxs"] is not None for a in valence_axes)
+    if _valence_attn_installed:
+        _scoring_attn_procs = dict(scoring_unet.attn_processors)
+        for _name in list(_scoring_attn_procs.keys()):
+            if _name.endswith("attn2.processor"):
+                _scoring_attn_procs[_name] = CrossAttnCaptureProcessor(attn_capture_ctx)
+        scoring_unet.set_attn_processor(_scoring_attn_procs)
+        logger.info(
+            "AXISATTN: per-axis cross-attention weighting ON. attmap axes=%s ; uniform axes=%s.",
+            [a["name"] for a in valence_axes if a["pos_content_idxs"] is not None],
+            [a["name"] for a in valence_axes if a["pos_content_idxs"] is None],
+        )
+    else:
+        logger.info(
+            "AXISATTN: uniform whole-image reduction for every axis (capturing processor NOT installed; "
+            "scoring UNet keeps SDPA)."
+        )
+    if args.factor2 != 1.0:
+        logger.warning(
+            "--factor2 %s is IGNORED for valence (it was the spatial SCR gate inside the class "
+            "cross-attention region; that region does not exist for a scene-level class). factor1=%s is "
+            "the single release damping.", args.factor2, args.factor1,
+        )
 
     # if args.enable_xformers_memory_efficient_attention:
     #     if is_xformers_available():
@@ -1887,6 +2359,48 @@ def main(args):
             embeds = torch.nn.functional.normalize(embeds, dim=-1)
         return embeds
 
+    @torch.no_grad()
+    def get_valence_test(images):
+        """ZERO-SHOT CLIP VALENCE HEAD -- the EVALUATION metric. Replaces the CelebA gender classifier.
+
+        Returns (preds [N] int64, probs [N,2] fp32), class order [neg=0, pos=1]. MAIN PROCESS ONLY (the
+        open_clip bigG lives on rank 0), so pass it the already-all-gathered images.
+
+        WHY A NEW HEAD AT ALL: the CelebA MobileNet test classifier consumes 224x224 FACE CROPS and emits a
+        gender logit pair. It cannot be repointed at a scene-level concept even in principle -- there is no
+        face crop that carries "the background has a gloomy atmosphere".
+
+        WHY CLIP: the eval metric must be INDEPENDENT of the training signal (that is the entire reason the
+        gender file used a separately-trained CelebA classifier rather than its own scorer). The open_clip
+        ViT-bigG-14 is already loaded on rank 0 for CLIP-I/CLIP-T, is NOT part of this file's training loss,
+        and scores the FULL image rather than a face chip. Scoring valence with the training scorer instead
+        would not be merely "self-referential" -- it would be the training loss re-evaluated, i.e. a number
+        the optimiser is directly maximising.
+
+        PROMPT ENSEMBLING is done in EMBEDDING space: mean of the unit text vectors per class, renormalised.
+        This is the canonical CLIP zero-shot recipe -- and it is exactly "average within a class", applied at
+        the one place where averaging within a class is the right operation.
+
+        NOTE the logit_scale: CLIP's cosine similarities live in a ~[-0.3, 0.4] band, so a softmax over raw
+        cosines would be almost uniform and every probs-based metric would be mush. open_clip's learned
+        logit_scale (exp ~100) is what makes the two-way softmax meaningful, and it is what the model was
+        trained with.
+        """
+        img_feats = get_clip_feat_eval(images)                                   # [N,D] L2-normalised fp32
+        t_pos = get_clip_text_feat_eval(list(args.valence_eval_pos_prompts))     # [n_pos,D] L2-normalised
+        t_neg = get_clip_text_feat_eval(list(args.valence_eval_neg_prompts))     # [n_neg,D] L2-normalised
+        t_pos = t_pos.mean(dim=0, keepdim=True)
+        t_neg = t_neg.mean(dim=0, keepdim=True)
+        t_pos = t_pos / t_pos.norm(dim=-1, keepdim=True)                         # renormalise the ensemble
+        t_neg = t_neg / t_neg.norm(dim=-1, keepdim=True)
+        text_feats = torch.cat([t_neg, t_pos], dim=0)                            # [2,D], rows [neg, pos]
+
+        logit_scale = eval_clip_model.logit_scale.exp().float()
+        logits = logit_scale * (img_feats.float() @ text_feats.float().t())       # [N,2]
+        probs = torch.softmax(logits, dim=-1).float()                             # [N,2] fp32
+        preds = probs.max(dim=-1).indices                                         # [N]   int64
+        return preds, probs
+
     def get_face_feats(net, data, flip=True, normalize=True, to_high_precision=True):
         # extract features from the original 
         # and horizontally flipped data
@@ -2063,46 +2577,46 @@ def main(args):
         
         return face_indicators_app, face_bboxs_app, face_chips_app, face_landmarks_app, aligned_face_chips_app
                 
-    def reduce_gender_residual(residual_map, common_attn):
-        """Spatially reduce a per-pixel woman/man squared residual [n,K,H,W] to a per-image error [n].
+    def _valence_axis_errors(z0):
+        """Per-axis, per-class residual errors of the FROZEN scoring UNet -- the multi-prompt class scorer.
 
-        Controlled by --gender_attn_weight:
-          'attn' (default): weighted SUM with the sum-to-1 common woman/man cross-attention map,
-              E_c = sum_{u,v} common_attn(u,v) * res_c(u,v)  -- the error only counts the gender/person
-              region. This is the original NODETECTOR behaviour.
-          'none': UNIFORM spatial MEAN over all H*W pixels, E_c = mean_{u,v} res_c(u,v) -- the FULL error,
-              every pixel counts equally. Identical to the 'attn' formula with a FLAT weight map 1/(H*W),
-              which ALSO sums to 1, so E_c keeps the same normalization/scale as 'attn' (--tau comparable).
-        The timestep axis K is always reduced by a uniform mean, in both modes. common_attn is detached in
-        both callers, so this only changes WHERE the gradient d E_c / d z0 is weighted, never the graph.
-        """
-        if args.gender_attn_weight == "none":
-            return residual_map.mean(dim=(2, 3)).mean(dim=1)                                    # [n]
-        return (common_attn.unsqueeze(1) * residual_map).sum(dim=(2, 3)).mean(dim=1)            # [n]
+        z0: [n,4,H,W] clean latent in the scheduler/UNet scale. NOT detached, so gradient flows
+            E -> scoring_unet(zt) -> zt -> z0 -> the trainable model.
 
-    def residual_gender_logits(z0):
-        """Prompt-conditioned diffusion residual-error gender scorer with cross-attention spatial weighting.
+        Returns E [n,P,2] (fp32), class order [neg=0, pos=1]:
+            E[i,p,c] = mean_t  sum_pixels A_p(pixel) * || eps_pred(z_t, t, c_{p,c}) - eps ||^2
+        over --residual_num_timesteps timesteps linspaced in [--residual_t_min, --residual_t_max], where A_p
+        is axis p's spatial weighting map (sum-to-1 per image).
 
-        z0: [n,4,H,W] clean latent in the scheduler/UNet scale. May require grad; it is NOT detached,
-            so gradient flows: logits -> weighted residual err -> scoring UNet(zt) -> zt -> z0.
+        SPATIAL REDUCTION (AXISATTN, --valence_axis_attn):
+          'peraxis' (default): A_p is axis p's CONTENT-token cross-attention -- captured from the frozen
+             scoring UNet for the content phrases (--valence_axes 4th field: facial expressions -> face;
+             clothing,actions -> body; background,atmosphere -> scene), averaged over the axis's pos & neg
+             forwards, resized to (H,W), summed-to-1 and DETACHED. So each aspect is scored WHERE IT LIVES.
+             Axes with no content phrases (e.g. 'tone') fall back to the uniform map. Because A_p SUMS TO 1,
+             the weighted error keeps the SAME scale as a uniform mean (the uniform map is just A=1/(H*W),
+             which also sums to 1), so per-axis commensurability and --valence_axis_scale are unaffected.
+          'uniform': A_p = 1/(H*W) for every axis -- the plain whole-image mean of the _multiprompt_valence.py
+             (no-attmap) file. In this mode the capturing processor is not installed and this loop never
+             touches attn_capture_ctx, so the scoring UNet uses SDPA.
 
-        For each of `--residual_num_timesteps` timesteps (linearly spaced in
-        [--residual_t_min, --residual_t_max] inclusive) a fresh eps is sampled and the SAME eps/zt is
-        scored under both the woman and man text conditions. Rather than averaging the squared eps error
-        uniformly over space, it is weighted by a single COMMON cross-attention map:
-          - for every (timestep, prompt, cross-attn block, head) the class-token ("woman"/"man")
-            cross-attention map is extracted, resized to (H,W), and averaged over ALL of those axes;
-          - the common map is spatially normalized to sum to 1 and detached (pure weighting mask);
-          - the per-pixel squared error (channel-mean, [n,H,W]) is reduced by a spatial weighted SUM
-            with the common map (not mean, because the map already sums to 1).
+        THE MAP IS SHARED BY THE PAIR (and detached), which is what keeps the gap a clean paired difference:
+        E_neg and E_pos for axis p are BOTH reduced by the SAME A_p, so A_p cancels in its own right and only
+        the residual differs between the two classes. Building a per-class map instead would let the map
+        difference leak into g_p. A_p is averaged over the pos AND neg forwards (the content tokens are the
+        shared, non-polarity part of the pair) -- the exact analogue of the gender file's woman/man common map,
+        but kept PER AXIS rather than pooled across axes (pooling across axes was the thing that smeared).
 
-        Returns logits [n,2], class order [woman=0, man=1]: logit_c = -E_c / tau.
+        NOISE. eps is SHARED WITHIN a pair: E_pos and E_neg for axis p are computed on the SAME zt/eps, which
+        is what makes the gap g_p = E_neg - E_pos a low-variance PAIRED difference (the two prompts see the
+        identical noise, so everything except the prompt cancels). eps is drawn INDEPENDENTLY ACROSS axes
+        (--valence_axis_eps independent, the default): sharing one eps across all 2P prompts -- the obvious
+        port of the old 2-prompt code -- would correlate the P gap estimates through a single noise draw, so
+        averaging them would cancel no Monte-Carlo noise and pooling would buy nothing.
 
-        [PERF] The `--residual_num_timesteps` timesteps are folded into the batch dimension, so the
-        scoring UNet runs ONCE per prompt on an [n*K, ...] batch instead of K sequential [n, ...]
-        forwards. A fresh eps is still drawn per timestep in the same order and the attention/residual
-        reductions are unchanged, so the estimator is mathematically identical to the per-timestep loop
-        (only GPU batching differs). Verified numerically equal (logits + grad) to the looped version.
+        [PERF] the K timesteps are folded into the batch dim ([n,K,...] -> [n*K,...]), so the scoring UNet
+        runs ONCE per prompt (2P forwards) rather than 2*P*K sequential ones. The attention capture is a
+        no_grad side-effect; the cost of 'peraxis' is that the scoring UNet runs the explicit attention path.
         """
         n = z0.shape[0]
         H, W = z0.shape[-2], z0.shape[-1]
@@ -2110,66 +2624,121 @@ def main(args):
             args.residual_t_min, args.residual_t_max, steps=args.residual_num_timesteps, device=z0.device
         ).round().long()
         K = timesteps.shape[0]
+        t_all = timesteps.repeat(n)                                      # [n*K], row i*K+k -> t_k
 
-        # Draw a fresh eps per timestep (SAME order/values as the per-timestep loop) and build z_t,
-        # then fold the K timesteps into the batch dimension: [n,K,...] -> [n*K,...] (row = i*K + k).
-        eps_list, zt_list = [], []
-        for t in timesteps:
-            t_batch = t.repeat(n)
-            eps_k = torch.randn_like(z0)                          # fresh eps per timestep
-            zt_list.append(noise_scheduler.add_noise(z0, eps_k, t_batch))
-            eps_list.append(eps_k)
-        eps_all = torch.stack(eps_list, dim=1).reshape(n * K, *z0.shape[1:])          # [n*K,4,H,W]
-        zt_all = torch.stack(zt_list, dim=1).reshape(n * K, *z0.shape[1:]).to(weight_dtype)
-        t_all = timesteps.repeat(n)                                                   # [n*K], row i*K+k -> t_k
+        def _draw_noise():
+            """one fresh eps per timestep, folded into the batch dim -> (eps_all, zt_all) [n*K,4,H,W]"""
+            eps_list, zt_list = [], []
+            for t in timesteps:
+                eps_k = torch.randn_like(z0)
+                zt_list.append(noise_scheduler.add_noise(z0, eps_k, t.repeat(n)))
+                eps_list.append(eps_k)
+            eps_all = torch.stack(eps_list, dim=1).reshape(n * K, *z0.shape[1:])
+            zt_all = torch.stack(zt_list, dim=1).reshape(n * K, *z0.shape[1:]).to(weight_dtype)
+            return eps_all, zt_all
 
-        prompts_cfg = [
-            ("woman", residual_woman_embeds, residual_woman_token_idxs),
-            ("man", residual_man_embeds, residual_man_token_idxs),
-        ]
+        shared = _draw_noise() if args.valence_axis_eps == "shared" else None
 
-        residual_maps = {}                                        # cls -> [n,K,H,W] (grad-carrying)
-        attn_accum = torch.zeros(n, H, W, dtype=torch.float, device=z0.device)   # detached attention accumulator
-        attn_count = 0
+        cols = []
+        for ax in valence_axes:
+            eps_all, zt_all = shared if shared is not None else _draw_noise()
+            # This axis's per-class content-token indices; None => no region => uniform reduction.
+            use_attn = ax["pos_content_idxs"] is not None
+            per_class = []                                               # [n] error per class, order [neg,pos]
+            per_class_res = []                                           # grad-carrying per-pixel res [n,K,H,W]
+            attn_accum = torch.zeros(n, H, W, dtype=torch.float, device=z0.device)   # detached accumulator
+            attn_count = 0
+            # class order [neg=0, pos=1]; each forward captures with ITS OWN prompt's content-token indices.
+            for embeds, tok_idxs in ((ax["neg_embeds"], ax["neg_content_idxs"]),
+                                     (ax["pos_embeds"], ax["pos_content_idxs"])):
+                c = embeds.expand(n * K, -1, -1)
+                if use_attn:
+                    attn_capture_ctx.store = []
+                    attn_capture_ctx.token_idxs = tok_idxs
+                    attn_capture_ctx.enabled = True
+                eps_pred = scoring_unet(zt_all, t_all, encoder_hidden_states=c).sample
+                if not use_attn:
+                    # UNIFORM: the EXACT single fused reduction of the no-attmap file (mean over C,H,W then K).
+                    # Kept bit-for-bit identical (not the channel-mean-then-spatial-mean form) so uniform mode is
+                    # a perfect ablation baseline: any difference vs _multiprompt_valence.py is attributable to
+                    # peraxis, never to fp32 reduction-order. The .float() pins the whole valence pipeline to fp32.
+                    e = (eps_pred.float() - eps_all.float()).pow(2).mean(dim=(1, 2, 3)).view(n, K).mean(dim=1)
+                    per_class.append(e)
+                    continue
+                # PERAXIS: accumulate this prompt's content-token cross-attention maps (detached), resized to (H,W).
+                attn_capture_ctx.enabled = False
+                captured = attn_capture_ctx.store
+                attn_capture_ctx.store = []
+                for col, heads in captured:
+                    hw = col.shape[-1]
+                    s = int(round(math.sqrt(hw)))
+                    a = col.view(n * K, heads, s, s).float()                    # [n*K, heads, s, s]
+                    a = torch.nn.functional.interpolate(a, size=(H, W), mode="bilinear", align_corners=False)
+                    a = a.mean(dim=1).view(n, K, H, W).mean(dim=1)              # mean heads, then K -> [n,H,W]
+                    attn_accum = attn_accum + a
+                    attn_count += 1
+                # per-pixel squared residual (channel-mean) -> [n,K,H,W], grad-carrying; reduced spatially below.
+                res = (eps_pred.float() - eps_all.float()).pow(2).mean(dim=1).view(n, K, H, W)
+                per_class_res.append(res)
 
-        for cls, embeds, tok_idxs in prompts_cfg:
-            c = embeds.expand(n * K, -1, -1)
-            attn_capture_ctx.store = []
-            attn_capture_ctx.token_idxs = tok_idxs
-            attn_capture_ctx.enabled = True
-            eps_pred = scoring_unet(zt_all, t_all, encoder_hidden_states=c).sample
-            attn_capture_ctx.enabled = False
-            captured = attn_capture_ctx.store
-            attn_capture_ctx.store = []
+            if use_attn:
+                # ONE detached, sum-to-1 map per axis, shared by both classes (see docstring). attn_count > 0
+                # is guaranteed: use_attn implies the capture processor is installed and attn2 layers fired.
+                A = attn_accum / attn_count                                          # [n,H,W]
+                A = A / (A.sum(dim=(1, 2), keepdim=True) + 1e-8)                      # sum-to-1 per image
+                A = A.detach().unsqueeze(1)                                          # [n,1,H,W] weighting mask
+                per_class = [(A * r).sum(dim=(2, 3)).mean(dim=1) for r in per_class_res]   # weighted SUM, mean-K
+            cols.append(torch.stack(per_class, dim=1))                   # [n,2] order [neg,pos]
+        return torch.stack(cols, dim=1)                                  # [n,P,2]
 
-            # channel-mean squared residual -> [n*K,H,W] -> [n,K,H,W] (keeps grad to z0)
-            residual_maps[cls] = (eps_pred.float() - eps_all.float()).pow(2).mean(dim=1).view(n, K, H, W)
+    def valence_logits_from_errors(E):
+        """Pool the P axes into ONE binary decision. E: [n,P,2] fp32, class order [neg=0, pos=1].
 
-            # accumulate the class-token cross-attention maps (detached), each resized to (H,W).
-            # A captured block spans the whole [n*K] batch; averaging over K and counting once per
-            # (prompt, block) reproduces the original per-(timestep,prompt,block) accum / attn_count.
-            for col, heads in captured:
-                hw = col.shape[-1]
-                s = int(round(math.sqrt(hw)))
-                a = col.view(n * K, heads, s, s).float()                                # [n*K, heads, s, s]
-                a = torch.nn.functional.interpolate(a, size=(H, W), mode="bilinear", align_corners=False)
-                a = a.mean(dim=1).view(n, K, H, W).mean(dim=1)                          # mean heads, then K -> [n,H,W]
-                attn_accum = attn_accum + a
-                attn_count += 1
+        Returns (logits [n,2], score [n], gaps [n,P] detached-for-logging).
 
-        # common attention map: mean over {timesteps, prompts, blocks, heads}
-        common_attn = attn_accum / max(attn_count, 1)                                   # [n,H,W]
-        # spatial normalization so that sum_{u,v} common_attn(u,v) == 1 per image
-        common_attn = common_attn / (common_attn.sum(dim=(1, 2), keepdim=True) + 1e-8)
-        common_attn = common_attn.detach()                                             # weighting mask only
+            gap    g_p = E_neg - E_pos          (> 0  <=>  the image reads POSITIVE)
+            z_p        = (g_p - m_p) / s_p      (FROZEN offline constants, never live batch statistics)
+            score      = sum_p w_p * z_p        (w sums to 1)
+            logits     = [-score/(2*tau), +score/(2*tau)]
 
-        # spatial reduction per --gender_attn_weight: 'attn' = attention-weighted SUM (original),
-        # 'none' = uniform mean over all pixels (the FULL error). Then uniform mean over timesteps.
-        E_woman = reduce_gender_residual(residual_maps["woman"], common_attn)           # [n]
-        E_man = reduce_gender_residual(residual_maps["man"], common_attn)               # [n]
+        WHY THE SYMMETRIC LOGIT FORM: logit_pos - logit_neg = score/tau by construction, so
+        probs[:,1] = sigmoid(score/tau). Writing the logits this way instead of [-E_neg/tau, -E_pos/tau] is
+        IDENTICAL in value and in gradient -- softmax and cross-entropy are invariant to a per-sample
+        class-constant shift -- but it drops the large class-independent common-mode term that fp32 would
+        otherwise have to cancel.
 
-        logits_gender = torch.stack([-E_woman / args.tau, -E_man / args.tau], dim=1)    # [n, 2]
-        return logits_gender
+        WHY THIS IS SIMULTANEOUSLY 'average the errors', 'average the logits' AND 'average the log-probs':
+        logit_c = -E_c/tau is AFFINE in E with a shared tau, so averaging over axes commutes with it; and the
+        mean of per-axis log-probs differs from the mean of per-axis logits only by the per-axis
+        log-partition, which is CLASS-INDEPENDENT and therefore invisible to softmax/CE. The three are ONE
+        estimator (verified in float64: max abs diff 4.6e-14). Only 'average the PROBABILITIES' is genuinely
+        different -- and it is the one that breaks; see --valence_pooling and the prob_mean branch below.
+
+        WHY THE STANDARDISATION MATTERS: each axis's BASELINE error level cancels for free (g_p is a
+        within-pair difference), but each axis's GAP SCALE does not. Without 1/s_p the axis with the largest
+        dynamic range owns the pooled decision -- and owns the z0 gradient too, since
+        dL/dE[p,c] is proportional to w_p/s_p -- so a '4-axis' scorer silently degenerates into a 1-axis one.
+        """
+        gaps = E[:, :, 0] - E[:, :, 1]                                        # [n,P]  E_neg - E_pos
+        z = (gaps - valence_center.view(1, -1)) / valence_scale.view(1, -1)   # [n,P]  standardised
+
+        if args.valence_pooling == "prob_mean":
+            # ABLATION ONLY -- the user's option (iii), kept reachable so its failure can be DEMONSTRATED
+            # rather than argued about. Per-axis sigmoid then average = a MIXTURE of experts: one confident
+            # axis cannot be outvoted, and a saturated axis contributes ~no gradient (dp/dg ~ p(1-p) -> 0).
+            # With a small tau each axis becomes a hard 0/1 vote, so the mean lands on the discrete grid
+            # {0, 1/P, ..., 1} and generate_dynamic_targets' argsort splits the resulting tie buckets by
+            # ARRIVAL ORDER rather than by valence -- while still reporting a perfect 50/50 count.
+            p_pos = torch.sigmoid(z / args.valence_tau)                        # [n,P]
+            p_pos = (valence_weight.view(1, -1) * p_pos).sum(dim=1)            # [n]
+            p_pos = p_pos.clamp(1e-6, 1.0 - 1e-6)
+            logits = torch.stack([torch.log1p(-p_pos), torch.log(p_pos)], dim=1)   # [n,2], CE on log p
+            return logits, p_pos - 0.5, gaps.detach()                          # score = monotone key
+
+        score = (valence_weight.view(1, -1) * z).sum(dim=1)                    # [n]
+        half = score / (2.0 * args.valence_tau)
+        logits = torch.stack([-half, half], dim=1)                             # [n,2], [neg=0, pos=1]
+        return logits, score, gaps.detach()
 
     @torch.no_grad()
     def residual_face_indicators(z0):
@@ -2214,318 +2783,121 @@ def main(args):
 
         return E["face"] < E["faceless"]                                              # bool [n]
 
-    def residual_gender_and_realism(z0):
-        """Fused residual-error scorer used by the training loss (SCR gender + SRR realism).
+    def residual_valence_and_realism(z0):
+        """Fused scorer for the TRAINING loss: the multi-prompt valence class + the SRR realism anchor.
 
-        A single eps/zt is sampled per timestep and scored under THREE frozen-SD text conditions:
-        woman / man (the SCR gender fair loss) and args.srr_prompt = "a photo of a realistic person"
-        (the SRR realism loss). The three passes share the same per-timestep eps (and identical zt
-        VALUES); the realism pass additionally masks the z0 gradient to the person region (see E_realistic).
-        Gradient flows z0 -> trainable model; the scorer (scoring_unet / scoring_text_encoder) stays
-        frozen, so E_realistic pulls z0 onto the frozen model's "realistic person" manifold (score
-        distillation on the realism prompt).
-
-        z0: [n,4,H,W] clean latent in the scheduler/UNet scale (NOT detached).
+        z0: [n,4,H,W] clean latent (NOT detached) -- gradient flows to the trainable model. The scorer
+        (scoring_unet / scoring_text_encoder) stays frozen, so E_realistic pulls z0 onto the frozen model's
+        "realistic photo" manifold (score distillation on the realism prompt).
 
         Returns:
-          logits_gender [n,2], class order [woman=0, man=1], logit_c = -E_c / tau. Woman/man use the
-              same attention-weighted spatial reduction as residual_gender_logits (identical estimator,
-              modulo the fresh random eps draw).
-          E_realistic [n], the SRR loss per sample: squared residual for the realism prompt, meaned over
-              the WHOLE image (every pixel contributes to the VALUE), then averaged over timesteps. RAW
-              error -- NOT divided by tau. The GRADIENT is localized to the person/gender region by masking
-              the SCORER INPUT: non-region z0 pixels are detached before the realism UNet pass, so
-              d(E_realistic)/dz0 is exactly zero outside the min-max-normalized common_attn >=
-              args.attn_gate_thr region, while the value stays the true whole-image residual. (Masking the
-              residual instead would leave the value region-limited AND still leak z0 gradient through the
-              UNet's global receptive field, so INPUT masking is used to actually localize the gradient.)
-          common_attn [n,H,W], the sum-to-1 (detached) gender localization map used internally for the SRR
-              region mask, returned so the h-space SCR image loss can reuse it for its flip gradient-gate
-              (min-max normalized >= args.attn_gate_thr) without a second scorer forward.
+          logits [n,2]     pooled valence logits, class order [neg=0, pos=1]  -> the fair (CE) loss
+          score  [n]       the pooled continuous score; probs[:,1] = sigmoid(score / --valence_tau)
+          gaps   [n,P]     per-axis gaps, DETACHED. Logged per axis so that a DEAD axis (gap ~ noise) or a
+                           DOMINATING axis is visible directly in wandb, instead of having to be inferred
+                           from a flat loss curve -- which is exactly how this project's two previous dead
+                           scorers stayed hidden.
+          E_realistic [n]  the SRR loss: the raw eps-residual under --srr_prompt, meaned over the WHOLE image
+                           and over timesteps. RAW error -- NOT divided by tau.
 
-        [PERF] The `--residual_num_timesteps` timesteps are folded into the batch dimension, so the
-        scoring UNet runs ONCE per prompt (woman/man on zt_all; realism on a gradient-masked zt of the
-        SAME value) on an [n*K, ...] batch instead of K sequential [n, ...] forwards. The woman/man gender
-        logits are unchanged vs residual_gender_logits (verified numerically equal, logits + grad); only
-        E_realistic's reduction and gradient-localization intentionally differ.
+        SRR GRADIENT SUPPORT = THE WHOLE IMAGE. The gender file input-masked z0 outside the person region so
+        d(E_realistic)/dz0 was exactly zero outside it. That was right when the fair loss only edited a face.
+        The valence fair loss edits expression AND clothing AND background AND global tone, so a
+        person-region-only realism anchor would leave the model free to WRECK THE BACKGROUND in order to win
+        the valence objective. The anchor must cover the same support the fair loss pushes on.
         """
         n = z0.shape[0]
-        H, W = z0.shape[-2], z0.shape[-1]
+        E = _valence_axis_errors(z0)                                     # [n,P,2], grad-carrying
+        logits, score, gaps = valence_logits_from_errors(E)              # [n,2], [n], [n,P]
+
+        # ---- SRR realism. Its own eps draw: E_realistic is a RAW error, not a paired difference, so it
+        # gains nothing from sharing eps with the class prompts (only the within-pair sharing above matters).
         timesteps = torch.linspace(
             args.residual_t_min, args.residual_t_max, steps=args.residual_num_timesteps, device=z0.device
         ).round().long()
         K = timesteps.shape[0]
+        t_all = timesteps.repeat(n)
 
-        # fresh eps per timestep (same order as the loop), folded into the batch dim: [n,K,...]->[n*K,...]
         eps_list, zt_list = [], []
         for t in timesteps:
-            t_batch = t.repeat(n)
-            eps_k = torch.randn_like(z0)                          # new eps per timestep, shared by all 3 prompts
-            zt_list.append(noise_scheduler.add_noise(z0, eps_k, t_batch))
+            eps_k = torch.randn_like(z0)
+            zt_list.append(noise_scheduler.add_noise(z0, eps_k, t.repeat(n)))
             eps_list.append(eps_k)
         eps_all = torch.stack(eps_list, dim=1).reshape(n * K, *z0.shape[1:])
         zt_all = torch.stack(zt_list, dim=1).reshape(n * K, *z0.shape[1:]).to(weight_dtype)
-        t_all = timesteps.repeat(n)
-
-        # Gender prompts (attention-weighted). The realism (SRR) prompt is scored SEPARATELY below,
-        # after the face-region mask is known, so its z0 gradient can be restricted to that region.
-        gender_prompts_cfg = [
-            ("woman", residual_woman_embeds, residual_woman_token_idxs),
-            ("man", residual_man_embeds, residual_man_token_idxs),
-        ]
-
-        residual_maps = {}                                        # cls -> [n,K,H,W] (grad-carrying)
-        attn_accum = torch.zeros(n, H, W, dtype=torch.float, device=z0.device)  # detached attention accumulator
-        attn_count = 0
-
-        for cls, embeds, tok_idxs in gender_prompts_cfg:
-            c = embeds.expand(n * K, -1, -1)
-            attn_capture_ctx.store = []
-            attn_capture_ctx.token_idxs = tok_idxs
-            attn_capture_ctx.enabled = True
-            eps_pred = scoring_unet(zt_all, t_all, encoder_hidden_states=c).sample
-            attn_capture_ctx.enabled = False
-            captured = attn_capture_ctx.store
-            attn_capture_ctx.store = []
-
-            # channel-mean squared residual -> [n*K,H,W] -> [n,K,H,W] (keeps grad to z0)
-            residual_maps[cls] = (eps_pred.float() - eps_all.float()).pow(2).mean(dim=1).view(n, K, H, W)
-
-            # accumulate the class-token cross-attention maps (detached), each resized to (H,W).
-            for col, heads in captured:
-                hw = col.shape[-1]
-                s = int(round(math.sqrt(hw)))
-                a = col.view(n * K, heads, s, s).float()                            # [n*K, heads, s, s]
-                a = torch.nn.functional.interpolate(a, size=(H, W), mode="bilinear", align_corners=False)
-                a = a.mean(dim=1).view(n, K, H, W).mean(dim=1)                      # mean heads, then K -> [n,H,W]
-                attn_accum = attn_accum + a
-                attn_count += 1
-
-        # gender: common attention map (mean over {timesteps, woman/man, blocks, heads}), sum-to-1, detached
-        common_attn = attn_accum / max(attn_count, 1)                                   # [n,H,W]
-        common_attn = common_attn / (common_attn.sum(dim=(1, 2), keepdim=True) + 1e-8)
-        common_attn = common_attn.detach()
-        # spatial reduction per --gender_attn_weight: 'attn' = attention-weighted SUM (original),
-        # 'none' = uniform mean over all pixels (the FULL error). common_attn is still computed above
-        # regardless, because the SRR region mask below (and the h-space SCR flip gate, via the returned
-        # map) use it in BOTH modes -- only the CLASS-ERROR weighting is switched off by 'none'.
-        E_woman = reduce_gender_residual(residual_maps["woman"], common_attn)           # [n]
-        E_man = reduce_gender_residual(residual_maps["man"], common_attn)               # [n]
-        logits_gender = torch.stack([-E_woman / args.tau, -E_man / args.tau], dim=1)    # [n, 2]
-
-        # -------- SRR realism: VALUE over the WHOLE image, GRADIENT only in the person/gender region --------
-        # Person/gender region = min-max-normalized common_attn hard-thresholded at args.attn_gate_thr.
-        cmin = common_attn.amin(dim=(1, 2), keepdim=True)                               # [n,1,1]
-        cmax = common_attn.amax(dim=(1, 2), keepdim=True)                               # [n,1,1]
-        attn_gate = ((common_attn - cmin) / (cmax - cmin + 1e-8)).clamp(0, 1)           # [n,H,W] min-max, detached
-        face_mask = (attn_gate >= args.attn_gate_thr).to(z0.dtype)                      # [n,H,W] hard region, detached
-
-        # Localize the gradient on the SCORER INPUT (not the residual). The scoring UNet has a global
-        # receptive field, so masking the residual would still leak z0 gradient through the UNet; masking
-        # the input does not. z0_srr equals z0 in VALUE (detach keeps the forward), so the realism residual
-        # is the TRUE whole-image residual, but d/dz0 is exactly zero outside the region (non-region z0 is
-        # detached). Region z0 pixels still drive -- and receive gradient from -- the whole-image value.
-        face_mask_c = face_mask.unsqueeze(1)                                            # [n,1,H,W] over channels
-        z0_srr = face_mask_c * z0 + (1.0 - face_mask_c) * z0.detach()                   # value == z0; grad only in region
-        zt_srr_all = torch.stack(
-            [noise_scheduler.add_noise(z0_srr, eps_list[k], timesteps[k].repeat(n)) for k in range(K)],
-            dim=1,
-        ).reshape(n * K, *z0.shape[1:]).to(weight_dtype)                                # same VALUE as zt_all, grad masked
         c_real = residual_realistic_embeds.expand(n * K, -1, -1)
-        eps_pred_real = scoring_unet(zt_srr_all, t_all, encoder_hidden_states=c_real).sample
-        residual_realistic = (eps_pred_real.float() - eps_all.float()).pow(2).mean(dim=1).view(n, K, H, W)
-        # WHOLE-image mean over all H*W pixels (no region restriction on the value), then mean over K -> [n].
-        E_realistic = residual_realistic.mean(dim=(2, 3)).mean(dim=1)                   # [n]
+        eps_pred = scoring_unet(zt_all, t_all, encoder_hidden_states=c_real).sample
+        E_realistic = (eps_pred.float() - eps_all.float()).pow(2).mean(dim=(1, 2, 3)).view(n, K).mean(dim=1)
 
-        # common_attn [n,H,W] (sum-to-1, detached) is also returned so the h-space SCR flip gate can reuse
-        # the SAME gender localization map (min-max normalized >= attn_gate_thr) without a second scorer pass.
-        return logits_gender, E_realistic, common_attn
-    def get_face_gender(z0, selector=None, fill_value=-1):
-        """Drop-in replacement for the removed mnet classifier, now scoring the clean latent z0.
-
-        z0: [B,4,64,64] clean latents (scheduler/UNet scale).
-        selector (bool [B]) == face_indicators: only face-detected latents are scored; the rest are
-            filled with fill_value (mirrors the previous mnet behaviour so no-face images are excluded).
-        Returns (preds_gender, probs_gender, logits_gender), class order [woman=0, man=1].
-        Raw logits are returned so callers can feed them straight into cross_entropy (no pre-softmax).
-        """
-        if selector != None:
-            z0_w_faces = z0[selector]
-        else:
-            z0_w_faces = z0
-
-        if z0_w_faces.shape[0] == 0:
-            logits_gender = torch.empty([0,2], dtype=torch.float, device=z0.device)
-            probs_gender = torch.empty([0,2], dtype=torch.float, device=z0.device)
-            preds_gender = torch.empty([0], dtype=torch.int64, device=z0.device)
-        else:
-            logits_gender = residual_gender_logits(z0_w_faces)
-            probs_gender = torch.softmax(logits_gender, dim=-1)
-            preds_gender = probs_gender.max(dim=-1).indices
-
-        if selector != None:
-            preds_gender_new = torch.ones(
-                [selector.shape[0]]+list(preds_gender.shape[1:]),
-                dtype=preds_gender.dtype,
-                device=preds_gender.device
-                ) * (fill_value)
-            preds_gender_new[selector] = preds_gender
-
-            probs_gender_new = torch.ones(
-                [selector.shape[0]]+list(probs_gender.shape[1:]),
-                dtype=probs_gender.dtype,
-                device=probs_gender.device
-                ) * (fill_value)
-            probs_gender_new[selector] = probs_gender
-
-            logits_gender_new = torch.ones(
-                [selector.shape[0]]+list(logits_gender.shape[1:]),
-                dtype=logits_gender.dtype,
-                device=logits_gender.device
-                ) * (fill_value)
-            logits_gender_new[selector] = logits_gender
-
-            return preds_gender_new, probs_gender_new, logits_gender_new
-        else:
-            return preds_gender, probs_gender, logits_gender
+        return logits, score, gaps, E_realistic
 
     @torch.no_grad()
-    def compute_gender_attmaps(z0):
-        """Visualization-only: aggregate the woman/man class-token cross-attention maps and the common map.
+    def valence_valid_indicators(z0):
+        """Which samples participate in the valence loss. [n] bool.
 
-        Mirrors the attention aggregation inside residual_gender_logits but keeps woman/man separate and
-        runs under no_grad. Returns (woman_map, man_map, common_map), each [B,H,W] normalized so that the
-        spatial values sum to 1 per image (common_map == the actual weighting mask used by the scorer).
+        DEFAULT (--valence_face_gate none): ALL of them. This is the substantive change, not a refactor.
+        A scene has a valence whether or not it contains a face -- a faceless, grim alleyway is negative --
+        so gating on face detection would enforce the 50/50 objective only INSIDE the face-containing
+        subpopulation (roughly a third to a half of occupation generations), which is a sample-selection
+        bias, not a safety net. It also means the gathered shapes/dtypes no longer depend on per-rank
+        detection outcomes, which structurally removes the NCCL all_gather deadlock class this project has
+        already hit twice.
+
+        --valence_face_gate errfd reinstates the gender file's residual-error face detector, for the ablation.
         """
-        n = z0.shape[0]
-        H, W = z0.shape[-2], z0.shape[-1]
-        timesteps = torch.linspace(
-            args.residual_t_min, args.residual_t_max, steps=args.residual_num_timesteps, device=z0.device
-        ).round().long()
-        c_woman = residual_woman_embeds.expand(n, -1, -1)
-        c_man = residual_man_embeds.expand(n, -1, -1)
-        prompts_cfg = [
-            ("woman", c_woman, residual_woman_token_idxs),
-            ("man", c_man, residual_man_token_idxs),
-        ]
-        accum = {
-            "woman": torch.zeros(n, H, W, dtype=torch.float, device=z0.device),
-            "man": torch.zeros(n, H, W, dtype=torch.float, device=z0.device),
-        }
-        counts = {"woman": 0, "man": 0}
-        for t in timesteps:
-            t_batch = t.repeat(n)
-            eps = torch.randn_like(z0)
-            zt_in = noise_scheduler.add_noise(z0, eps, t_batch).to(weight_dtype)
-            for cls, c, tok_idxs in prompts_cfg:
-                attn_capture_ctx.store = []
-                attn_capture_ctx.token_idxs = tok_idxs
-                attn_capture_ctx.enabled = True
-                _ = scoring_unet(zt_in, t_batch, encoder_hidden_states=c).sample
-                attn_capture_ctx.enabled = False
-                captured = attn_capture_ctx.store
-                attn_capture_ctx.store = []
-                for col, heads in captured:
-                    hw = col.shape[-1]
-                    s = int(round(math.sqrt(hw)))
-                    a = col.view(n, heads, s, s).float()
-                    a = torch.nn.functional.interpolate(a, size=(H, W), mode="bilinear", align_corners=False)
-                    accum[cls] = accum[cls] + a.mean(dim=1)
-                    counts[cls] += 1
-        woman_map = accum["woman"] / max(counts["woman"], 1)
-        man_map = accum["man"] / max(counts["man"], 1)
-        common_map = (woman_map + man_map) / 2.0   # == common_attn (mean over prompts too), before normalization
+        if args.valence_face_gate == "errfd":
+            return residual_face_indicators(z0)
+        return torch.ones([z0.shape[0]], dtype=torch.bool, device=z0.device)
 
-        def _norm(m):
-            return m / (m.sum(dim=(1, 2), keepdim=True) + 1e-8)
-        return _norm(woman_map), _norm(man_map), _norm(common_map)
+    def get_valence(z0, selector=None, fill_value=-1):
+        """Training-time valence predictor on the clean latent z0. Successor of get_face_gender.
 
-    def save_gender_attmap_panels(z0, images, save_to, max_imgs=16):
-        """Save a grid where each row is [ generated image | woman-attn | man-attn | common-attn ] (overlays)."""
-        n = min(z0.shape[0], images.shape[0], max_imgs)
-        if n == 0:
-            return
-        woman_map, man_map, common_map = compute_gender_attmaps(z0[:n])
-        imgs = images[:n].detach().cpu()
-        labels = ["generated", "woman-attn", "man-attn", "common-attn"]
-        rows = []
-        for i in range(n):
-            base_pil = transforms.ToPILImage()(imgs[i].mul(0.5).add(0.5).clamp(0, 1))
-            panels = [
-                base_pil,
-                attmap_overlay_on_image(woman_map[i], imgs[i]),
-                attmap_overlay_on_image(man_map[i], imgs[i]),
-                attmap_overlay_on_image(common_map[i], imgs[i]),
-            ]
-            w, h = base_pil.size
-            row = Image.new("RGB", (w * len(panels), h))
-            for j, (p, lab) in enumerate(zip(panels, labels)):
-                p = p.resize((w, h)).copy()
-                ImageDraw.Draw(p).text((5, 5), f"{lab} #{i}", fill="white")
-                row.paste(p, (j * w, 0))
-            rows.append(row)
-        gw, gh = rows[0].size
-        grid = Image.new("RGB", (gw, gh * len(rows)))
-        for i, r in enumerate(rows):
-            grid.paste(r, (0, i * gh))
-        if os.path.dirname(save_to) and not os.path.exists(os.path.dirname(save_to)):
-            os.makedirs(os.path.dirname(save_to), exist_ok=True)
-        grid.save(save_to, quality=92)
+        Returns (preds [n] int64, probs [n,2] fp32, logits [n,2] fp32, score [n] fp32, gaps [n,P] fp32),
+        class order [neg=0, pos=1]. Raw logits are returned so callers can feed cross_entropy directly.
 
-    def save_grad_gate_panels(images, common_attn, attn_gate, scr_grad_mask, release, targets,
-                              preds_gender_ori, save_to, thr, factor2, max_imgs=16):
-        """Save the SCR flip gradient-gate visualization = the min-max-normalized, hard-masked (>= thr)
-        region whose SCR gradient is scaled by factor2. These are the EXACT tensors that gate the gradient
-        in the training loop (already detached), so the panel shows what actually happened this step.
+        `selector` exists ONLY for --valence_face_gate errfd (the gender file's face gate). With the default
+        --valence_face_gate none it is None and EVERY image is scored: a scene has a valence whether or not
+        it contains a face, and gating on faces would silently restrict the 50/50 objective to the
+        face-containing subpopulation -- a sample-selection bias, not a safety net.
 
-        Each row = [ generated | common-attn (scoring weight, sum-to-1) | min-max gate | hard-mask (>= thr) |
-                     applied damp (x factor2) ].
-          - common-attn: the attention map multiplied into the residual error inside the gender scorer.
-          - min-max gate: (common-attn - min)/(max - min), the value thresholded at thr.
-          - hard-mask: gate >= thr (where damping WOULD apply for a released sample), regardless of release.
-          - applied damp: the region actually multiplied by factor2 this step = (hard-mask AND released);
-            empty for kept (agree) samples. A per-row caption prints t=target, p_ori=pred_gender_ori, release.
+        DTYPE INVARIANT (do not break): the empty and non-empty branches must emit IDENTICAL dtypes -- fp32
+        probs/logits/score/gaps and int64 preds. An fp16/fp32 split between these two branches silently
+        DEADLOCKS the downstream all_gather until the NCCL watchdog fires; that bug has already cost this
+        project a debugging cycle. `score` and `gaps` are NEW gathered tensors, so they are pinned here too.
         """
-        n = min(images.shape[0], common_attn.shape[0], max_imgs)
-        if n == 0:
-            return
-        imgs = images[:n].detach().cpu()
-        common = common_attn[:n].detach().float().cpu()
-        gate = attn_gate[:n].detach().float().cpu()
-        hard = (gate >= thr).float()                                        # [n,H,W] min-max hard mask
-        gmask = scr_grad_mask[:n].detach().float().cpu()
-        if gmask.dim() == 4:
-            gmask = gmask[:, 0]                                             # [n,1,H,W] -> [n,H,W]
-        applied = (gmask < (1.0 - 1e-4)).float()                            # damped iff mask < 1 (== factor2 region)
-        labels = ["generated", "common-attn", "min-max gate", f"hard >= {thr:g}", f"applied x{factor2:g}"]
-        rows = []
-        for i in range(n):
-            t = int(targets[i].item()) if targets is not None else -9
-            p = int(preds_gender_ori[i].item()) if preds_gender_ori is not None else -9
-            rel = bool(release[i].item()) if release is not None else False
-            base_pil = transforms.ToPILImage()(imgs[i].mul(0.5).add(0.5).clamp(0, 1))
-            panels = [
-                base_pil,
-                attmap_overlay_on_image(common[i], imgs[i]),
-                attmap_overlay_on_image(gate[i], imgs[i]),
-                mask_overlay_on_image(hard[i], imgs[i], color=(255, 165, 0)),
-                mask_overlay_on_image(applied[i], imgs[i], color=(0, 220, 255)),
-            ]
-            w, h = base_pil.size
-            row = Image.new("RGB", (w * len(panels), h))
-            for jj, (pl, lab) in enumerate(zip(panels, labels)):
-                pl = pl.resize((w, h)).copy()
-                ImageDraw.Draw(pl).text((5, 5), f"{lab} #{i}", fill="white")
-                row.paste(pl, (jj * w, 0))
-            ImageDraw.Draw(row).text((5, h - 14), f"t={t} p_ori={p} release={rel} damp=x{factor2:g}", fill="yellow")
-            rows.append(row)
-        gw, gh = rows[0].size
-        grid = Image.new("RGB", (gw, gh * len(rows)))
-        for i, r in enumerate(rows):
-            grid.paste(r, (0, i * gh))
-        if os.path.dirname(save_to) and not os.path.exists(os.path.dirname(save_to)):
-            os.makedirs(os.path.dirname(save_to), exist_ok=True)
-        grid.save(save_to, quality=92)
+        z0_sel = z0 if selector is None else z0[selector]
+        n_all = z0.shape[0]
+
+        if z0_sel.shape[0] == 0:
+            logits = torch.empty([0, 2], dtype=torch.float, device=z0.device)
+            probs = torch.empty([0, 2], dtype=torch.float, device=z0.device)
+            preds = torch.empty([0], dtype=torch.int64, device=z0.device)
+            score = torch.empty([0], dtype=torch.float, device=z0.device)
+            gaps = torch.empty([0, P_axes], dtype=torch.float, device=z0.device)
+        else:
+            E = _valence_axis_errors(z0_sel)
+            logits, score, gaps = valence_logits_from_errors(E)
+            probs = torch.softmax(logits, dim=-1)
+            preds = probs.max(dim=-1).indices
+            logits, probs = logits.float(), probs.float()
+            score, gaps = score.float(), gaps.float()
+
+        if selector is None:
+            return preds, probs, logits, score, gaps
+
+        def _scatter(t):
+            out = torch.ones([n_all] + list(t.shape[1:]), dtype=t.dtype, device=t.device) * fill_value
+            out[selector] = t
+            return out
+
+        return _scatter(preds), _scatter(probs), _scatter(logits), _scatter(score), _scatter(gaps)
+
+    # REMOVED FOR VALENCE: compute_gender_attmaps / save_gender_attmap_panels / save_grad_gate_panels.
+    # All three visualised the class-token cross-attention map and the SCR gradient gate derived from it.
+    # Neither exists for a scene-level class: the map cannot be built for these axes (non-contiguous content
+    # words, incommensurable prompt lengths, 4 supports that average to ~uniform -- see the header), and the
+    # spatial SCR gate is gone with it. The per-axis GAP logging in the training loop replaces them as the
+    # diagnostic: it is what actually tells you whether an axis is dead or dominating.
 
     def get_face_gender_test(face_chips, selector=None, fill_value=-1):
         """for the separately-trained CelebA gender *test* classifier (evaluation only).
@@ -2581,50 +2953,134 @@ def main(args):
             return preds_gender, probs_gender, logits_gender
 
     @torch.no_grad()
-    def generate_dynamic_targets(probs, target_ratio=0.5, w_uncertainty=False):
-        """generate dynamic targets for the distributional alignment loss
+    def generate_dynamic_targets(scores, valid, target_ratio=0.5, w_uncertainty=False):
+        """Generate the dynamic 50/50 targets for the distributional alignment loss.
 
         Args:
-            probs (torch.tensor): shape [N,2], N points in a probability simplex of 2 dims
-            target_ratio (float): target distribution, the percentage of class 1 (male)
-            w_uncertainty (True/False): whether return uncertainty measures
-        
-        Returns:
-            targets_all (torch.tensor): target classes
-            uncertainty_all (torch.tensor): uncertainty of target classes
+            scores (torch.tensor): [N] the CONTINUOUS pooled valence score (higher = more POSITIVE).
+            valid  (torch.tensor): [N] bool, which rows participate in the ranking population.
+            target_ratio (float): fraction of the population assigned to class 0 (negative); the top
+                (1 - target_ratio) of the ranking gets class 1 (positive). 0.5 -> a 50/50 split.
+            w_uncertainty: also return the binomial uncertainty of each assigned target.
+
+        Returns targets_all [N] int64 (-1 where not ranked) and, optionally, uncertainty_all [N].
+
+        WHY IT RANKS THE SCORE AND NOT probs[:,1] (this is a real bug fix, not a refactor):
+        probs[:,1] = sigmoid(score / valence_tau) is a strictly increasing function of the score, so the two
+        rankings are MATHEMATICALLY identical -- but fp32 sigmoid returns EXACTLY 1.0 once the logit gap
+        exceeds ~16.6 (and exactly 0.0 below ~-16.6). Ranking on probs therefore manufactures large TIE
+        buckets out of thin air, and argsort breaks those ties by ARRIVAL ORDER, handing opposite 50/50
+        targets to images the scorer considers identical. The continuous score cannot saturate. (The failure
+        is invisible in wandb, because argsort of a tied block still emits a perfect 50/50 count.)
+
+        WHY `valid` IS AN EXPLICIT ARGUMENT: the gender file inferred the ranking population from a `-1`
+        FILL VALUE inside probs. A score is a signed quantity for which -1 is a perfectly legal value, so the
+        sentinel trick is not merely ugly here, it is WRONG. With --valence_face_gate none, `valid` is simply
+        all-True: every image has a valence and participates.
         """
-        idxs_2_rank = (probs!=-1).all(dim=-1)
-        probs_2_rank = probs[idxs_2_rank]
+        idxs_2_rank = valid
+        scores_2_rank = scores[idxs_2_rank]
+        n_rank = scores_2_rank.shape[0]
 
-        rank = torch.argsort(torch.argsort(probs_2_rank[:,1]))
-        targets = (rank >= (rank.shape[0]*target_ratio)).long()
+        targets_all = torch.ones([scores.shape[0]], dtype=torch.long, device=scores.device) * (-1)
+        uncertainty_all = torch.ones([scores.shape[0]], dtype=scores.dtype, device=scores.device) * (-1)
+        if n_rank == 0:
+            return (targets_all, uncertainty_all) if w_uncertainty else targets_all
 
-        targets_all = torch.ones([probs.shape[0]], dtype=torch.long, device=probs.device) * (-1)
+        rank = torch.argsort(torch.argsort(scores_2_rank))
+        targets = (rank >= (n_rank * target_ratio)).long()      # top (1-target_ratio) -> class 1 = POSITIVE
         targets_all[idxs_2_rank] = targets
-        
+
         if w_uncertainty:
-            uncertainty = torch.ones([probs_2_rank.shape[0]], dtype=probs.dtype, device=probs.device) * (-1)
-            uncertainty[targets==1] = torch.tensor(
+            uncertainty = torch.ones([n_rank], dtype=scores.dtype, device=scores.device) * (-1)
+            uncertainty[targets == 1] = torch.tensor(
                 1 - scipy.stats.binom.cdf(
-                    (rank[targets==1]).cpu().numpy(), 
-                    probs_2_rank.shape[0], 
-                    1-target_ratio
+                    (rank[targets == 1]).cpu().numpy(),
+                    n_rank,
+                    1 - target_ratio,
                     )
-                ).to(probs.dtype).to(probs.device)
-            uncertainty[targets==0] = torch.tensor(
+                ).to(scores.dtype).to(scores.device)
+            uncertainty[targets == 0] = torch.tensor(
                 scipy.stats.binom.cdf(
-                    rank[targets==0].cpu().numpy(), 
-                    probs_2_rank.shape[0], 
-                    target_ratio
+                    rank[targets == 0].cpu().numpy(),
+                    n_rank,
+                    target_ratio,
                     )
-                ).to(probs.dtype).to(probs.device)
-            
-            uncertainty_all = torch.ones([probs.shape[0]], dtype=probs.dtype, device=probs.device) * (-1)
+                ).to(scores.dtype).to(scores.device)
             uncertainty_all[idxs_2_rank] = uncertainty
-            
             return targets_all, uncertainty_all
-        else:
-            return targets_all
+        return targets_all
+
+    def err_valence_scores_eval(z0_chunks, seed):
+        """EVAL-ONLY readout of the TRAINING residual-error valence scorer, over ALL IMAGES.
+
+        z0_chunks: list of [n_j,4,H,W] clean latents, in the SAME order they were generated (so the
+        concatenation lines up row-for-row with the concatenated images and therefore, after
+        all_gather + [:val_keep], with images_all / the CLIP predictions).
+        seed: int, the eps seed for THIS call -- see point 3 below. Must differ per (step, prompt,
+        ft/ori, rank), otherwise every scorer call reuses the identical Monte-Carlo draw.
+        Returns (preds [n] int64, probs [n,2] fp32, score [n] fp32, gaps [n,P] fp32), un-scattered.
+
+        NO FACE GATE. `selector=None` is passed as a LITERAL, deliberately NOT the training loop's
+        ternary `selector=(valid_indicators if args.valence_face_gate == "errfd" else None)`. Copying that
+        would (a) fire residual_face_indicators -- 2 extra scoring-UNet forwards per chunk -- and (b) put -1
+        fill rows back into the metrics. Every eval image is scored, which also matches the CLIP eval head's
+        denominator, so errVal/* and the CLIP valence_* keys describe the SAME population and may be compared
+        directly (that comparison is the point: see errVal/agree_with_clip).
+
+        THREE THINGS THIS WRAPPER EXISTS FOR -- do not inline it away:
+        1. torch.no_grad, defensively. get_valence / _valence_axis_errors are UNDECORATED and inherit the
+           caller's grad mode; without no_grad an autograd graph is built across 2*P gradient-checkpointed
+           UNet forwards at batch n*K, per prompt -> OOM. evaluate_process IS decorated @torch.no_grad(), so
+           this inner `with` is currently redundant -- keep it anyway: it makes the helper safe to call from
+           anywhere, and DO NOT "simplify" by moving the decorator off evaluate_process onto this function
+           (that mistake was made once already while writing this, and it silently un-guards ~300 lines).
+        2. attn_capture_ctx reset. Under --valence_axis_attn peraxis (the default) _valence_axis_errors
+           mutates the process-global attn_capture_ctx and resets it with NO try/finally. If the forward
+           raises, `enabled` stays True and EVERY later scoring_unet forward (SRR, errFD, SCR h-space) appends
+           to ctx.store unboundedly -- a recoverable eval OOM would become silent training corruption plus a
+           memory leak. Eval runs mid-training every --evaluate_every_n_iter steps, so that must not happen.
+        3. RNG isolation, NOT merely RNG restore. The scorer burns global CUDA RNG (P*K torch.randn_like
+           draws per chunk; _draw_noise takes no generator argument, so a private torch.Generator cannot be
+           threaded in without editing the training scorer). Left alone it would shift every subsequent
+           training noise draw, so a run WITH this metric would not be step-comparable to one without it.
+           But saving and restoring the state ALONE is a trap: nothing else in the eval prompt loop consumes
+           CUDA RNG (the val noises are drawn once, up in evaluation_step), so every scorer call would
+           re-enter from the byte-identical generator state and draw the SAME eps -- making errVal/gap_ori a
+           worthless "noise floor" (deterministic given the images) and giving the cross-prompt mean zero
+           Monte-Carlo averaging. So: seed explicitly per call, then restore. See err_seed for the tuple the
+           seed is hashed from and why it is hashed rather than stride-mixed.
+        Chunking is the caller's job: pass one chunk per --val_GPU_batch_size generation batch. NOTE this
+        bounds but does NOT equalise memory vs generation -- _valence_axis_errors folds K
+        (--residual_num_timesteps, default 15) into the batch dim, so the scoring UNet runs at
+        val_GPU_batch_size*K (8*15 = 120) against generation's CFG batch of 2*val_GPU_batch_size (16).
+        That is the same scorer batch the training loop already sustains, but scorer memory grows 15x
+        faster than generation memory if --val_GPU_batch_size is raised.
+        """
+        cpu_rng_state = torch.get_rng_state()
+        cuda_rng_state = (
+            torch.cuda.get_rng_state(accelerator.device) if accelerator.device.type == "cuda" else None
+        )
+        preds_l, probs_l, score_l, gaps_l = [], [], [], []
+        try:
+            # INSIDE the try: once this runs the generator is dirty, so every exit path from here on must go
+            # through the finally that restores it.
+            torch.manual_seed(seed)
+            with torch.no_grad():
+                for z0_c in z0_chunks:
+                    preds_c, probs_c, _logits_c, score_c, gaps_c = get_valence(z0_c, selector=None)
+                    preds_l.append(preds_c)
+                    probs_l.append(probs_c)
+                    score_l.append(score_c)
+                    gaps_l.append(gaps_c)
+        finally:
+            attn_capture_ctx.enabled = False
+            attn_capture_ctx.token_idxs = None
+            attn_capture_ctx.store = []
+            torch.set_rng_state(cpu_rng_state)
+            if cuda_rng_state is not None:
+                torch.cuda.set_rng_state(cuda_rng_state, accelerator.device)
+        return torch.cat(preds_l), torch.cat(probs_l), torch.cat(score_l), torch.cat(gaps_l)
 
     @torch.no_grad()
     def evaluate_process(which_text_encoder, which_unet, name, prompts, noises, current_global_step):
@@ -2640,83 +3096,160 @@ def main(args):
             val_keep = min(args.val_images_per_prompt_total, num_images_per_prompt_gathered)
         else:
             val_keep = num_images_per_prompt_gathered
-        for prompt_i, noises_i in itertools.zip_longest(prompts, noises):
+
+        # EVAL READOUT OF THE TRAINING SCORER (--eval_err_valence). Scored over ALL images: the errFD face
+        # gate that restricts the train_* valence metrics is deliberately NOT applied here (see
+        # err_valence_scores_eval). These flags are constant across prompts, so every logs_i gets the SAME
+        # key set -- required by the cross-prompt averaging loop at the bottom of this function, which does
+        # logs[0].keys() and then indexes every log with it.
+        score_err_gen = args.eval_err_valence in ("generated", "both")
+        score_err_ori = args.eval_err_valence == "both"
+
+        def err_seed(prompt_idx, which):
+            """Reproducible, INDEPENDENT eps seed per (run, eval arm, step, prompt, ft/ori, rank).
+
+            Independence along every axis is what makes the readout statistically useful: across steps so the
+            curve is not one frozen draw; across prompts so the cross-prompt mean actually averages MC noise
+            down; across ft/ori so errVal/gap_ori is a genuine noise floor rather than the same draw replayed;
+            across ranks so the gathered population is not N copies of one noise pattern; across `name` so a
+            re-enabled "main" arm does not share eps with "EMA".
+
+            HASHED, NOT STRIDE-MIXED, ON PURPOSE. The obvious `a*A + b*B + c*C + rank` form silently aliases
+            as soon as one stride is smaller than the range of the term below it -- e.g. a ft/ori stride of 7
+            collides with rank at 8 GPUs, so rank 7's finetuned draw and rank 0's original draw become the
+            same eps stream and the "noise floor" quietly correlates with the thing it is supposed to be a
+            floor for. sha256 over the tuple has no strides to get wrong at any world size or prompt count.
+            hashlib (not the builtin hash()) because PYTHONHASHSEED randomises str hashing per process --
+            builtin hash would make this neither reproducible across runs nor consistent across ranks.
+            """
+            key = f"{args.seed}|{name}|{int(current_global_step)}|{int(prompt_idx)}|{which}|{int(accelerator.process_index)}"
+            # 63-bit, comfortably inside torch's int64 seed range. 32 bits would be enough for correctness
+            # but not for comfort: a full run reaches O(1e5) distinct (step, prompt, arm, rank) tuples, where
+            # the birthday rate at 32 bits is already ~1 expected collision.
+            return int(hashlib.sha256(key.encode("utf-8")).hexdigest()[:16], 16) % (2**63 - 1)
+
+        for prompt_idx, (prompt_i, noises_i) in enumerate(itertools.zip_longest(prompts, noises)):
             if accelerator.is_main_process:
                 logs_i = {
-                    "gender_gap": [],
-                    "gender_gap_abs": [],
-                    "gender_pred_between_0.2_0.8": [],
+                    "valence_gap": [],
+                    "valence_gap_abs": [],
+                    "valence_pred_between_0.2_0.8": [],
                     "CLIP-T": [],
                     "CLIP-I": [],
                     "DINO": [],
                 }
+                if score_err_gen:
+                    # NOT a debias result -- the training objective re-evaluated on held-out prompts. Namespaced
+                    # under "errVal/" so wandb renders it in its own panel group and it can never be mistaken
+                    # for the independent CLIP number sitting next to it (eval_<name>_valence_gap).
+                    logs_i["errVal/gap"] = []
+                    logs_i["errVal/gap_abs"] = []
+                    logs_i["errVal/pred_between_0.2_0.8"] = []
+                    logs_i["errVal/score_mean"] = []
+                    logs_i["errVal/score_std"] = []
+                    # THE REWARD-HACKING TELL. The CLIP head and this scorer run on the SAME rows, so their
+                    # disagreement is measurable directly. errVal/gap -> 0 while the CLIP valence_gap stays
+                    # large == the model is winning the residual scorer without changing what the images look
+                    # like. Nothing else logged by this file can show that.
+                    logs_i["errVal/agree_with_clip"] = []
+                    logs_i["errVal/gap_minus_clip_gap"] = []
+                    for _ax in valence_axes:
+                        # RAW per-axis gap g_p = E_neg - E_pos. Diagnostic for a DEAD axis (|mean| ~ 0, |corr|
+                        # ~ 0) or a DOMINATING one. Raw gaps are NOT commensurable across axes...
+                        logs_i[f"errVal/gap_{_ax['name']}_mean"] = []
+                        logs_i[f"errVal/gap_{_ax['name']}_std"] = []
+                        logs_i[f"errVal/gap_{_ax['name']}_corr_pooled"] = []
+                        # ...so also log the STANDARDISED z_p = (g_p - m_p)/s_p. That is what actually enters
+                        # the pooled score, and it is the only per-axis quantity comparable across axes and
+                        # across runs -- i.e. the one that reveals --valence_axis_scale calibration drift on
+                        # the eval distribution.
+                        logs_i[f"errVal/z_{_ax['name']}_mean"] = []
+                if score_err_ori:
+                    # NOISE FLOOR / CONTROL. Frozen weights + fixed prompts, so this is constant in
+                    # expectation across training; any drift in it is Monte-Carlo noise from the scorer's
+                    # fresh eps draw. The delta is the interpretable quantity, the absolute gap is not.
+                    logs_i["errVal/gap_ori"] = []
+                    logs_i["errVal/gap_delta_ft_minus_ori"] = []
                 log_imgs_i = {}
             ################################################
             # step 1: generate all ori images
             images_ori = []
+            # One z0 chunk per generation batch, appended in generation order so the concatenation stays
+            # row-aligned with images_ori (and so the scorer's peak memory tracks val_GPU_batch_size).
+            z0s_ori = []
             N = math.ceil(noises_i.shape[0] / args.val_GPU_batch_size)
             for j in range(N):
                 noises_ij = noises_i[args.val_GPU_batch_size*j:args.val_GPU_batch_size*(j+1)]
                 if args.train_text_encoder and args.train_unet:
-                    images_ij = generate_image_no_gradient(prompt_i, noises_ij, num_denoising_steps, which_text_encoder=eval_text_encoder, which_unet=eval_unet, skip_denoise_frac=0.0)
+                    out_ij = generate_image_no_gradient(prompt_i, noises_ij, num_denoising_steps, which_text_encoder=eval_text_encoder, which_unet=eval_unet, return_latents=score_err_ori, skip_denoise_frac=0.0)
                 elif args.train_text_encoder and not args.train_unet:
-                    images_ij = generate_image_no_gradient(prompt_i, noises_ij, num_denoising_steps, which_text_encoder=eval_text_encoder, which_unet=unet, skip_denoise_frac=0.0)
+                    out_ij = generate_image_no_gradient(prompt_i, noises_ij, num_denoising_steps, which_text_encoder=eval_text_encoder, which_unet=unet, return_latents=score_err_ori, skip_denoise_frac=0.0)
                 elif not args.train_text_encoder and args.train_unet:
-                    images_ij = generate_image_no_gradient(prompt_i, noises_ij, num_denoising_steps, which_text_encoder=text_encoder, which_unet=eval_unet, skip_denoise_frac=0.0)
+                    out_ij = generate_image_no_gradient(prompt_i, noises_ij, num_denoising_steps, which_text_encoder=text_encoder, which_unet=eval_unet, return_latents=score_err_ori, skip_denoise_frac=0.0)
+                if score_err_ori:
+                    images_ij, z0_ori_ij = out_ij
+                    z0s_ori.append(z0_ori_ij)
+                else:
+                    images_ij = out_ij
                 images_ori.append(images_ij)
             images_ori = torch.cat(images_ori)
-            face_indicators_ori, face_bboxs_ori, face_chips_ori, face_landmarks_ori, aligned_face_chips_ori = get_face(images_ori)
-            preds_gender_ori, probs_gender_ori, logits_gender_ori = get_face_gender_test(face_chips_ori, selector=face_indicators_ori, fill_value=-1)
 
+            # VALENCE: no insightface, no face chips, no CelebA gender classifier. The valence head is a
+            # zero-shot CLIP head that lives on rank 0 and scores the FULL image, so it runs AFTER the
+            # all-gather (below) -- which also means 4 of the old per-rank all_gather calls disappear.
+            # Removing the face gate is what makes this safe: the gathered shapes/dtypes no longer depend on
+            # per-rank detection outcomes, which is the structural cause of the NCCL deadlock class this
+            # project has already hit twice.
             images_ori_all = customized_all_gather(images_ori, accelerator, return_tensor_other_processes=False)
-            face_indicators_ori_all = customized_all_gather(face_indicators_ori, accelerator, return_tensor_other_processes=False)
-            face_bboxs_ori_all = customized_all_gather(face_bboxs_ori, accelerator, return_tensor_other_processes=False)
-            preds_gender_ori_all = customized_all_gather(preds_gender_ori, accelerator, return_tensor_other_processes=False)
-            probs_gender_ori_all = customized_all_gather(probs_gender_ori, accelerator, return_tensor_other_processes=False)
+            images_ori_all = images_ori_all[:val_keep]   # see --val_images_per_prompt_total
 
-            # keep only the first val_keep gathered images (see --val_images_per_prompt_total)
-            images_ori_all = images_ori_all[:val_keep]
-            face_indicators_ori_all = face_indicators_ori_all[:val_keep]
-            face_bboxs_ori_all = face_bboxs_ori_all[:val_keep]
-            preds_gender_ori_all = preds_gender_ori_all[:val_keep]
-            probs_gender_ori_all = probs_gender_ori_all[:val_keep]
+            # ORI-side training-scorer readout (--eval_err_valence both). Scoring and the all_gather run on
+            # EVERY rank -- never inside an is_main_process guard. evaluate_process has no barrier, so a
+            # collective entered by rank 0 alone hangs the job until the NCCL watchdog fires. Truncate to
+            # val_keep AFTER the gather so rows stay aligned with images_ori_all.
+            if score_err_ori:
+                _, probs_ev_ori, _, _ = err_valence_scores_eval(z0s_ori, err_seed(prompt_idx, "ori"))
+                probs_ev_ori_all = customized_all_gather(probs_ev_ori, accelerator, return_tensor_other_processes=False)[:val_keep]
 
             if accelerator.is_main_process:
+                preds_valence_ori_all, probs_valence_ori_all = get_valence_test(images_ori_all)
                 save_to = os.path.join(args.imgs_save_dir, f"eval_{name}_{global_step}_{prompt_i}_ori.jpg")
                 plot_in_grid(
-                    images_ori_all, 
-                    save_to, 
-                    face_indicators=face_indicators_ori_all, face_bboxs=face_bboxs_ori_all, 
-                    preds_gender=preds_gender_ori_all,
-                    pred_class_probs_gender=probs_gender_ori_all.max(dim=-1).values,
+                    images_ori_all,
+                    save_to,
+                    preds_class=preds_valence_ori_all,
+                    pred_class_probs=probs_valence_ori_all.max(dim=-1).values,
                 )
 
                 log_imgs_i["img_ori"] = [save_to]
 
             
             images = []
+            z0s = []   # one chunk per generation batch, in generation order (see z0s_ori above)
             N = math.ceil(noises_i.shape[0] / args.val_GPU_batch_size)
             for j in range(N):
                 noises_ij = noises_i[args.val_GPU_batch_size*j:args.val_GPU_batch_size*(j+1)]
-                images_ij = generate_image_no_gradient(prompt_i, noises_ij, num_denoising_steps, which_text_encoder=which_text_encoder, which_unet=which_unet, skip_denoise_frac=0.0)
+                if score_err_gen:
+                    images_ij, z0_ij = generate_image_no_gradient(prompt_i, noises_ij, num_denoising_steps, which_text_encoder=which_text_encoder, which_unet=which_unet, return_latents=True, skip_denoise_frac=0.0)
+                    z0s.append(z0_ij)
+                else:
+                    images_ij = generate_image_no_gradient(prompt_i, noises_ij, num_denoising_steps, which_text_encoder=which_text_encoder, which_unet=which_unet, skip_denoise_frac=0.0)
                 images.append(images_ij)
             images = torch.cat(images)
-            
-            face_indicators, face_bboxs, face_chips, face_landmarks, aligned_face_chips = get_face(images)
-            preds_gender, probs_gender, logits_gender = get_face_gender_test(face_chips, selector=face_indicators, fill_value=-1)
 
             images_all = customized_all_gather(images, accelerator, return_tensor_other_processes=False)
-            face_indicators_all = customized_all_gather(face_indicators, accelerator, return_tensor_other_processes=False)
-            face_bboxs_all = customized_all_gather(face_bboxs, accelerator, return_tensor_other_processes=False)
-            preds_gender_all = customized_all_gather(preds_gender, accelerator, return_tensor_other_processes=False)
-            probs_gender_all = customized_all_gather(probs_gender, accelerator, return_tensor_other_processes=False)
+            images_all = images_all[:val_keep]   # see --val_images_per_prompt_total
 
-            # keep only the first val_keep gathered images (see --val_images_per_prompt_total)
-            images_all = images_all[:val_keep]
-            face_indicators_all = face_indicators_all[:val_keep]
-            face_bboxs_all = face_bboxs_all[:val_keep]
-            preds_gender_all = preds_gender_all[:val_keep]
-            probs_gender_all = probs_gender_all[:val_keep]
+            # FINETUNED-side training-scorer readout (--eval_err_valence generated|both), over ALL images --
+            # no face gate. All ranks score and gather; truncate to val_keep afterwards so the rows line up
+            # with images_all and hence with the CLIP predictions computed from it on rank 0. get_valence
+            # pins fp32/int64 in the selector=None branch, so the gathered dtypes are rank-uniform.
+            if score_err_gen:
+                preds_ev, probs_ev, scores_ev, gaps_ev = err_valence_scores_eval(z0s, err_seed(prompt_idx, "ft"))
+                preds_ev_all = customized_all_gather(preds_ev, accelerator, return_tensor_other_processes=False)[:val_keep]
+                probs_ev_all = customized_all_gather(probs_ev, accelerator, return_tensor_other_processes=False)[:val_keep]
+                scores_ev_all = customized_all_gather(scores_ev, accelerator, return_tensor_other_processes=False)[:val_keep]
+                gaps_ev_all = customized_all_gather(gaps_ev, accelerator, return_tensor_other_processes=False)[:val_keep]
 
             ################################################
             # eval fidelity / text-alignment metrics (CLIP-T, CLIP-I, DINO) are ALL computed on the
@@ -2727,25 +3260,97 @@ def main(args):
             # (same noises_i, same order).
 
             if accelerator.is_main_process:
+                preds_valence_all, probs_valence_all = get_valence_test(images_all)
                 save_to = os.path.join(args.imgs_save_dir, f"eval_{name}_{global_step}_{prompt_i}_generated.jpg")
                 plot_in_grid(
-                    images_all, 
-                    save_to, 
-                    face_indicators=face_indicators_all, 
-                    face_bboxs=face_bboxs_all, 
-                    preds_gender=preds_gender_all,
-                    pred_class_probs_gender=probs_gender_all.max(dim=-1).values,
+                    images_all,
+                    save_to,
+                    preds_class=preds_valence_all,
+                    pred_class_probs=probs_valence_all.max(dim=-1).values,
                     )
 
                 log_imgs_i["img_generated"] = [save_to]
-            
+
             if accelerator.is_main_process:
-                probs_tmp = probs_gender_all[(probs_gender_all!=-1).all(dim=-1)]
-                gender_gap = (((probs_tmp[:,1]>=0.5)*(probs_tmp[:,1]<=1)).float().mean() - ((probs_tmp[:,1]>=0)*(probs_tmp[:,1]<=0.5)).float().mean()).item()
-                gender_pred_between_02_08 = ((probs_tmp[:,1]>=0.2)*(probs_tmp[:,1]<=0.8)).float().mean().item()
-                logs_i["gender_gap"].append(gender_gap)
-                logs_i["gender_gap_abs"].append(abs(gender_gap))
-                logs_i["gender_pred_between_0.2_0.8"].append(abs(gender_pred_between_02_08))
+                # NOTE the missing `-1` filter: the gender file dropped the fill-value rows here, which
+                # silently made the metric DENOMINATOR "images with a detected face" rather than "images".
+                # Every image has a valence, so the denominator is now every image -- an intentional
+                # semantic change, and the reason the debias numbers are not comparable to a gender run.
+                p_pos = probs_valence_all[:, 1]                                  # P(positive)
+                valence_gap = ((p_pos >= 0.5).float().mean() - (p_pos < 0.5).float().mean()).item()
+                valence_between = ((p_pos >= 0.2) * (p_pos <= 0.8)).float().mean().item()
+                logs_i["valence_gap"].append(valence_gap)
+                logs_i["valence_gap_abs"].append(abs(valence_gap))
+                logs_i["valence_pred_between_0.2_0.8"].append(valence_between)
+
+                # ---------------------------------------------------------------------------------
+                # TRAINING-SCORER READOUT (--eval_err_valence). ALL IMAGES, NO FACE GATE.
+                # ---------------------------------------------------------------------------------
+                # WHAT THIS IS: the residual-error valence head the training loss is built on, re-run on the
+                # validation generations. It is a DIAGNOSTIC OF THE OPTIMISER, never a debias result -- the
+                # optimiser is directly pushing on this quantity. Every bias claim must come from
+                # valence_gap above (the independent zero-shot CLIP head; see the get_valence_test docstring).
+                #
+                # WHY THE DENOMINATOR DIFFERS FROM train_valence_gap: the training loop restricts its valence
+                # metrics to errFD face-detected rows (--valence_face_gate default errfd) and scatters the
+                # rest to a -1 fill value. Here every image is scored (selector=None), so there are no fill
+                # rows to mask out and the mean runs over all val_keep images -- matching the CLIP eval
+                # convention directly above. Three further differences make
+                # "train_valence_gap - errVal/gap" NOT a generalisation gap: eval uses held-out test
+                # occupations, EMA rather than live weights, and a different sample size.
+                if score_err_gen:
+                    p_pos_e = probs_ev_all[:, 1]                                 # P(positive), training scorer
+                    err_gap = ((p_pos_e >= 0.5).float().mean() - (p_pos_e < 0.5).float().mean()).item()
+                    logs_i["errVal/gap"].append(err_gap)
+                    logs_i["errVal/gap_abs"].append(abs(err_gap))
+                    logs_i["errVal/pred_between_0.2_0.8"].append(
+                        ((p_pos_e >= 0.2) * (p_pos_e <= 0.8)).float().mean().item()
+                    )
+                    # Standardised units: score = sum_p w_p * (g_p - m_p)/s_p, so these move with
+                    # --valence_axis_scale / --valence_axis_center and are not comparable across
+                    # differently-calibrated runs. Same caveat applies to pred_between_0.2_0.8, which is a
+                    # pure function of --valence_tau (a scorer-confidence readout, not a fairness number).
+                    logs_i["errVal/score_mean"].append(scores_ev_all.float().mean().item())
+                    logs_i["errVal/score_std"].append(
+                        scores_ev_all.float().std().item() if scores_ev_all.numel() > 1 else 0.0
+                    )
+                    # AGREEMENT WITH THE INDEPENDENT HEAD. Legal only because both heads scored the identical,
+                    # identically-ordered rows (images_all, post-gather, post-val_keep). A falling agreement
+                    # while errVal/gap improves is the signature of the model gaming its own scorer.
+                    logs_i["errVal/agree_with_clip"].append(
+                        (preds_ev_all == preds_valence_all).float().mean().item()
+                    )
+                    logs_i["errVal/gap_minus_clip_gap"].append(err_gap - valence_gap)
+
+                    # PER-AXIS HEALTH. A DEAD axis: |mean gap| ~ 0, std ~ the Monte-Carlo noise floor,
+                    # |corr_pooled| ~ 0. A DOMINATING axis: |gap| an order of magnitude above the others.
+                    # This project has twice shipped a scorer that carried no signal; per-component logging
+                    # is the only thing that would have caught it.
+                    _score_e = scores_ev_all.float()
+                    _z_e = (gaps_ev_all.float() - valence_center.view(1, -1)) / valence_scale.view(1, -1)
+                    for _p, _ax in enumerate(valence_axes):
+                        _g = gaps_ev_all[:, _p].float()
+                        logs_i[f"errVal/gap_{_ax['name']}_mean"].append(_g.mean().item() if _g.numel() > 0 else 0.0)
+                        logs_i[f"errVal/gap_{_ax['name']}_std"].append(_g.std().item() if _g.numel() > 1 else 0.0)
+                        if _g.numel() > 1 and _g.std() > 0 and _score_e.std() > 0:
+                            _c = torch.corrcoef(torch.stack([_g, _score_e]))[0, 1].item()
+                        else:
+                            _c = 0.0
+                        logs_i[f"errVal/gap_{_ax['name']}_corr_pooled"].append(_c)
+                        logs_i[f"errVal/z_{_ax['name']}_mean"].append(
+                            _z_e[:, _p].mean().item() if _z_e.shape[0] > 0 else 0.0
+                        )
+
+                if score_err_ori:
+                    # The frozen model on the same prompts/noises: constant in expectation, so it is the
+                    # noise floor. The scorer redraws eps on every call, so errVal/gap alone is stochastic
+                    # even on fixed images -- the DELTA is what carries the training signal.
+                    p_pos_e_ori = probs_ev_ori_all[:, 1]
+                    err_gap_ori = (
+                        (p_pos_e_ori >= 0.5).float().mean() - (p_pos_e_ori < 0.5).float().mean()
+                    ).item()
+                    logs_i["errVal/gap_ori"].append(err_gap_ori)
+                    logs_i["errVal/gap_delta_ft_minus_ori"].append(err_gap - err_gap_ori)
 
                 # CLIP-T / CLIP-I / DINO via open_clip bigG + eval DINOv2 on the MAIN PROCESS ONLY,
                 # over the already all-gathered & val_keep-truncated images_all / images_ori_all
@@ -2841,21 +3446,35 @@ def main(args):
         images_new = torch.cat(images_new)
         return images_new
     
-    def gen_dynamic_weights(face_indicators, targets, preds_gender_ori, probs_gender_ori, factor=0.2):
-        weights = []
-        for face_indicator, target, pred_gender_ori, prob_gender_ori in itertools.zip_longest(face_indicators, targets, preds_gender_ori, probs_gender_ori):
-            if (face_indicator == False).all():
-                weights.append(1)
-            else:
-                if target==-1:
-                    weights.append(factor)
-                elif target==pred_gender_ori:
-                    weights.append(1)
-                elif target!=pred_gender_ori:
-                    weights.append(factor)
+    def gen_dynamic_weights(valid_indicators, targets, preds_ori, factor=0.2):
+        """Per-sample scalar on the SCR image-preservation loss.
 
-        weights = torch.tensor(weights, dtype=probs_gender_ori.dtype, device=probs_gender_ori.device)
-        return weights
+        RELEASED samples -- those the fair loss wants to CHANGE (target != pred_ori) or that are too
+        uncertain to have a target (target == -1) -- get their preservation loss damped to `factor`, so the
+        model is allowed to move them. Samples already on target keep weight 1 (preserve them fully).
+
+        This is now the SINGLE release damping. The gender file additionally damped the SAME release set
+        spatially by factor2 inside the attention region (0.2 x 0.2 = 0.04 of the kept gradient); that
+        spatial gate is gone for valence (there is no coherent region for a scene-level class).
+
+        BEHAVIOUR CHANGE vs the gender file, stated explicitly: its no-face branch returned weight 1
+        UNCONDITIONALLY, i.e. a no-face image had its preservation loss fully applied and BYPASSED the
+        flip/uncertain damping entirely. With --valence_face_gate none every sample is valid, so that bypass
+        no longer fires and every released sample is actually released. `valid_indicators` is kept only so
+        --valence_face_gate errfd reproduces the old behaviour exactly.
+        """
+        weights = []
+        for valid, target, pred_ori in itertools.zip_longest(valid_indicators, targets, preds_ori):
+            if (valid == False).all():
+                weights.append(1)                       # not scored -> nothing to release
+            elif target == -1:                          # too uncertain to have a target -> release
+                weights.append(factor)
+            elif target == pred_ori:                    # already on target -> preserve fully
+                weights.append(1)
+            else:                                       # flip -> release
+                weights.append(factor)
+
+        return torch.tensor(weights, dtype=weight_dtype, device=accelerator.device)
 
     def model_sanity_print(model, state):
         params = [p for p in model.parameters()]
@@ -3020,10 +3639,17 @@ def main(args):
                     "loss_SRR": [],
                     "loss_SCR": [],
                     "loss": [],
-                    "gender_gap": [],
-                    "gender_gap_abs": [],
-                    "gender_pred_between_0.2_0.8": [],
+                    "valence_gap": [],
+                    "valence_gap_abs": [],
+                    "valence_pred_between_0.2_0.8": [],
                 }
+                # PER-AXIS diagnostics. Without these, a dead axis or a single dominating axis is invisible:
+                # the aggregate loss curve looks the same either way, which is exactly how this project's two
+                # previous non-discriminative scorers survived entire training runs unnoticed.
+                for _ax in valence_axes:
+                    logs_i[f"gap_{_ax['name']}_mean"] = []
+                    logs_i[f"gap_{_ax['name']}_std"] = []
+                    logs_i[f"gap_{_ax['name']}_corr_pooled"] = []
                 log_imgs_i = {}
 
             num_denoising_steps = random.choices(range(19,24), k=1)
@@ -3044,60 +3670,81 @@ def main(args):
                 images = torch.cat(images)
                 z0 = torch.cat(z0s)
 
-                # NODETECTOR: residual-error face indicator on z0 replaces insightface get_face(images).
-                # face_bboxs become fill_value(-1) dummies -- they were only consumed by plot_in_grid.
-                face_indicators = residual_face_indicators(z0)
-                face_bboxs = torch.ones([face_indicators.shape[0], 4], dtype=torch.long, device=images.device) * (-1)
-                preds_gender, probs_gender, logits_gender = get_face_gender(z0, selector=face_indicators, fill_value=-1)
+                # VALENCE: by DEFAULT (--valence_face_gate errfd) only face-detected images are scored and
+                # participate; get_valence scatters non-face rows to the -1 fill value. --valence_face_gate
+                # none scores EVERY image instead (valid_indicators all-True, no -1 rows).
+                valid_indicators = valence_valid_indicators(z0)
+                preds_val, probs_val, logits_val, score_val, gaps_val = get_valence(
+                    z0, selector=(valid_indicators if args.valence_face_gate == "errfd" else None), fill_value=-1
+                )
 
-                face_indicators_all, face_indicators_others = customized_all_gather(face_indicators, accelerator, return_tensor_other_processes=True)
-                accelerator.print(f"\tNum faces detected (residual errFD, no detector): {face_indicators_all.sum().item()}/{face_indicators_all.shape[0]}.")
-                
                 images_all = customized_all_gather(images, accelerator, return_tensor_other_processes=False)
-                face_bboxs_all = customized_all_gather(face_bboxs, accelerator, return_tensor_other_processes=False)
-                preds_gender_all = customized_all_gather(preds_gender, accelerator, return_tensor_other_processes=False)
-                probs_gender_all = customized_all_gather(probs_gender, accelerator, return_tensor_other_processes=False)
-                if accelerator.is_main_process and args.save_noface_imgs:
-                    # NODETECTOR: dump every current-model generation the errFD marked NO-FACE (all ranks,
-                    # gathered) so false negatives can be eyeballed. One JPG per image.
-                    save_noface_images(
-                        images_all, face_indicators_all,
-                        os.path.join(args.noface_imgs_save_dir, "train"),
-                        f"train_step{global_step}_{_sanitize_tag(prompt_i)}",
-                    )
+                preds_val_all = customized_all_gather(preds_val, accelerator, return_tensor_other_processes=False)
+                probs_val_all = customized_all_gather(probs_val, accelerator, return_tensor_other_processes=False)
+                # the ranking key must reach rank 0, so the pooled score is now a GATHERED tensor too
+                score_val_all = customized_all_gather(score_val, accelerator, return_tensor_other_processes=False)
+                gaps_val_all = customized_all_gather(gaps_val, accelerator, return_tensor_other_processes=False)
+                valid_all = customized_all_gather(valid_indicators, accelerator, return_tensor_other_processes=False)
+                if args.valence_face_gate == "errfd":
+                    accelerator.print(f"\tNum faces detected (errFD gate): {valid_all.sum().item()}/{valid_all.shape[0]}.")
 
                 if accelerator.is_main_process:
                     if step % args.train_plot_every_n_iter == 0:
                         save_to = os.path.join(args.imgs_save_dir, f"train-{global_step}_generated.jpg")
-                        plot_in_grid(images_all, save_to, face_indicators=face_indicators_all, face_bboxs=face_bboxs_all, preds_gender=preds_gender_all, pred_class_probs_gender=probs_gender_all.max(dim=-1).values)
-
+                        plot_in_grid(images_all, save_to, preds_class=preds_val_all,
+                                     pred_class_probs=probs_val_all.max(dim=-1).values)
                         log_imgs_i["img_generated"] = [save_to]
 
-                        if args.save_attn_maps:
-                            # gender-classification cross-attention maps for this process's generated batch
-                            attmap_save_to = os.path.join(args.imgs_save_dir, f"train-{global_step}_attmap.jpg")
-                            save_gender_attmap_panels(z0, images, attmap_save_to)
-                            log_imgs_i["attmap_generated"] = [attmap_save_to]
-
                 if accelerator.is_main_process:
-                    probs_tmp = probs_gender_all[(probs_gender_all!=-1).all(dim=-1)]
-                    gender_gap = (((probs_tmp[:,1]>=0.5)*(probs_tmp[:,1]<=1)).float().mean() - ((probs_tmp[:,1]>=0)*(probs_tmp[:,1]<=0.5)).float().mean()).item()
-                    gender_pred_between_02_08 = ((probs_tmp[:,1]>=0.2)*(probs_tmp[:,1]<=0.8)).float().mean().item()
-                    logs_i["gender_gap"].append(gender_gap)
-                    logs_i["gender_gap_abs"].append(abs(gender_gap))
-                    logs_i["gender_pred_between_0.2_0.8"].append(gender_pred_between_02_08)
+                    # Restrict every logged metric to the SCORED population. Under --valence_face_gate errfd
+                    # (default) get_valence scatters non-face rows to the -1 fill value, and a -1 must NOT enter
+                    # any statistic below: as a prob it reads "negative" (biasing valence_gap), and as a gap /
+                    # score it poisons the per-axis mean/std/corr. valid_all (the gather of the face mask) is
+                    # the correct "which rows are real" selector -- filtering on `!= -1` would be wrong because
+                    # a real gap/score of -1 is legal. Under --valence_face_gate none valid_all is all-True, so
+                    # this filter is a no-op and the numbers match the un-gated run exactly.
+                    _m = valid_all.bool()
+                    _nsc = int(_m.sum().item())
+                    p_pos = probs_val_all[_m][:, 1] if _nsc > 0 else probs_val_all[:0, 1]
+                    valence_gap = (
+                        ((p_pos >= 0.5).float().mean() - (p_pos < 0.5).float().mean()).item() if _nsc > 0 else 0.0
+                    )
+                    logs_i["valence_gap"].append(valence_gap)
+                    logs_i["valence_gap_abs"].append(abs(valence_gap))
+                    logs_i["valence_pred_between_0.2_0.8"].append(
+                        ((p_pos >= 0.2) * (p_pos <= 0.8)).float().mean().item() if _nsc > 0 else 0.0
+                    )
+                    # PER-AXIS DIAGNOSTICS -- the whole point of logging these. A DEAD axis shows up as
+                    # |mean gap| ~ 0 with std ~ the Monte-Carlo noise floor and |corr| ~ 0 with the pooled
+                    # score; a DOMINATING axis shows up as a |gap| an order of magnitude above the others.
+                    # This project's two previous dead scorers hid behind a flat aggregate loss curve for
+                    # entire training runs precisely because no per-component signal was ever logged.
+                    _score_m = score_val_all[_m].float() if _nsc > 0 else score_val_all[:0].float()
+                    for _p, _ax in enumerate(valence_axes):
+                        _g = gaps_val_all[_m][:, _p].float() if _nsc > 0 else gaps_val_all[:0, _p].float()
+                        logs_i[f"gap_{_ax['name']}_mean"].append(_g.mean().item() if _g.numel() > 0 else 0.0)
+                        logs_i[f"gap_{_ax['name']}_std"].append(_g.std().item() if _g.numel() > 1 else 0.0)
+                        if _g.numel() > 1 and _g.std() > 0 and _score_m.std() > 0:
+                            _c = torch.corrcoef(torch.stack([_g, _score_m]))[0, 1].item()
+                        else:
+                            _c = 0.0
+                        logs_i[f"gap_{_ax['name']}_corr_pooled"].append(_c)
 
                 ################################################
-                # Step 2: generate dynamic targets 
-                # also broadcast from process idx 0, just in case targets_all computed might be different on different processes
-                targets_all, uncertainty_all = generate_dynamic_targets(probs_gender_all, w_uncertainty=True)
+                # Step 2: generate dynamic targets
+                # Ranked on the CONTINUOUS pooled score, not on probs[:,1] -- see generate_dynamic_targets.
+                # Still broadcast from rank 0, so every rank uses byte-identical targets.
+                targets_all, uncertainty_all = generate_dynamic_targets(
+                    score_val_all, valid_all, target_ratio=0.5, w_uncertainty=True
+                )
                 torch.distributed.broadcast(targets_all, src=0)
                 torch.distributed.broadcast(uncertainty_all, src=0)
 
                 targets_all[uncertainty_all>args.uncertainty_threshold] = -1
-                targets = targets_all[probs_gender.shape[0]*(accelerator.local_process_index):probs_gender.shape[0]*(accelerator.local_process_index+1)]
-                uncertainty = uncertainty_all[probs_gender.shape[0]*(accelerator.local_process_index):probs_gender.shape[0]*(accelerator.local_process_index+1)]
-                accelerator.print(f"\tNum faces to compute grads: {(targets_all!=-1).sum().item()}/{targets_all.shape[0]}")
+                _n_local = preds_val.shape[0]
+                targets = targets_all[_n_local*(accelerator.local_process_index):_n_local*(accelerator.local_process_index+1)]
+                uncertainty = uncertainty_all[_n_local*(accelerator.local_process_index):_n_local*(accelerator.local_process_index+1)]
+                accelerator.print(f"\tNum samples to compute grads: {(targets_all!=-1).sum().item()}/{targets_all.shape[0]}")
 
                 ################################################
                 # Step 3: generate all original images using the original diffusion model
@@ -3119,25 +3766,26 @@ def main(args):
                 images_ori = torch.cat(images_ori)
                 z0_ori = torch.cat(z0_ori_list)
 
-                # NODETECTOR: residual-error face indicator on z0_ori replaces insightface get_face(images_ori).
-                face_indicators_ori = residual_face_indicators(z0_ori)
-                face_bboxs_ori = torch.ones([face_indicators_ori.shape[0], 4], dtype=torch.long, device=images_ori.device) * (-1)
-                preds_gender_ori, probs_gender_ori, logits_gender_ori = get_face_gender(z0_ori, selector=face_indicators_ori, fill_value=-1)
+                # VALENCE of the ORIGINAL (frozen-model) images. preds_valence_ori is the "where the sample
+                # currently sits" reference that decides the SCR release set (flip vs keep) below.
+                valid_indicators_ori = valence_valid_indicators(z0_ori)
+                preds_val_ori, probs_val_ori, logits_val_ori, score_val_ori, gaps_val_ori = get_valence(
+                    z0_ori, selector=(valid_indicators_ori if args.valence_face_gate == "errfd" else None), fill_value=-1
+                )
 
                 # SCR: the image loss no longer uses CLIP/DINO features; it is computed in Step 4 from the
                 # FROZEN scoring UNet's mid_block (h-space) on re-noised z0_ori vs z0_ft. (CLIP-I / DINO-I are
                 # still computed as eval metrics.) z0_ori (the detached SCR target) is already retained above.
 
                 images_ori_all = customized_all_gather(images_ori, accelerator, return_tensor_other_processes=False)
-                face_indicators_ori_all = customized_all_gather(face_indicators_ori, accelerator, return_tensor_other_processes=False)
-                face_bboxs_ori_all = customized_all_gather(face_bboxs_ori, accelerator, return_tensor_other_processes=False)
-                preds_gender_ori_all = customized_all_gather(preds_gender_ori, accelerator, return_tensor_other_processes=False)
-                probs_gender_ori_all = customized_all_gather(probs_gender_ori, accelerator, return_tensor_other_processes=False)
+                preds_val_ori_all = customized_all_gather(preds_val_ori, accelerator, return_tensor_other_processes=False)
+                probs_val_ori_all = customized_all_gather(probs_val_ori, accelerator, return_tensor_other_processes=False)
 
                 if accelerator.is_main_process:
                     if step % args.train_plot_every_n_iter == 0:
                         save_to = os.path.join(args.imgs_save_dir, f"train-{global_step}_ori.jpg")
-                        plot_in_grid(images_ori_all, save_to, face_indicators=face_indicators_ori_all, face_bboxs=face_bboxs_ori_all, preds_gender=preds_gender_ori_all, pred_class_probs_gender=probs_gender_ori_all.max(dim=-1).values)
+                        plot_in_grid(images_ori_all, save_to, preds_class=preds_val_ori_all,
+                                     pred_class_probs=probs_val_ori_all.max(dim=-1).values)
 
                         log_imgs_i["img_ori"] = [save_to]
             
@@ -3162,61 +3810,35 @@ def main(args):
                 idxs_ij = idxs_i[j*args.train_GPU_batch_size:(j+1)*args.train_GPU_batch_size]
                 noises_ij = noises_i[idxs_ij]
                 targets_ij = targets[idxs_ij]
-                preds_gender_ori_ij = preds_gender_ori[idxs_ij]
-                probs_gender_ori_ij = probs_gender_ori[idxs_ij]
-                face_bboxs_ori_ij = face_bboxs_ori[idxs_ij]
+                preds_val_ori_ij = preds_val_ori[idxs_ij]
 
                 images_ij, z0_ij = generate_image_w_gradient(prompt_i, noises_ij, num_denoising_steps, which_text_encoder=text_encoder, which_unet=unet, return_latents=True)
-                # NODETECTOR: residual-error face indicator on z0_ij replaces insightface get_face(images_ij).
-                # Runs under no_grad inside (the detector it replaces was equally non-differentiable);
-                # bboxes/chips are not used anywhere in this loss path.
-                face_indicators_ij = residual_face_indicators(z0_ij)
+                valid_ij = valence_valid_indicators(z0_ij)
                 # Branch B: fused residual scorer on z0_ij (grad flows z0 -> trainable model).
-                #   - logits_gender_ij [n,2]: woman/man residual-error gender logits (SCR fair loss).
-                #   - loss_SRR_ij [n]: "a photo of a realistic person" residual error (SRR realism loss).
-                #   - common_attn_ij [n,H,W]: sum-to-1 gender localization map, reused by the SCR flip gate
-                #     below (no extra scorer forward). Both losses share the same per-timestep eps/zt.
-                logits_gender_ij, loss_SRR_ij, common_attn_ij = residual_gender_and_realism(z0_ij)
-                # Zero the attn for no-face FINETUNE samples so they are never damped (mirrors debias's
-                # "if no face, skip" / the Face_hspace get_face_gender selector filling non-faces with zeros).
-                common_attn_ij = common_attn_ij * face_indicators_ij.view(-1, 1, 1).to(common_attn_ij.dtype)
+                #   - logits_val_ij [n,2]: pooled multi-prompt valence logits  -> the fair (CE) loss
+                #   - score_val_ij  [n]  : the pooled continuous score (logged)
+                #   - gaps_val_ij   [n,P]: per-axis gaps, detached (logged -- a dead/dominating axis is
+                #                          visible here and nowhere else)
+                #   - loss_SRR_ij   [n]  : raw residual error of --srr_prompt (SRR realism loss)
+                logits_val_ij, score_val_ij, gaps_val_ij, loss_SRR_ij = residual_valence_and_realism(z0_ij)
 
-                # Branch A: SCR image loss (scoring-space, FROZEN feature extractor) -- replaces the CLIP/DINO img loss.
-                #   re-noise the ORIGINAL (z0_ori) and FINETUNE (z0_ij) latents to the SAME zt (shared eps & t)
-                #   and MSE the FROZEN scoring UNet's mid_block (h-space) output under the frozen generation prompt.
-                #   grad: h_ft -> zt_ft -> z0_ij -> generation (reaches up_blocks); h_ori is a detached target.
-                #   FLIP RELEASE: for flip OR uncertain samples, multiply the SCR gradient by --factor2 inside
-                #   the face/gender region (min-max attn >= --attn_gate_thr), x1 else. Applied via a hook on the
-                #   SCR-only tensor zt_ft, so loss_fair/loss_SRR gradients are untouched.
-                #   The release set MATCHES the debias apply_grad_hook_face decision exactly:
-                #     debias damps when {target == -1} OR {target != pred_gender_ori}   (the `if target==-1`
-                #     branch fires first/unconditionally), and keeps only when {target != -1 AND target == pred_ori}.
-                #   So release_ij = (target != pred_ori) | (target == -1). The extra `| (target == -1)` term (vs the
-                #   plain `!=`) covers the {target==-1 AND pred_ori==-1} corner, which `-1 != -1 == False` would
-                #   otherwise (wrongly) treat as "agree -> keep". No-face FINETUNE samples were zeroed above ->
-                #   attn_gate==0 < thr -> no damping.
+                # Branch A: SCR image loss (scoring-space, FROZEN feature extractor).
+                #   Re-noise the ORIGINAL (z0_ori) and FINETUNE (z0_ij) latents to the SAME zt (shared eps & t)
+                #   and MSE the FROZEN scoring UNet's mid_block (h-space) output under the frozen generation
+                #   prompt. grad: h_ft -> zt_ft -> z0_ij -> generation; h_ori is a detached target.
+                #
+                #   RELEASE SET: a sample is RELEASED (preservation damped to --factor1) when it must FLIP
+                #   (target != pred_ori) or is too uncertain to have a target (target == -1). That decision now
+                #   lives in exactly ONE place, gen_dynamic_weights below -- the gender file made it twice, in
+                #   two different forms, which is what let the double-damping below go unnoticed.
+                #
+                #   THE SPATIAL GATE IS GONE. The gender file ALSO multiplied the SCR gradient by --factor2
+                #   inside the class attention region for exactly this same release set -- so a released
+                #   sample was damped TWICE (factor1 globally x factor2 in-region = 0.2 x 0.2 = 0.04). For a
+                #   scene-level class there is no region to gate on ("where the class lives" is the whole
+                #   frame), so the spatial mask is vacuous and only factor1 remains. No hook on zt_ft.
                 z0_ori_ij = z0_ori[idxs_ij]
                 scr_gen_embeds_ij = scr_gen_embeds.expand(len(idxs_ij), -1, -1)
-
-                cmin = common_attn_ij.amin(dim=(1, 2), keepdim=True)
-                cmax = common_attn_ij.amax(dim=(1, 2), keepdim=True)
-                attn_gate = ((common_attn_ij - cmin) / (cmax - cmin + 1e-8)).clamp(0, 1)          # [chunk,64,64] min-max
-                release_ij = (targets_ij != preds_gender_ori_ij) | (targets_ij == -1)               # debias-aligned: flip OR uncertain(-1)
-                scr_grad_mask = torch.ones_like(attn_gate)
-                scr_grad_mask = torch.where((attn_gate >= args.attn_gate_thr) & release_ij[:, None, None],
-                                            torch.full_like(scr_grad_mask, args.factor2), scr_grad_mask)
-                scr_grad_mask = scr_grad_mask[:, None, :, :].to(z0_ij.dtype)                        # [chunk,1,64,64]
-
-                # Visualize/save the flip gradient-gate: min-max normalized attn + hard mask (--attn_gate_thr)
-                # and the region actually damped by --factor2 this step. Uses the exact gating tensors above.
-                if accelerator.is_main_process and args.save_attn_maps and (step % args.train_plot_every_n_iter == 0) and j == 0:
-                    grad_gate_save_to = os.path.join(args.imgs_save_dir, f"train-{global_step}_gradgate.jpg")
-                    save_grad_gate_panels(
-                        images_ij, common_attn_ij, attn_gate, scr_grad_mask, release_ij,
-                        targets_ij, preds_gender_ori_ij, grad_gate_save_to,
-                        thr=args.attn_gate_thr, factor2=args.factor2,
-                    )
-                    log_imgs_i["grad_gate"] = [grad_gate_save_to]
 
                 scr_mid_store = []
                 def _scr_mid_hook(_m, _in, _out):
@@ -3227,7 +3849,6 @@ def main(args):
                     _tb = _t.repeat(len(idxs_ij))
                     _eps = torch.randn_like(z0_ij)
                     zt_ft = noise_scheduler.add_noise(z0_ij, _eps, _tb)                             # grad -> z0_ij
-                    zt_ft.register_hook(lambda g, mm=scr_grad_mask: g * mm)                         # SCR-only spatial gate
                     zt_ori = noise_scheduler.add_noise(z0_ori_ij, _eps, _tb)                        # detached target input
                     scr_mid_store.clear()
                     _ = scoring_unet(zt_ft.to(weight_dtype), _tb, encoder_hidden_states=scr_gen_embeds_ij).sample
@@ -3239,19 +3860,34 @@ def main(args):
                     scr_per_t.append(((h_ft.to(weight_dtype_high_precision) - h_ori.to(weight_dtype_high_precision)) ** 2).mean(dim=[1, 2, 3]))
                 _scr_h.remove()
                 loss_SCR_ij = torch.stack(scr_per_t, dim=0).mean(dim=0).to(weight_dtype)
-                
-                loss_fair_ij = torch.ones(len(idxs_ij), dtype=weight_dtype, device=accelerator.device) *(-1)
-                idxs_w_face_loss = ((face_indicators_ij == True) * (targets_ij != -1)).nonzero().view([-1])
-                loss_fair_ij_w_face_loss = CE_loss(logits_gender_ij[idxs_w_face_loss], targets_ij[idxs_w_face_loss])
-                loss_fair_ij[idxs_w_face_loss] = loss_fair_ij_w_face_loss.to(loss_fair_ij.dtype)
 
-                # SRR realism loss: raw residual error of args.srr_prompt (no 1/tau). Applies to ALL
-                # generated samples (like the old CLIP/DINO), not gated on face detection or target validity.
+                # ---- fair loss (CE on the pooled valence logits) over the samples that HAVE a target.
+                # With --valence_face_gate none, `valid_ij` is all-True, so participation is decided purely
+                # by target validity (i.e. by the uncertainty threshold) -- which is what it should be: every
+                # image has a valence, so no image is excluded for lacking a face.
+                idxs_w_fair_loss = ((valid_ij == True) * (targets_ij != -1)).nonzero().view([-1])
+
+                # NOTE the two separate tensors. The gender file kept ONE `loss_fair_ij` pre-filled with -1
+                # and then ADDED it straight into the optimized loss, so every non-participating row
+                # contributed a constant -1 to loss_ij.mean(). That is gradient-free (a constant), so it never
+                # corrupted training -- but it silently biased the REPORTED loss downward by
+                # (#excluded / #total). Here the backward tensor is zero-filled (a true no-op) and the -1
+                # sentinel survives only in the LOGGING tensor, where the `!= -1` filter below expects it.
+                loss_fair_bwd = torch.zeros(len(idxs_ij), dtype=weight_dtype, device=accelerator.device)
+                loss_fair_log = torch.ones(len(idxs_ij), dtype=weight_dtype, device=accelerator.device) * (-1)
+                if idxs_w_fair_loss.numel() > 0:
+                    _ce = CE_loss(logits_val_ij[idxs_w_fair_loss], targets_ij[idxs_w_fair_loss])
+                    loss_fair_bwd[idxs_w_fair_loss] = _ce.to(weight_dtype)
+                    loss_fair_log[idxs_w_fair_loss] = _ce.detach().to(weight_dtype)
+
+                # SRR realism loss: raw residual error of --srr_prompt (no 1/tau). Applies to ALL generated
+                # samples (like the old CLIP/DINO image loss), not gated on target validity.
                 loss_SRR_ij = loss_SRR_ij.to(weight_dtype)
 
-                dynamic_weights = gen_dynamic_weights(face_indicators_ij, targets_ij, preds_gender_ori_ij, probs_gender_ori_ij, factor=args.factor1)
-                loss_ij = loss_fair_ij + args.weight_loss_scr * dynamic_weights * loss_SCR_ij + args.weight_loss_face * loss_SRR_ij
+                dynamic_weights = gen_dynamic_weights(valid_ij, targets_ij, preds_val_ori_ij, factor=args.factor1)
+                loss_ij = loss_fair_bwd + args.weight_loss_scr * dynamic_weights * loss_SCR_ij + args.weight_loss_face * loss_SRR_ij
                 accelerator.backward(loss_ij.mean())
+                loss_fair_ij = loss_fair_log
 
                 with torch.no_grad():
                     loss_fair_i[idxs_ij] = loss_fair_ij.to(loss_fair_i.dtype)
@@ -3283,8 +3919,11 @@ def main(args):
                         logs_i.pop(key)
                     else:
                         logs_i[key] = torch.cat(logs_i[key])
-                for key in ["gender_gap", "gender_gap_abs", "gender_pred_between_0.2_0.8"]:
-                    if logs_i[key] == []:
+                _scalar_keys = ["valence_gap", "valence_gap_abs", "valence_pred_between_0.2_0.8"]
+                _scalar_keys += [f"gap_{_ax['name']}_{_s}" for _ax in valence_axes
+                                 for _s in ("mean", "std", "corr_pooled")]
+                for key in _scalar_keys:
+                    if logs_i.get(key) == []:
                         logs_i.pop(key)
 
             ##########################################################################

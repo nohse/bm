@@ -14,36 +14,85 @@
 # See the License for the specific language governing permissions and
 
 # =====================================================================================
-# ATTMAP = NODETECTOR + a switch on the SPATIAL REDUCTION of the woman/man class error:
-#     --gender_attn_weight {attn, none}     (default: attn == the original NODETECTOR file)
-# The woman/man gender error E_c is the per-pixel squared eps-residual of the frozen scoring UNet
-# under the "woman"/"man" text condition. The original file always reduces it with the COMMON
-# woman/man cross-attention map (sum-to-1 normalized) as a spatial weight, i.e. E_c = sum_{u,v}
-# attn(u,v) * res_c(u,v) -- re-weighting the error toward the gender/person region. This file makes
-# that weighting OPTIONAL:
-#   attn : E_c = sum_{u,v} common_attn(u,v) * res_c(u,v)        (attention-weighted SUM; original)
-#   none : E_c = mean_{u,v} res_c(u,v)                          (the FULL error, uniform over space)
-# The 'none' branch is exactly the 'attn' branch with a FLAT weight map 1/(H*W), which also sums to
-# 1 -- so E_c keeps the same normalization/scale and --tau does NOT need to be re-tuned a priori.
-# HOW BIG IS THE DIFFERENCE? Measured on 8 real generated images (K=15, t 400-800): this gender attn
-# map is DIFFUSE, not a face mask (values 1.7e-4..4.7e-4 around the 2.44e-4 uniform value, ~2.8x
-# max/min, participation ratio ~3900 of 4096 px). So 'attn' is a MILD re-weighting: E_woman
-# none/attn = 1.04, the class GAP |E_man - E_woman| none/attn = 0.83, and the argmax gender preds
-# agree 8/8. The flag mainly rescales the class-error GAP (hence the fair-loss gradient), and does
-# NOT make the z0 gradient uniform (it flows through the scoring UNet's global receptive field:
-# top-10% |grad| energy 0.225 attn -> 0.196 none, vs 0.10 for a truly uniform field).
-# The flag applies to BOTH places the class error is computed: residual_gender_and_realism (the SCR
-# fair loss) and residual_gender_logits (the training-time gender predictor behind get_face_gender).
-# What the flag does NOT change (the cross-attention map is still computed in BOTH modes):
-#   - the SRR realism gradient region  (min-max common_attn >= --attn_gate_thr, input-masked z0)
-#   - the h-space SCR flip gradient gate (same region, scaled by --factor2)
-#   - the attention/grad-gate visualizations (--save_attn_maps)
-# Only the gender-error reduction switches; everything else is byte-for-byte the original file.
-# Run-folder tag: the mode is ALWAYS written into the output folder / wandb run name --
-#   _gAttn-attn = attmap weighting ON (original behaviour) , _gAttn-none = attmap weighting OFF
-# so a run's own folder states whether the attmap multiply was used (an absent tag would be
-# ambiguous with the original _nodetector.py runs, which carry no _gAttn tag at all). Example:
-#   ..._wSRR-4_srr-person_errFD-8-50-950_gAttn-none_skipFrac-0.5_Th-0.2_loraR-50_lr-5e-05_07131530
+# MULTIPROMPT = the NODETECTOR file below, with the residual-error class scorer switched from
+# ONE prompt per class to FOUR ASPECT PROMPT PAIRS, and with the SCR spatial gradient gate REMOVED.
+#
+# 1) TWO CLASSES, FOUR ASPECTS (8 prompts total). The 2-class axis that used to be
+#    gender = [woman(0), man(1)] is now sentiment = [POSITIVE(0), NEGATIVE(1)]:
+#      aspect 1 facial_expressions : "A photo of positive facial expressions"
+#                                  / "A photo of negative facial expressions"
+#      aspect 2 clothing_actions   : "A photo of positive clothing and actions"
+#                                  / "A photo of negative clothing and actions"
+#      aspect 3 background         : "A photo of a background with a positive atmosphere"
+#                                  / "A photo of a background with a negative atmosphere"
+#      aspect 4 overall_tone       : "A photo of a scene with an overall positive tone"
+#                                  / "A photo of a scene with an overall negative tone"
+#    ONE COMMON ATTENTION MAP PER ASPECT: exactly as the single-prompt file built one common map
+#    from {woman, man}, each aspect builds its OWN common map from ITS OWN pos+neg pair, averaged
+#    over {timesteps, the 2 class prompts of that aspect, cross-attn blocks, heads}, resized to
+#    (H,W), normalized to sum to 1 over space and detached. The cross-attention token used for an
+#    aspect is the ASPECT PHRASE, shared by both of its prompts (--residual_aspectN_attn_word,
+#    default "facial expressions" / "clothing and actions" / "background" / "tone"), NOT the
+#    class word, so the four maps localize to four different regions instead of collapsing onto
+#    the same one.
+#    That yields 8 attention-weighted errors E[aspect][class]. They are reduced to 2 by a plain
+#    mean over the 4 aspects, per class:
+#      E_pos = mean_a E[a]["pos"],   E_neg = mean_a E[a]["neg"]
+#    and from there everything is IDENTICAL to the single-prompt file:
+#      logits = [-E_pos/tau, -E_neg/tau], class order [positive=0, negative=1].
+#    All 8 prompts share the SAME per-timestep eps/zt (paired, low variance), and the K timesteps
+#    are still folded into the batch dim, so the scorer costs 8 UNet forwards per call (+1 for SRR)
+#    instead of 2 (+1). Peak memory is bounded by reducing each aspect to its 2 scalars and freeing
+#    its [n,K,H,W] residual maps before moving to the next aspect.
+#    >> COST WARNING: the training-loss scorer now runs 9 grad-carrying UNet forwards on an [n*K,...]
+#    batch instead of 3, so BOTH step time and the retained autograd graph grow ~3x versus the parent
+#    file. If this OOMs, lower --train_GPU_batch_size first, then --residual_num_timesteps (K).
+#    The attention-map panel (--save_attn_maps, every --train_plot_every_n_iter steps) likewise runs
+#    8 no_grad prompt passes per timestep instead of 2.
+#
+# 2) SCR SPATIAL GRADIENT GATE REMOVED. In the parent file the h-space SCR gradient was damped by
+#    --factor2 inside the min-max attention region (>= --attn_gate_thr) for flip/uncertain samples,
+#    via a hook on zt_ft. That gate existed to make the edit local to the face. This task wants the
+#    WHOLE image to change, so the gate (attn_gate / release_ij / scr_grad_mask / the zt_ft hook)
+#    and its "train-<step>_gradgate.jpg" visualization are gone; the SCR loss now receives an
+#    unmodified gradient everywhere. --factor2 is therefore UNUSED here (kept only so existing
+#    yaml configs that set it still load). The per-sample --factor1 dynamic_weights on the SCR loss
+#    are UNCHANGED (they scale the whole sample, not a region).
+#
+# 3) SRR GRADIENT UN-RESTRICTED. The parent file scored the realism prompt on an input-masked z0
+#    (non-subject pixels detached, subject = min-max common_attn >= --attn_gate_thr), so the realism
+#    gradient was exactly zero outside the person. For the same reason as (2) -- the whole image
+#    should move -- that mask is removed: the realism prompt is scored on the SAME unmasked zt as the
+#    8 aspect prompts, so E_realistic's VALUE and its GRADIENT are both whole-image. --attn_gate_thr
+#    is consequently UNUSED anywhere in this file (kept defined only for yaml-config compatibility).
+#
+# 4) EVALUATION SCORED BY THE SAME RESIDUAL ERROR (no MobileNet). The CelebA MobileNet test
+#    classifier predicts GENDER, which is not this run's axis, so it cannot score these images at
+#    all. evaluate_process therefore drops it (and the insightface detector) and scores the eval
+#    latents with residual_eval_class_scores -- literally the training helpers
+#    (_build_shared_eps_zt -> _score_aspects -> _aspect_errors_to_logits): same 8 aspect prompts,
+#    same per-aspect common attention maps, same weighted reduction, same 8->2 averaging. Only
+#    K differs: --eval_residual_num_timesteps (30) instead of --residual_num_timesteps (15), over
+#    the SAME --residual_t_min/max range, under no_grad and chunked to --eval_residual_max_rows.
+#    NO FACE GATING in eval: every generated image is scored (background / overall-tone aspects are
+#    defined with or without a face, and gating would make the valid-sample count vary per
+#    occupation, so per-prompt metrics would not be comparable). Both the ORIGINAL (frozen-model)
+#    and the finetuned images are scored, giving a per-occupation baseline. wandb gains
+#    gender_gap_ori / gender_gap_abs_ori and, per aspect, E_pos_<a> / E_neg_<a> / Egap_<a> /
+#    Egap_ori_<a> so it is visible WHICH aspect carries the bias. The insightface / MobileNet /
+#    opensphere models are still LOADED (deliberately, for easy A/B), just no longer used in eval.
+#    PROMPTS: --prompt_occupation_path defaults to ../data/1-prompts/occupation_wino.json
+#    (WinoBias, 30 train / 10 test occupations, disjoint; "A photo of the face of a {occupation},
+#    a person").
+#
+# NAMING: every downstream variable and wandb key is deliberately still called *_gender
+# (preds_gender, probs_gender, logits_gender, loss_fair, gender_gap, ...). Nothing about them is
+# gender any more -- they carry the positive(0)/negative(1) sentiment class. The names are kept so
+# this file stays line-by-line diffable against its parent and so wandb panels line up across runs.
+# In the training grids the border color still follows the class index: red = class 0 = POSITIVE,
+# blue = class 1 = NEGATIVE. EVALUATION (evaluate_process) is untouched and still reports the real
+# insightface + CelebA gender metrics, which are meaningless for this task; only its CLIP-T /
+# CLIP-I / DINO numbers carry information here.
 # =====================================================================================
 # NODETECTOR = SRR_person_truncated_hspace with the insightface FACE DETECTOR REPLACED -- in the
 # TRAINING branch points ONLY -- by a diffusion residual-error face/no-face classifier:
@@ -62,6 +111,14 @@
 # EVALUATION (evaluate_process) still uses the real insightface detector + the external test
 # classifier, so eval metrics stay comparable to all baselines.
 # The output folder name gets an extra tag: _errFD-<K>-<tmin>-<tmax>  (e.g. _errFD-8-50-950).
+# =====================================================================================
+# NOTE: everything below this line is the INHERITED history of the ancestor files, kept verbatim for
+# provenance. Two of its statements are SUPERSEDED by the MULTIPROMPT block at the top of this file:
+#   (a) the SCR gradient is NO LONGER spatially gated (no --factor2 region damping) -- see "SCR
+#       SPATIAL GRADIENT GATE REMOVED" above; ignore the gate paragraph in the next section;
+#   (b) the 2-class axis is NO LONGER woman/man from a single prompt pair -- it is
+#       positive/negative from four aspect prompt pairs. Read every "woman/man" and "gender" below
+#       as "positive/negative" and "sentiment class".
 # =====================================================================================
 # SRR_person_truncated_hspace = SRR_person_truncated with the image-semantics loss REPLACED by the
 # h-space SCR image loss (ported from 1-main-errorDAL,SCR,Face_hspace_truncated.py). The fairness
@@ -84,7 +141,7 @@
 # EVALUATION always passes skip_denoise_frac=0.0 (full denoising) so metrics match baselines.
 #
 # INTERACTION NOTE (truncated z0 x SRR realism): with frac>0, z0 is a blurrier x0 estimate.
-# The SRR realism loss (residual_gender_and_realism) scores this z0 with "a photo of a
+# The SRR realism loss (residual_multiprompt_and_realism) scores this z0 with "a photo of a
 # realistic person"; because E_realistic is a RAW eps-residual, part of it now reflects the
 # truncation blur rather than gender-induced unrealism, so the realism gradient partly fights
 # the truncation. The SCR gender logits (a woman-vs-man DIFFERENCE) are more robust to this
@@ -367,6 +424,9 @@ def attmap_overlay_on_image(att_map, image, alpha=0.45):
 def mask_overlay_on_image(mask, image, alpha=0.5, color=(255, 165, 0)):
     """Overlay a (near-)binary HxW mask onto one 3xHxW image tensor in [-1,1] as a solid-color tint.
 
+    MULTIPROMPT: currently UNUSED -- its only caller was save_grad_gate_panels, deleted with the SCR
+    spatial gradient gate. Kept as a generic helper for ad-hoc mask visualization.
+
     Unlike attmap_overlay_on_image this does NOT contrast-stretch, so the min-max hard mask
     (attn_gate >= thr) and the applied gradient-gate region are rendered faithfully (a pixel is
     tinted iff mask>0, with opacity proportional to the mask value). Returns a PIL RGB image.
@@ -563,7 +623,7 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--resume_from_checkpoint",
         type=str,
-        default="./outputs/gender-debias-text-encoder-again/BS-24_TE_tau-0.0001_resT-15-400-800_scrT-15-400-800_wSCR-4-0.2-0.2_wSRR-4_srr-person_errFD-8-50-950_gAttn-none_Th-0.2_loraR-50_lr-5e-05_07132336/ckpts/checkpoint_tmp-1720",
+        default="",
         help="provide the checkpoint path to resume from checkpoint. NOTE: kept None for the SRR_person "
              "experiment so it starts fresh from pretrained SD -- resuming from a face-prompt SRR checkpoint "
              "would carry over weights trained on the old 'a photo of a realistic face' prompt and "
@@ -609,11 +669,11 @@ def parse_args(input_args=None):
         '--save_attn_maps',
         action="store_true",
         default=True,
-        help="ON by default. At every --train_plot_every_n_iter step, save two visualizations overlaid on the "
-             "generated images: (1) train-<step>_attmap.jpg = the woman/man/common cross-attention weighting "
-             "maps used by the residual gender scorer; (2) train-<step>_gradgate.jpg = the SCR flip gradient-gate, "
-             "i.e. the min-max normalized gender-attn hard-masked at --attn_gate_thr (0.15) and the region "
-             "actually scaled by --factor2 for flip/uncertain samples this step",
+        help="ON by default. At every --train_plot_every_n_iter step, save train-<step>_attmap.jpg = the "
+             "FOUR per-aspect common cross-attention weighting maps used by the MULTIPROMPT residual "
+             "scorer plus their mean, overlaid on the generated images. NOTE: the parent file also wrote "
+             "train-<step>_gradgate.jpg here; that visualization is gone because the SCR spatial gradient "
+             "gate it depicted has been removed from this file.",
         )
     parser.add_argument(
         '--save_noface_imgs',
@@ -680,31 +740,13 @@ def parse_args(input_args=None):
              "over the same --residual_t_min/max and --residual_num_timesteps (no separate timestep args).",
     )
     parser.add_argument(
-        '--gender_attn_weight',
-        default="none",
-        type=str,
-        choices=["attn", "none"],
-        help="spatial reduction of the woman/man class error E_c (the per-pixel squared eps-residual of "
-             "the frozen scoring UNet under the woman/man text condition). 'attn' (default, identical to "
-             "the original NODETECTOR file): weight the residual by the sum-to-1 common woman/man "
-             "cross-attention map and spatially SUM, i.e. re-weight pixels toward the gender/person region. "
-             "'none': use the FULL error, a UNIFORM spatial mean over all H*W pixels -- i.e. the same "
-             "weighted sum with a FLAT 1/(H*W) map, which also sums to 1, so E_c keeps the same scale and "
-             "--tau needs no a-priori re-tuning. MEASURED (8 real gen. images, K=15, t400-800): the gender "
-             "attn map is DIFFUSE, not a face mask (1.7e-4..4.7e-4 vs the 2.44e-4 uniform value, ~2.8x "
-             "max/min, participation ratio ~3900/4096 px), so 'attn' is a MILD re-weighting, not a hard "
-             "localization: E_woman none/attn = 1.04, |E_man - E_woman| none/attn = 0.83, argmax preds "
-             "agree 8/8. Expect the two modes to differ mostly in the class-error GAP (hence the fair-loss "
-             "gradient scale), not in the predicted labels. Applies to BOTH the SCR fair loss "
-             "(residual_gender_and_realism) and the training-time gender predictor (residual_gender_logits "
-             "-> get_face_gender). The attention map is still computed in BOTH modes: it keeps driving the "
-             "SRR realism gradient region and the h-space SCR flip gate (--attn_gate_thr/--factor2) and the "
-             "attmap visualizations, which are unaffected by this flag.",
-    )
-    parser.add_argument(
         '--attn_gate_thr',
         default=0.15,
-        help="min-max-normalized gender (woman/man) cross-attention threshold defining the person/subject "
+        help="DEPRECATED, UNUSED in MULTIPROMPT: BOTH consumers of this threshold are gone -- the SCR "
+             "spatial gradient gate is removed, and the SRR realism gradient is no longer restricted to "
+             "the subject region (it is whole-image now). Kept defined only so existing yaml configs "
+             "that set it still load. Original help follows. "
+             "min-max-normalized gender (woman/man) cross-attention threshold defining the person/subject "
              "region (region = gate >= this). The SRR realism loss keeps its VALUE over the WHOLE image "
              "(every pixel contributes to E_realistic), but its GRADIENT is restricted to this region by "
              "input-masking z0 outside it (non-region z0 is detached), so d(E_realistic)/dz0 is exactly "
@@ -718,8 +760,12 @@ def parse_args(input_args=None):
         type=float, 
         default=0.2
         )
-    parser.add_argument('--factor1', help="train, val, test batch size", type=float, default=0.2)
-    parser.add_argument('--factor2', help="train, val, test batch size", type=float, default=0.2)
+    parser.add_argument('--factor1', help="per-sample dynamic weight on the SCR loss for flip/uncertain "
+                                          "samples (UNCHANGED in MULTIPROMPT)", type=float, default=0.2)
+    parser.add_argument('--factor2', help="DEPRECATED, UNUSED in MULTIPROMPT: this was the SCR spatial "
+                                          "gradient-gate damping factor, and that gate is removed here so "
+                                          "the whole image can change. Kept defined only so existing yaml "
+                                          "configs that set it still load.", type=float, default=0.2)
 
     # batch size, properly set to max out GPU
     parser.add_argument(
@@ -783,8 +829,11 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--prompt_occupation_path",
         type=str,
-        default="../data/1-prompts/occupation.json",
-        help="prompt template, and occupations for train and val",
+        default="../data/1-prompts/occupation_wino.json",
+        help="prompt template, and occupations for train and val. MULTIPROMPT/implicit_aaai: defaults "
+             "to the WinoBias occupation list (30 train / 10 test occupations, template "
+             "'A photo of the face of a {occupation}, a person'). Same schema as occupation.json, so "
+             "only this default changed.",
     )
     # NOTE: the mnet-based training gender classifier (--classifier_weight_path) has been removed;
     # the gender signal is now produced by a prompt-conditioned diffusion residual-error scorer.
@@ -813,6 +862,26 @@ def parse_args(input_args=None):
         help="maximum timestep (inclusive) for the residual-error gender scorer",
     )
     parser.add_argument(
+        '--eval_residual_num_timesteps',
+        default=30,
+        type=int,
+        help="EVALUATION: number of timesteps (K) for the residual-error class scorer used by "
+             "evaluate_process. This scenario has no external classifier (the CelebA MobileNet scores "
+             "gender, not positive/negative), so evaluation reuses the SAME estimator as training -- the "
+             "8 aspect prompts, the per-aspect common cross-attention maps, the 8->2 averaging -- just "
+             "with more timesteps and under no_grad. Kept SEPARATE from --residual_num_timesteps (15) so "
+             "evaluation can be lower-variance without changing the training loss. The timestep RANGE is "
+             "shared with training (--residual_t_min/--residual_t_max).",
+    )
+    parser.add_argument(
+        '--eval_residual_max_rows',
+        default=120,
+        type=int,
+        help="EVALUATION: cap on the folded [n*K] batch the eval class scorer pushes through the scoring "
+             "UNet in one forward. Images are scored in chunks of max(1, this // K) so raising "
+             "--eval_residual_num_timesteps cannot silently OOM. Lower it if evaluation OOMs.",
+    )
+    parser.add_argument(
         '--scr_num_timesteps',
         default=15,
         type=int,
@@ -834,31 +903,95 @@ def parse_args(input_args=None):
         type=int,
         help="maximum timestep (inclusive) for the h-space SCR image loss (see --scr_t_min).",
     )
+    # MULTIPROMPT: four aspect prompt PAIRS replace the single woman/man pair. For every aspect N:
+    #   --residual_aspectN_pos_prompt / --residual_aspectN_neg_prompt : the class-0 / class-1 prompt
+    #   --residual_aspectN_attn_word : the phrase (shared by BOTH prompts of the aspect) whose
+    #       cross-attention map defines that aspect's common spatial weighting map. Its token
+    #       indices are located inside each prompt via the tokenizer, not hard-coded, so the word
+    #       must appear VERBATIM in both prompts of the pair or startup fails loudly.
+    #   --residual_aspectN_name : short slug, used only for logging / attention-map panel labels.
     parser.add_argument(
-        '--residual_woman_prompt',
-        default="a photo of a woman",
-        type=str,
-        help="text prompt for the woman class (index 0) in the residual-error gender scorer",
+        '--residual_aspect1_name', default="facial_expressions", type=str,
+        help="MULTIPROMPT aspect 1 slug (labels only)",
     )
     parser.add_argument(
-        '--residual_man_prompt',
-        default="a photo of a man",
-        type=str,
-        help="text prompt for the man class (index 1) in the residual-error gender scorer",
+        '--residual_aspect1_pos_prompt', default="A photo of positive facial expressions", type=str,
+        help="MULTIPROMPT aspect 1, POSITIVE class (index 0) prompt",
     )
     parser.add_argument(
-        '--residual_woman_word',
-        default="woman",
-        type=str,
-        help="the woman-class word whose cross-attention map is used for spatial weighting "
-             "(its token index is located in --residual_woman_prompt via the tokenizer, not hard-coded)",
+        '--residual_aspect1_neg_prompt', default="A photo of negative facial expressions", type=str,
+        help="MULTIPROMPT aspect 1, NEGATIVE class (index 1) prompt",
     )
     parser.add_argument(
-        '--residual_man_word',
-        default="man",
-        type=str,
-        help="the man-class word whose cross-attention map is used for spatial weighting "
-             "(its token index is located in --residual_man_prompt via the tokenizer, not hard-coded)",
+        '--residual_aspect1_attn_word', default="facial expressions", type=str,
+        help="MULTIPROMPT aspect 1 attention phrase, must appear verbatim in BOTH aspect-1 prompts",
+    )
+    parser.add_argument(
+        '--residual_aspect2_name', default="clothing_actions", type=str,
+        help="MULTIPROMPT aspect 2 slug (labels only)",
+    )
+    parser.add_argument(
+        '--residual_aspect2_pos_prompt', default="A photo of positive clothing and actions", type=str,
+        help="MULTIPROMPT aspect 2, POSITIVE class (index 0) prompt",
+    )
+    parser.add_argument(
+        '--residual_aspect2_neg_prompt', default="A photo of negative clothing and actions", type=str,
+        help="MULTIPROMPT aspect 2, NEGATIVE class (index 1) prompt",
+    )
+    parser.add_argument(
+        '--residual_aspect2_attn_word', default="clothing and actions", type=str,
+        help="MULTIPROMPT aspect 2 attention phrase, must appear verbatim in BOTH aspect-2 prompts",
+    )
+    parser.add_argument(
+        '--residual_aspect3_name', default="background", type=str,
+        help="MULTIPROMPT aspect 3 slug (labels only)",
+    )
+    parser.add_argument(
+        '--residual_aspect3_pos_prompt', default="A photo of a background with a positive atmosphere", type=str,
+        help="MULTIPROMPT aspect 3, POSITIVE class (index 0) prompt",
+    )
+    parser.add_argument(
+        '--residual_aspect3_neg_prompt', default="A photo of a background with a negative atmosphere", type=str,
+        help="MULTIPROMPT aspect 3, NEGATIVE class (index 1) prompt",
+    )
+    parser.add_argument(
+        '--residual_aspect3_attn_word', default="background", type=str,
+        help="MULTIPROMPT aspect 3 attention phrase, must appear verbatim in BOTH aspect-3 prompts",
+    )
+    parser.add_argument(
+        '--residual_aspect4_name', default="overall_tone", type=str,
+        help="MULTIPROMPT aspect 4 slug (labels only)",
+    )
+    parser.add_argument(
+        '--residual_aspect4_pos_prompt', default="A photo of a scene with an overall positive tone", type=str,
+        help="MULTIPROMPT aspect 4, POSITIVE class (index 0) prompt",
+    )
+    parser.add_argument(
+        '--residual_aspect4_neg_prompt', default="A photo of a scene with an overall negative tone", type=str,
+        help="MULTIPROMPT aspect 4, NEGATIVE class (index 1) prompt",
+    )
+    parser.add_argument(
+        '--residual_aspect4_attn_word', default="tone", type=str,
+        help="MULTIPROMPT aspect 4 attention phrase, must appear verbatim in BOTH aspect-4 prompts",
+    )
+    # DEPRECATED / UNUSED in MULTIPROMPT -- superseded by the four aspect pairs above. Kept defined
+    # ONLY so shared yaml configs that still set these keys keep loading (parse_args does
+    # args_dict[key] = type(args_dict[key])(value), which KeyErrors on an unknown key).
+    parser.add_argument(
+        '--residual_woman_prompt', default="a photo of a woman", type=str,
+        help="DEPRECATED, ignored: replaced by --residual_aspectN_pos_prompt/--residual_aspectN_neg_prompt",
+    )
+    parser.add_argument(
+        '--residual_man_prompt', default="a photo of a man", type=str,
+        help="DEPRECATED, ignored: replaced by --residual_aspectN_pos_prompt/--residual_aspectN_neg_prompt",
+    )
+    parser.add_argument(
+        '--residual_woman_word', default="woman", type=str,
+        help="DEPRECATED, ignored: replaced by --residual_aspectN_attn_word",
+    )
+    parser.add_argument(
+        '--residual_man_word', default="man", type=str,
+        help="DEPRECATED, ignored: replaced by --residual_aspectN_attn_word",
     )
     parser.add_argument(
         '--face_residual_face_prompt',
@@ -1097,15 +1230,13 @@ def main(args):
         f"_tau-{args.tau:g}"
         f"_resT-{args.residual_num_timesteps}-{args.residual_t_min}-{args.residual_t_max}"
         f"_scrT-{args.scr_num_timesteps}-{args.scr_t_min}-{args.scr_t_max}"
-        f"_wSCR-{args.weight_loss_scr}-{args.factor1}-{args.factor2}"
+        # MULTIPROMPT: factor2 dropped from the tag (the SCR spatial gate it damped is removed),
+        # and "noGate" / "MP4" mark the two changes vs the parent single-prompt file.
+        f"_wSCR-{args.weight_loss_scr}-{args.factor1}-noGate"
+        f"_MP4"
         f"_wSRR-{args.weight_loss_face}"
         f"_srr-{_srr_tag}"
         f"_errFD-{args.face_residual_num_timesteps}-{args.face_residual_t_min}-{args.face_residual_t_max}"
-        # gender class-error spatial reduction, ALWAYS tagged (both modes) so a run's folder says outright
-        # whether the attmap weighting was on: _gAttn-attn = attention-weighted, _gAttn-none = full error.
-        # Deliberately not a "tag only when non-default" suffix like _skipFrac: an absent tag would be
-        # ambiguous with the original _nodetector.py runs, which have no _gAttn at all.
-        f"_gAttn-{args.gender_attn_weight}"
         f"{('_skipFrac-'+format(args.skip_denoise_frac, 'g')) if args.skip_denoise_frac>0 else ''}"
         f"_Th-{args.uncertainty_threshold}"
         f"_loraR-{args.rank}_lr-{args.learning_rate}"
@@ -1216,7 +1347,19 @@ def main(args):
         f"'{noise_scheduler.config.prediction_type}'."
     )
 
-    # Cache the fixed woman/man text embeddings (class order: [woman=0, man=1]).
+    # MULTIPROMPT: the four aspect prompt PAIRS, assembled from the --residual_aspectN_* args.
+    # Class order inside every pair is [positive=0, negative=1], matching the old [woman=0, man=1].
+    residual_aspects = [
+        {
+            "name": getattr(args, f"residual_aspect{_i}_name"),
+            "pos_prompt": getattr(args, f"residual_aspect{_i}_pos_prompt"),
+            "neg_prompt": getattr(args, f"residual_aspect{_i}_neg_prompt"),
+            "attn_word": getattr(args, f"residual_aspect{_i}_attn_word"),
+        }
+        for _i in (1, 2, 3, 4)
+    ]
+
+    # Cache the fixed aspect text embeddings (class order per aspect: [positive=0, negative=1]).
     def _encode_scoring_prompt(prompt):
         tok = tokenizer(
             [prompt],
@@ -1231,8 +1374,9 @@ def main(args):
                 tok["attention_mask"].to(accelerator.device),
             )[0]
         return emb.to(weight_dtype)
-    residual_woman_embeds = _encode_scoring_prompt(args.residual_woman_prompt)  # [1, L, D]
-    residual_man_embeds = _encode_scoring_prompt(args.residual_man_prompt)      # [1, L, D]
+    for _asp in residual_aspects:
+        _asp["pos_embeds"] = _encode_scoring_prompt(_asp["pos_prompt"])         # [1, L, D]
+        _asp["neg_embeds"] = _encode_scoring_prompt(_asp["neg_prompt"])         # [1, L, D]
     residual_realistic_embeds = _encode_scoring_prompt(args.srr_prompt)         # [1, L, D], SRR realism prompt
     # NODETECTOR: frozen-TE embeddings of the face/no-face classifier prompts (replaces the
     # insightface detector in the training branch points; see residual_face_indicators).
@@ -1318,8 +1462,8 @@ def main(args):
             hidden_states = hidden_states / attn.rescale_output_factor
             return hidden_states
 
-    # Locate the woman/man class-token indices from the actual tokenizer output (no hard-coded positions).
-    # If a class word splits into multiple subtokens, all of them are returned and later averaged.
+    # Locate the aspect-phrase token indices from the actual tokenizer output (no hard-coded positions).
+    # If the phrase spans several tokens, all of them are returned and later averaged.
     def _find_word_token_indices(prompt, word):
         prompt_ids = tokenizer(
             prompt, padding="max_length", max_length=tokenizer.model_max_length, truncation=True
@@ -1330,8 +1474,22 @@ def main(args):
             if prompt_ids[i:i + L] == word_ids:
                 return list(range(i, i + L))
         raise ValueError(f"could not locate '{word}' tokens {word_ids} inside prompt '{prompt}' -> {prompt_ids}")
-    residual_woman_token_idxs = _find_word_token_indices(args.residual_woman_prompt, args.residual_woman_word)
-    residual_man_token_idxs = _find_word_token_indices(args.residual_man_prompt, args.residual_man_word)
+    # MULTIPROMPT: one attention phrase per ASPECT, located inside BOTH prompts of that aspect. The
+    # phrase is the aspect itself ("facial expressions", "clothing and actions", "background",
+    # "tone"), not the class word, so aspect maps localize to different regions; because the same
+    # phrase is looked up in the positive and the negative prompt, the two class passes of an aspect
+    # contribute attention over the SAME concept and their average is a meaningful common map.
+    for _asp in residual_aspects:
+        _asp["pos_token_idxs"] = _find_word_token_indices(_asp["pos_prompt"], _asp["attn_word"])
+        _asp["neg_token_idxs"] = _find_word_token_indices(_asp["neg_prompt"], _asp["attn_word"])
+    logger.info(
+        "MULTIPROMPT aspects (class order [positive=0, negative=1]):\n" + "\n".join(
+            f"  [{_i}] {_asp['name']}: attn_word={_asp['attn_word']!r} "
+            f"(tok pos={_asp['pos_token_idxs']}, neg={_asp['neg_token_idxs']})\n"
+            f"        pos={_asp['pos_prompt']!r}\n        neg={_asp['neg_prompt']!r}"
+            for _i, _asp in enumerate(residual_aspects)
+        )
+    )
 
     # install the capturing processor on the scoring UNet's cross-attention (attn2) layers only
     _scoring_attn_procs = dict(scoring_unet.attn_processors)
@@ -2063,118 +2221,218 @@ def main(args):
         
         return face_indicators_app, face_bboxs_app, face_chips_app, face_landmarks_app, aligned_face_chips_app
                 
-    def reduce_gender_residual(residual_map, common_attn):
-        """Spatially reduce a per-pixel woman/man squared residual [n,K,H,W] to a per-image error [n].
+    def _build_shared_eps_zt(z0, K):
+        """Draw ONE fresh eps per timestep and fold the K timesteps into the batch dim.
 
-        Controlled by --gender_attn_weight:
-          'attn' (default): weighted SUM with the sum-to-1 common woman/man cross-attention map,
-              E_c = sum_{u,v} common_attn(u,v) * res_c(u,v)  -- the error only counts the gender/person
-              region. This is the original NODETECTOR behaviour.
-          'none': UNIFORM spatial MEAN over all H*W pixels, E_c = mean_{u,v} res_c(u,v) -- the FULL error,
-              every pixel counts equally. Identical to the 'attn' formula with a FLAT weight map 1/(H*W),
-              which ALSO sums to 1, so E_c keeps the same normalization/scale as 'attn' (--tau comparable).
-        The timestep axis K is always reduced by a uniform mean, in both modes. common_attn is detached in
-        both callers, so this only changes WHERE the gradient d E_c / d z0 is weighted, never the graph.
-        """
-        if args.gender_attn_weight == "none":
-            return residual_map.mean(dim=(2, 3)).mean(dim=1)                                    # [n]
-        return (common_attn.unsqueeze(1) * residual_map).sum(dim=(2, 3)).mean(dim=1)            # [n]
+        Returns (eps_all, zt_all, t_all), each with n*K rows laid out as row = i*K + k:
+          eps_all [n*K,4,H,W]  the eps that produced zt_all
+          zt_all  [n*K,4,H,W]  noised latents, cast to weight_dtype. NOT detached -> grad reaches z0.
+          t_all   [n*K]        timesteps aligned with those rows.
+        The K timesteps are linspaced over [--residual_t_min, --residual_t_max]; only their COUNT (K)
+        varies between training (--residual_num_timesteps) and evaluation
+        (--eval_residual_num_timesteps), never the range or the estimator.
 
-    def residual_gender_logits(z0):
-        """Prompt-conditioned diffusion residual-error gender scorer with cross-attention spatial weighting.
-
-        z0: [n,4,H,W] clean latent in the scheduler/UNet scale. May require grad; it is NOT detached,
-            so gradient flows: logits -> weighted residual err -> scoring UNet(zt) -> zt -> z0.
-
-        For each of `--residual_num_timesteps` timesteps (linearly spaced in
-        [--residual_t_min, --residual_t_max] inclusive) a fresh eps is sampled and the SAME eps/zt is
-        scored under both the woman and man text conditions. Rather than averaging the squared eps error
-        uniformly over space, it is weighted by a single COMMON cross-attention map:
-          - for every (timestep, prompt, cross-attn block, head) the class-token ("woman"/"man")
-            cross-attention map is extracted, resized to (H,W), and averaged over ALL of those axes;
-          - the common map is spatially normalized to sum to 1 and detached (pure weighting mask);
-          - the per-pixel squared error (channel-mean, [n,H,W]) is reduced by a spatial weighted SUM
-            with the common map (not mean, because the map already sums to 1).
-
-        Returns logits [n,2], class order [woman=0, man=1]: logit_c = -E_c / tau.
-
-        [PERF] The `--residual_num_timesteps` timesteps are folded into the batch dimension, so the
-        scoring UNet runs ONCE per prompt on an [n*K, ...] batch instead of K sequential [n, ...]
-        forwards. A fresh eps is still drawn per timestep in the same order and the attention/residual
-        reductions are unchanged, so the estimator is mathematically identical to the per-timestep loop
-        (only GPU batching differs). Verified numerically equal (logits + grad) to the looped version.
+        Every prompt scored on this batch shares this single draw, which is what makes the aspect /
+        class comparison paired and low-variance. Factored out so the training scorers and the
+        evaluation scorer provably build their inputs the same way.
         """
         n = z0.shape[0]
-        H, W = z0.shape[-2], z0.shape[-1]
         timesteps = torch.linspace(
-            args.residual_t_min, args.residual_t_max, steps=args.residual_num_timesteps, device=z0.device
+            args.residual_t_min, args.residual_t_max, steps=K, device=z0.device
         ).round().long()
-        K = timesteps.shape[0]
-
-        # Draw a fresh eps per timestep (SAME order/values as the per-timestep loop) and build z_t,
-        # then fold the K timesteps into the batch dimension: [n,K,...] -> [n*K,...] (row = i*K + k).
         eps_list, zt_list = [], []
         for t in timesteps:
             t_batch = t.repeat(n)
             eps_k = torch.randn_like(z0)                          # fresh eps per timestep
             zt_list.append(noise_scheduler.add_noise(z0, eps_k, t_batch))
             eps_list.append(eps_k)
-        eps_all = torch.stack(eps_list, dim=1).reshape(n * K, *z0.shape[1:])          # [n*K,4,H,W]
+        eps_all = torch.stack(eps_list, dim=1).reshape(n * K, *z0.shape[1:])
         zt_all = torch.stack(zt_list, dim=1).reshape(n * K, *z0.shape[1:]).to(weight_dtype)
-        t_all = timesteps.repeat(n)                                                   # [n*K], row i*K+k -> t_k
+        t_all = timesteps.repeat(n)                               # [n*K], row i*K+k -> t_k
+        return eps_all, zt_all, t_all
 
-        prompts_cfg = [
-            ("woman", residual_woman_embeds, residual_woman_token_idxs),
-            ("man", residual_man_embeds, residual_man_token_idxs),
-        ]
+    def _score_aspects(z0, eps_all, zt_all, t_all, K):
+        """MULTIPROMPT core: score ALL 8 aspect prompts on a shared (eps, zt, t) batch.
 
-        residual_maps = {}                                        # cls -> [n,K,H,W] (grad-carrying)
-        attn_accum = torch.zeros(n, H, W, dtype=torch.float, device=z0.device)   # detached attention accumulator
-        attn_count = 0
+        Shared by residual_multiprompt_logits and residual_multiprompt_and_realism so the two entry
+        points cannot drift apart.
 
-        for cls, embeds, tok_idxs in prompts_cfg:
-            c = embeds.expand(n * K, -1, -1)
-            attn_capture_ctx.store = []
-            attn_capture_ctx.token_idxs = tok_idxs
-            attn_capture_ctx.enabled = True
-            eps_pred = scoring_unet(zt_all, t_all, encoder_hidden_states=c).sample
-            attn_capture_ctx.enabled = False
-            captured = attn_capture_ctx.store
-            attn_capture_ctx.store = []
+        z0:      [n,4,H,W] clean latent (used only for its shape / device).
+        eps_all: [n*K,4,H,W] the eps that produced zt_all (row = i*K + k).
+        zt_all:  [n*K,4,H,W] noised latents, already cast to weight_dtype. NOT detached, so gradient
+                 flows back: E -> weighted residual -> scoring UNet(zt) -> zt -> z0 -> trainable model.
+        t_all:   [n*K] timesteps aligned with the rows of zt_all.
 
-            # channel-mean squared residual -> [n*K,H,W] -> [n,K,H,W] (keeps grad to z0)
-            residual_maps[cls] = (eps_pred.float() - eps_all.float()).pow(2).mean(dim=1).view(n, K, H, W)
+        For EACH of the four aspects, both of its class prompts are scored on that same batch and the
+        aspect's OWN common attention map is built from BOTH of those passes:
+          - for every (timestep, class prompt of THIS aspect, cross-attn block, head) the aspect-phrase
+            cross-attention column is extracted, resized to (H,W) and averaged over all those axes;
+          - the aspect map is spatially normalized to sum to 1 and detached (pure weighting mask);
+          - each class's per-pixel squared error (channel-mean, [n,K,H,W]) is reduced by a spatial
+            weighted SUM with that aspect map (SUM, not mean, because the map already sums to 1),
+            then uniformly meaned over the K timesteps.
+        This is exactly the single-prompt file's woman/man reduction, applied four times.
 
-            # accumulate the class-token cross-attention maps (detached), each resized to (H,W).
-            # A captured block spans the whole [n*K] batch; averaging over K and counting once per
-            # (prompt, block) reproduces the original per-(timestep,prompt,block) accum / attn_count.
-            for col, heads in captured:
-                hw = col.shape[-1]
-                s = int(round(math.sqrt(hw)))
-                a = col.view(n * K, heads, s, s).float()                                # [n*K, heads, s, s]
-                a = torch.nn.functional.interpolate(a, size=(H, W), mode="bilinear", align_corners=False)
-                a = a.mean(dim=1).view(n, K, H, W).mean(dim=1)                          # mean heads, then K -> [n,H,W]
-                attn_accum = attn_accum + a
-                attn_count += 1
+        Returns (E_pos_per_aspect, E_neg_per_aspect, common_attn_per_aspect):
+          E_pos_per_aspect / E_neg_per_aspect: list of 4 tensors [n] (grad-carrying) -- the 8 errors.
+          common_attn_per_aspect:              list of 4 tensors [n,H,W], sum-to-1, DETACHED.
 
-        # common attention map: mean over {timesteps, prompts, blocks, heads}
-        common_attn = attn_accum / max(attn_count, 1)                                   # [n,H,W]
-        # spatial normalization so that sum_{u,v} common_attn(u,v) == 1 per image
-        common_attn = common_attn / (common_attn.sum(dim=(1, 2), keepdim=True) + 1e-8)
-        common_attn = common_attn.detach()                                             # weighting mask only
+        [MEM] An aspect is reduced to its two [n] error vectors and its [n,K,H,W] residual maps are
+        dropped before the next aspect runs, so peak activation memory tracks 2 residual maps, not 8.
+        The autograd graph of all 8 UNet forwards is of course still alive until backward.
+        """
+        n = z0.shape[0]
+        H, W = z0.shape[-2], z0.shape[-1]
 
-        # spatial reduction per --gender_attn_weight: 'attn' = attention-weighted SUM (original),
-        # 'none' = uniform mean over all pixels (the FULL error). Then uniform mean over timesteps.
-        E_woman = reduce_gender_residual(residual_maps["woman"], common_attn)           # [n]
-        E_man = reduce_gender_residual(residual_maps["man"], common_attn)               # [n]
+        E_pos_per_aspect, E_neg_per_aspect, common_attn_per_aspect = [], [], []
+        for asp in residual_aspects:
+            attn_accum = torch.zeros(n, H, W, dtype=torch.float, device=z0.device)  # detached accumulator
+            attn_count = 0
+            residual_maps = {}                                   # "pos"/"neg" -> [n,K,H,W] (grad-carrying)
 
-        logits_gender = torch.stack([-E_woman / args.tau, -E_man / args.tau], dim=1)    # [n, 2]
-        return logits_gender
+            for cls in ("pos", "neg"):
+                c = asp[f"{cls}_embeds"].expand(n * K, -1, -1)
+                attn_capture_ctx.store = []
+                attn_capture_ctx.token_idxs = asp[f"{cls}_token_idxs"]
+                attn_capture_ctx.enabled = True
+                eps_pred = scoring_unet(zt_all, t_all, encoder_hidden_states=c).sample
+                attn_capture_ctx.enabled = False
+                captured = attn_capture_ctx.store
+                attn_capture_ctx.store = []
+
+                # channel-mean squared residual -> [n*K,H,W] -> [n,K,H,W] (keeps grad to z0)
+                residual_maps[cls] = (eps_pred.float() - eps_all.float()).pow(2).mean(dim=1).view(n, K, H, W)
+
+                # accumulate THIS ASPECT's attention maps (detached), each resized to (H,W).
+                # A captured block spans the whole [n*K] batch; averaging over K and counting once per
+                # (prompt, block) reproduces a per-(timestep, prompt, block) accum / attn_count.
+                for col, heads in captured:
+                    hw = col.shape[-1]
+                    s = int(round(math.sqrt(hw)))
+                    a = col.view(n * K, heads, s, s).float()                            # [n*K, heads, s, s]
+                    a = torch.nn.functional.interpolate(a, size=(H, W), mode="bilinear", align_corners=False)
+                    a = a.mean(dim=1).view(n, K, H, W).mean(dim=1)                      # mean heads, then K -> [n,H,W]
+                    attn_accum = attn_accum + a
+                    attn_count += 1
+
+            # this aspect's common map: mean over {timesteps, its 2 class prompts, blocks, heads},
+            # spatially normalized so sum_{u,v} == 1 per image, detached (weighting mask only)
+            common_a = attn_accum / max(attn_count, 1)                                  # [n,H,W]
+            common_a = common_a / (common_a.sum(dim=(1, 2), keepdim=True) + 1e-8)
+            common_a = common_a.detach()
+
+            # attention-weighted spatial SUM per timestep, then uniform mean over timesteps
+            E_pos_per_aspect.append((common_a.unsqueeze(1) * residual_maps["pos"]).sum(dim=(2, 3)).mean(dim=1))
+            E_neg_per_aspect.append((common_a.unsqueeze(1) * residual_maps["neg"]).sum(dim=(2, 3)).mean(dim=1))
+            common_attn_per_aspect.append(common_a)
+            del residual_maps
+
+        return E_pos_per_aspect, E_neg_per_aspect, common_attn_per_aspect
+
+    def _aspect_errors_to_logits(E_pos_per_aspect, E_neg_per_aspect):
+        """Reduce the 8 per-aspect errors to the 2-class logits.
+
+        The 4 positive errors are averaged into a single E_pos and the 4 negative errors into E_neg
+        (plain unweighted mean over aspects -- every aspect map already sums to 1, so the four
+        per-aspect errors are on the same scale). From here on this is identical to the single-prompt
+        file: logit_c = -E_c / tau, class order [positive=0, negative=1].
+        """
+        E_pos = torch.stack(E_pos_per_aspect, dim=0).mean(dim=0)                        # [n]
+        E_neg = torch.stack(E_neg_per_aspect, dim=0).mean(dim=0)                        # [n]
+        return torch.stack([-E_pos / args.tau, -E_neg / args.tau], dim=1)               # [n,2]
+
+    def _merge_aspect_attn(common_attn_per_aspect):
+        """Mean of the four per-aspect common maps, re-normalized to sum to 1 per image (detached).
+
+        This whole-subject map is what the SRR realism gradient mask thresholds, and what the
+        attention panels show as the "common" column. It plays the role the single woman/man common
+        map played in the parent file.
+        """
+        merged = torch.stack(common_attn_per_aspect, dim=0).mean(dim=0)                 # [n,H,W]
+        merged = merged / (merged.sum(dim=(1, 2), keepdim=True) + 1e-8)
+        return merged.detach()
+
+    def residual_multiprompt_logits(z0):
+        """MULTIPROMPT residual-error class scorer (replaces the single-pair residual_gender_logits).
+
+        z0: [n,4,H,W] clean latent in the scheduler/UNet scale. May require grad; it is NOT detached,
+            so gradient flows: logits -> weighted residual err -> scoring UNet(zt) -> zt -> z0.
+
+        For each of `--residual_num_timesteps` timesteps (linearly spaced in
+        [--residual_t_min, --residual_t_max] inclusive) a fresh eps is sampled, and the SAME eps/zt is
+        scored under ALL EIGHT text conditions (4 aspects x {positive, negative}) -- see _score_aspects
+        for the per-aspect common attention map and the weighted reduction, and
+        _aspect_errors_to_logits for the 8 -> 2 averaging.
+
+        Returns logits [n,2], class order [positive=0, negative=1]: logit_c = -E_c / tau.
+
+        [PERF] The `--residual_num_timesteps` timesteps are folded into the batch dimension, so the
+        scoring UNet runs ONCE per prompt on an [n*K, ...] batch instead of K sequential [n, ...]
+        forwards -- 8 forwards per call here vs 2 in the single-prompt parent.
+        """
+        K = args.residual_num_timesteps
+        eps_all, zt_all, t_all = _build_shared_eps_zt(z0, K)
+        E_pos_per_aspect, E_neg_per_aspect, _ = _score_aspects(z0, eps_all, zt_all, t_all, K)
+        return _aspect_errors_to_logits(E_pos_per_aspect, E_neg_per_aspect)
+
+    @torch.no_grad()
+    def residual_eval_class_scores(z0):
+        """EVALUATION class scorer -- the training estimator, at --eval_residual_num_timesteps.
+
+        This scenario has no external test classifier: the CelebA MobileNet predicts gender, not the
+        positive/negative axis this run optimizes, so it cannot score these images at all. Evaluation
+        therefore reuses EXACTLY the training signal -- the same 8 aspect prompts, the same per-aspect
+        common cross-attention maps, the same attention-weighted reduction and the same 8->2 averaging
+        (_build_shared_eps_zt -> _score_aspects -> _aspect_errors_to_logits, the identical helpers the
+        training loss calls). The only differences are deliberate:
+          - K = --eval_residual_num_timesteps (30) instead of --residual_num_timesteps (15), for a
+            lower-variance estimate. The timestep RANGE is the same (--residual_t_min/max).
+          - no_grad, and NO face gating: every generated image is scored (background / overall-tone
+            aspects are defined with or without a face, and gating would make the number of valid
+            samples vary per occupation, which would make the per-prompt metrics incomparable).
+
+        Scoring is chunked so the folded [n*K] batch never exceeds --eval_residual_max_rows.
+
+        z0: [n,4,H,W] clean latents (scheduler/UNet scale).
+        Returns:
+          preds   [n]      argmax class, 0 = positive, 1 = negative
+          probs   [n,2]    softmax of the logits
+          logits  [n,2]    [-E_pos/tau, -E_neg/tau]
+          E_pos_a [n,4]    per-aspect positive errors (column a = residual_aspects[a]), for logging
+          E_neg_a [n,4]    per-aspect negative errors
+        """
+        n = z0.shape[0]
+        if n == 0:
+            return (
+                torch.empty([0], dtype=torch.int64, device=z0.device),
+                torch.empty([0, 2], dtype=torch.float, device=z0.device),
+                torch.empty([0, 2], dtype=torch.float, device=z0.device),
+                torch.empty([0, len(residual_aspects)], dtype=torch.float, device=z0.device),
+                torch.empty([0, len(residual_aspects)], dtype=torch.float, device=z0.device),
+            )
+
+        K = args.eval_residual_num_timesteps
+        chunk = max(1, args.eval_residual_max_rows // max(K, 1))   # images per forward, so n*K <= cap
+        logits_chunks, E_pos_chunks, E_neg_chunks = [], [], []
+        for s in range(0, n, chunk):
+            z0_c = z0[s:s + chunk]
+            eps_all, zt_all, t_all = _build_shared_eps_zt(z0_c, K)
+            E_pos_pa, E_neg_pa, _ = _score_aspects(z0_c, eps_all, zt_all, t_all, K)
+            logits_chunks.append(_aspect_errors_to_logits(E_pos_pa, E_neg_pa))
+            E_pos_chunks.append(torch.stack(E_pos_pa, dim=1))       # [chunk, n_aspects]
+            E_neg_chunks.append(torch.stack(E_neg_pa, dim=1))
+
+        logits = torch.cat(logits_chunks, dim=0).float()
+        E_pos_a = torch.cat(E_pos_chunks, dim=0).float()
+        E_neg_a = torch.cat(E_neg_chunks, dim=0).float()
+        probs = torch.softmax(logits, dim=-1)
+        preds = probs.max(dim=-1).indices
+        return preds, probs, logits, E_pos_a, E_neg_a
 
     @torch.no_grad()
     def residual_face_indicators(z0):
         """NODETECTOR: residual-error face/no-face indicator replacing insightface get_face in the
-        TRAINING branch points. Same estimator family as residual_gender_logits, but with a UNIFORM
+        TRAINING branch points. Same estimator family as residual_multiprompt_logits, but with a UNIFORM
         spatial mean (NO attention weighting) and its own prompt pair / timestep grid:
             E_c  = mean_t mean_pixels || eps_pred(z_t, t, c) - eps ||^2 ,
                    t = --face_residual_num_timesteps (8) steps linspaced in
@@ -2182,7 +2440,7 @@ def main(args):
             face iff E(--face_residual_face_prompt) < E(--face_residual_nonface_prompt)
         The SAME fresh eps/zt per timestep is shared by both prompts (paired, low-variance), scored
         by the FROZEN scoring UNet under no_grad (the insightface detector it replaces was equally
-        non-differentiable). K folded into the batch dim like residual_gender_logits ([n*K,...]).
+        non-differentiable). K folded into the batch dim like residual_multiprompt_logits ([n*K,...]).
         Offline ablation (face_error_exp/exp100, 50 genuine-face vs 50 genuine-noface occupation
         images): "a photo of a face" vs "a faceless photo" = 88/100 at K=8, t50-950 (== its K=15
         score; K<8 degrades). Returns a bool tensor [n], same as get_face's face_indicators.
@@ -2214,131 +2472,69 @@ def main(args):
 
         return E["face"] < E["faceless"]                                              # bool [n]
 
-    def residual_gender_and_realism(z0):
-        """Fused residual-error scorer used by the training loss (SCR gender + SRR realism).
+    def residual_multiprompt_and_realism(z0):
+        """Fused residual-error scorer used by the training loss (MULTIPROMPT class + SRR realism).
 
-        A single eps/zt is sampled per timestep and scored under THREE frozen-SD text conditions:
-        woman / man (the SCR gender fair loss) and args.srr_prompt = "a photo of a realistic person"
-        (the SRR realism loss). The three passes share the same per-timestep eps (and identical zt
-        VALUES); the realism pass additionally masks the z0 gradient to the person region (see E_realistic).
-        Gradient flows z0 -> trainable model; the scorer (scoring_unet / scoring_text_encoder) stays
-        frozen, so E_realistic pulls z0 onto the frozen model's "realistic person" manifold (score
-        distillation on the realism prompt).
+        A single eps/zt is sampled per timestep and scored under NINE frozen-SD text conditions:
+        the 8 aspect x class prompts (the fair loss) and args.srr_prompt = "a photo of a realistic
+        person" (the SRR realism loss). All passes share the same per-timestep eps (and identical zt
+        VALUES); the realism pass additionally masks the z0 gradient to the subject region (see
+        E_realistic). Gradient flows z0 -> trainable model; the scorer (scoring_unet /
+        scoring_text_encoder) stays frozen, so E_realistic pulls z0 onto the frozen model's
+        "realistic person" manifold (score distillation on the realism prompt).
 
         z0: [n,4,H,W] clean latent in the scheduler/UNet scale (NOT detached).
 
         Returns:
-          logits_gender [n,2], class order [woman=0, man=1], logit_c = -E_c / tau. Woman/man use the
-              same attention-weighted spatial reduction as residual_gender_logits (identical estimator,
-              modulo the fresh random eps draw).
+          logits_gender [n,2], class order [positive=0, negative=1], logit_c = -E_c / tau. Built by
+              _score_aspects + _aspect_errors_to_logits, i.e. the identical estimator to
+              residual_multiprompt_logits (modulo the fresh random eps draw).
           E_realistic [n], the SRR loss per sample: squared residual for the realism prompt, meaned over
-              the WHOLE image (every pixel contributes to the VALUE), then averaged over timesteps. RAW
-              error -- NOT divided by tau. The GRADIENT is localized to the person/gender region by masking
-              the SCORER INPUT: non-region z0 pixels are detached before the realism UNet pass, so
-              d(E_realistic)/dz0 is exactly zero outside the min-max-normalized common_attn >=
-              args.attn_gate_thr region, while the value stays the true whole-image residual. (Masking the
-              residual instead would leave the value region-limited AND still leak z0 gradient through the
-              UNet's global receptive field, so INPUT masking is used to actually localize the gradient.)
-          common_attn [n,H,W], the sum-to-1 (detached) gender localization map used internally for the SRR
-              region mask, returned so the h-space SCR image loss can reuse it for its flip gradient-gate
-              (min-max normalized >= args.attn_gate_thr) without a second scorer forward.
+              the WHOLE image (uniform, NO attention weighting), then averaged over timesteps. RAW error
+              -- NOT divided by tau. MULTIPROMPT: the GRADIENT is now whole-image too -- the realism
+              prompt is scored on the same unmasked zt_all as the aspect prompts, so every z0 pixel
+              receives d(E_realistic)/dz0. (The parent file input-masked z0 to confine that gradient to
+              the subject region; that restriction is removed here.)
+          common_attn [n,H,W], the sum-to-1 (detached) localization map = mean of the four per-aspect
+              common maps (see _merge_aspect_attn), used internally for the SRR region mask and returned
+              for inspection/plotting. NOTE: in this file the SCR image loss NO LONGER consumes it --
+              the SCR spatial gradient gate is removed so the whole image can change.
 
         [PERF] The `--residual_num_timesteps` timesteps are folded into the batch dimension, so the
-        scoring UNet runs ONCE per prompt (woman/man on zt_all; realism on a gradient-masked zt of the
-        SAME value) on an [n*K, ...] batch instead of K sequential [n, ...] forwards. The woman/man gender
-        logits are unchanged vs residual_gender_logits (verified numerically equal, logits + grad); only
-        E_realistic's reduction and gradient-localization intentionally differ.
+        scoring UNet runs ONCE per prompt (8 aspect prompts on zt_all; realism on a gradient-masked zt
+        of the SAME value) on an [n*K, ...] batch instead of K sequential [n, ...] forwards.
         """
         n = z0.shape[0]
         H, W = z0.shape[-2], z0.shape[-1]
-        timesteps = torch.linspace(
-            args.residual_t_min, args.residual_t_max, steps=args.residual_num_timesteps, device=z0.device
-        ).round().long()
-        K = timesteps.shape[0]
+        # fresh eps per timestep, folded into the batch dim; shared by all 9 prompts (8 aspect + SRR)
+        K = args.residual_num_timesteps
+        eps_all, zt_all, t_all = _build_shared_eps_zt(z0, K)
 
-        # fresh eps per timestep (same order as the loop), folded into the batch dim: [n,K,...]->[n*K,...]
-        eps_list, zt_list = [], []
-        for t in timesteps:
-            t_batch = t.repeat(n)
-            eps_k = torch.randn_like(z0)                          # new eps per timestep, shared by all 3 prompts
-            zt_list.append(noise_scheduler.add_noise(z0, eps_k, t_batch))
-            eps_list.append(eps_k)
-        eps_all = torch.stack(eps_list, dim=1).reshape(n * K, *z0.shape[1:])
-        zt_all = torch.stack(zt_list, dim=1).reshape(n * K, *z0.shape[1:]).to(weight_dtype)
-        t_all = timesteps.repeat(n)
+        # Aspect prompts (attention-weighted, 4 aspects x {pos,neg}). The realism (SRR) prompt is
+        # scored SEPARATELY below, after the subject-region mask is known, so its z0 gradient can be
+        # restricted to that region.
+        E_pos_per_aspect, E_neg_per_aspect, common_attn_per_aspect = _score_aspects(
+            z0, eps_all, zt_all, t_all, K
+        )
+        logits_gender = _aspect_errors_to_logits(E_pos_per_aspect, E_neg_per_aspect)    # [n, 2]
+        common_attn = _merge_aspect_attn(common_attn_per_aspect)                        # [n,H,W], sum-to-1, detached
 
-        # Gender prompts (attention-weighted). The realism (SRR) prompt is scored SEPARATELY below,
-        # after the face-region mask is known, so its z0 gradient can be restricted to that region.
-        gender_prompts_cfg = [
-            ("woman", residual_woman_embeds, residual_woman_token_idxs),
-            ("man", residual_man_embeds, residual_man_token_idxs),
-        ]
-
-        residual_maps = {}                                        # cls -> [n,K,H,W] (grad-carrying)
-        attn_accum = torch.zeros(n, H, W, dtype=torch.float, device=z0.device)  # detached attention accumulator
-        attn_count = 0
-
-        for cls, embeds, tok_idxs in gender_prompts_cfg:
-            c = embeds.expand(n * K, -1, -1)
-            attn_capture_ctx.store = []
-            attn_capture_ctx.token_idxs = tok_idxs
-            attn_capture_ctx.enabled = True
-            eps_pred = scoring_unet(zt_all, t_all, encoder_hidden_states=c).sample
-            attn_capture_ctx.enabled = False
-            captured = attn_capture_ctx.store
-            attn_capture_ctx.store = []
-
-            # channel-mean squared residual -> [n*K,H,W] -> [n,K,H,W] (keeps grad to z0)
-            residual_maps[cls] = (eps_pred.float() - eps_all.float()).pow(2).mean(dim=1).view(n, K, H, W)
-
-            # accumulate the class-token cross-attention maps (detached), each resized to (H,W).
-            for col, heads in captured:
-                hw = col.shape[-1]
-                s = int(round(math.sqrt(hw)))
-                a = col.view(n * K, heads, s, s).float()                            # [n*K, heads, s, s]
-                a = torch.nn.functional.interpolate(a, size=(H, W), mode="bilinear", align_corners=False)
-                a = a.mean(dim=1).view(n, K, H, W).mean(dim=1)                      # mean heads, then K -> [n,H,W]
-                attn_accum = attn_accum + a
-                attn_count += 1
-
-        # gender: common attention map (mean over {timesteps, woman/man, blocks, heads}), sum-to-1, detached
-        common_attn = attn_accum / max(attn_count, 1)                                   # [n,H,W]
-        common_attn = common_attn / (common_attn.sum(dim=(1, 2), keepdim=True) + 1e-8)
-        common_attn = common_attn.detach()
-        # spatial reduction per --gender_attn_weight: 'attn' = attention-weighted SUM (original),
-        # 'none' = uniform mean over all pixels (the FULL error). common_attn is still computed above
-        # regardless, because the SRR region mask below (and the h-space SCR flip gate, via the returned
-        # map) use it in BOTH modes -- only the CLASS-ERROR weighting is switched off by 'none'.
-        E_woman = reduce_gender_residual(residual_maps["woman"], common_attn)           # [n]
-        E_man = reduce_gender_residual(residual_maps["man"], common_attn)               # [n]
-        logits_gender = torch.stack([-E_woman / args.tau, -E_man / args.tau], dim=1)    # [n, 2]
-
-        # -------- SRR realism: VALUE over the WHOLE image, GRADIENT only in the person/gender region --------
-        # Person/gender region = min-max-normalized common_attn hard-thresholded at args.attn_gate_thr.
-        cmin = common_attn.amin(dim=(1, 2), keepdim=True)                               # [n,1,1]
-        cmax = common_attn.amax(dim=(1, 2), keepdim=True)                               # [n,1,1]
-        attn_gate = ((common_attn - cmin) / (cmax - cmin + 1e-8)).clamp(0, 1)           # [n,H,W] min-max, detached
-        face_mask = (attn_gate >= args.attn_gate_thr).to(z0.dtype)                      # [n,H,W] hard region, detached
-
-        # Localize the gradient on the SCORER INPUT (not the residual). The scoring UNet has a global
-        # receptive field, so masking the residual would still leak z0 gradient through the UNet; masking
-        # the input does not. z0_srr equals z0 in VALUE (detach keeps the forward), so the realism residual
-        # is the TRUE whole-image residual, but d/dz0 is exactly zero outside the region (non-region z0 is
-        # detached). Region z0 pixels still drive -- and receive gradient from -- the whole-image value.
-        face_mask_c = face_mask.unsqueeze(1)                                            # [n,1,H,W] over channels
-        z0_srr = face_mask_c * z0 + (1.0 - face_mask_c) * z0.detach()                   # value == z0; grad only in region
-        zt_srr_all = torch.stack(
-            [noise_scheduler.add_noise(z0_srr, eps_list[k], timesteps[k].repeat(n)) for k in range(K)],
-            dim=1,
-        ).reshape(n * K, *z0.shape[1:]).to(weight_dtype)                                # same VALUE as zt_all, grad masked
+        # -------- SRR realism: VALUE and GRADIENT both over the WHOLE image --------
+        # MULTIPROMPT: the region restriction is REMOVED. The parent file input-masked z0 (non-region
+        # pixels detached, region = min-max common_attn >= --attn_gate_thr) so d(E_realistic)/dz0 was
+        # exactly zero outside the subject; that existed to keep the realism pull local to the person.
+        # This task wants the whole image to move, so the realism prompt is now scored on the SAME
+        # UNMASKED zt_all the aspect prompts use: every z0 pixel both drives the value AND receives
+        # gradient. No z0_srr / zt_srr_all / face_mask, and --attn_gate_thr is now unused everywhere.
         c_real = residual_realistic_embeds.expand(n * K, -1, -1)
-        eps_pred_real = scoring_unet(zt_srr_all, t_all, encoder_hidden_states=c_real).sample
+        eps_pred_real = scoring_unet(zt_all, t_all, encoder_hidden_states=c_real).sample
         residual_realistic = (eps_pred_real.float() - eps_all.float()).pow(2).mean(dim=1).view(n, K, H, W)
         # WHOLE-image mean over all H*W pixels (no region restriction on the value), then mean over K -> [n].
         E_realistic = residual_realistic.mean(dim=(2, 3)).mean(dim=1)                   # [n]
 
-        # common_attn [n,H,W] (sum-to-1, detached) is also returned so the h-space SCR flip gate can reuse
-        # the SAME gender localization map (min-max normalized >= attn_gate_thr) without a second scorer pass.
+        # common_attn [n,H,W] (sum-to-1, detached) is returned for inspection/plotting. In the parent
+        # file it also fed the h-space SCR flip gradient gate; that gate is REMOVED here, so nothing
+        # downstream consumes it any more.
         return logits_gender, E_realistic, common_attn
     def get_face_gender(z0, selector=None, fill_value=-1):
         """Drop-in replacement for the removed mnet classifier, now scoring the clean latent z0.
@@ -2346,7 +2542,8 @@ def main(args):
         z0: [B,4,64,64] clean latents (scheduler/UNet scale).
         selector (bool [B]) == face_indicators: only face-detected latents are scored; the rest are
             filled with fill_value (mirrors the previous mnet behaviour so no-face images are excluded).
-        Returns (preds_gender, probs_gender, logits_gender), class order [woman=0, man=1].
+        Returns (preds_gender, probs_gender, logits_gender), class order [positive=0, negative=1]
+            (MULTIPROMPT: the *_gender names are kept, but the axis is now sentiment -- see file header).
         Raw logits are returned so callers can feed them straight into cross_entropy (no pre-softmax).
         """
         if selector != None:
@@ -2359,7 +2556,7 @@ def main(args):
             probs_gender = torch.empty([0,2], dtype=torch.float, device=z0.device)
             preds_gender = torch.empty([0], dtype=torch.int64, device=z0.device)
         else:
-            logits_gender = residual_gender_logits(z0_w_faces)
+            logits_gender = residual_multiprompt_logits(z0_w_faces)
             probs_gender = torch.softmax(logits_gender, dim=-1)
             preds_gender = probs_gender.max(dim=-1).indices
 
@@ -2390,73 +2587,70 @@ def main(args):
             return preds_gender, probs_gender, logits_gender
 
     @torch.no_grad()
-    def compute_gender_attmaps(z0):
-        """Visualization-only: aggregate the woman/man class-token cross-attention maps and the common map.
+    def compute_aspect_attmaps(z0):
+        """Visualization-only: the FOUR per-aspect common cross-attention maps plus their mean.
 
-        Mirrors the attention aggregation inside residual_gender_logits but keeps woman/man separate and
-        runs under no_grad. Returns (woman_map, man_map, common_map), each [B,H,W] normalized so that the
-        spatial values sum to 1 per image (common_map == the actual weighting mask used by the scorer).
+        Mirrors the attention aggregation inside _score_aspects -- for each aspect, both of its class
+        prompts contribute to that aspect's map -- but runs under no_grad and per-timestep (batch n
+        instead of n*K, to keep the visualization pass cheap in memory).
+
+        Returns (aspect_maps, common_map):
+          aspect_maps: list of 4 tensors [B,H,W], aligned with residual_aspects.
+          common_map:  [B,H,W], the mean of the four (== what _merge_aspect_attn produces).
+        Every map is normalized so its spatial values sum to 1 per image, matching the actual
+        weighting masks used by the scorer.
         """
         n = z0.shape[0]
         H, W = z0.shape[-2], z0.shape[-1]
         timesteps = torch.linspace(
             args.residual_t_min, args.residual_t_max, steps=args.residual_num_timesteps, device=z0.device
         ).round().long()
-        c_woman = residual_woman_embeds.expand(n, -1, -1)
-        c_man = residual_man_embeds.expand(n, -1, -1)
-        prompts_cfg = [
-            ("woman", c_woman, residual_woman_token_idxs),
-            ("man", c_man, residual_man_token_idxs),
-        ]
-        accum = {
-            "woman": torch.zeros(n, H, W, dtype=torch.float, device=z0.device),
-            "man": torch.zeros(n, H, W, dtype=torch.float, device=z0.device),
-        }
-        counts = {"woman": 0, "man": 0}
+        accum = [torch.zeros(n, H, W, dtype=torch.float, device=z0.device) for _ in residual_aspects]
+        counts = [0 for _ in residual_aspects]
         for t in timesteps:
             t_batch = t.repeat(n)
             eps = torch.randn_like(z0)
             zt_in = noise_scheduler.add_noise(z0, eps, t_batch).to(weight_dtype)
-            for cls, c, tok_idxs in prompts_cfg:
-                attn_capture_ctx.store = []
-                attn_capture_ctx.token_idxs = tok_idxs
-                attn_capture_ctx.enabled = True
-                _ = scoring_unet(zt_in, t_batch, encoder_hidden_states=c).sample
-                attn_capture_ctx.enabled = False
-                captured = attn_capture_ctx.store
-                attn_capture_ctx.store = []
-                for col, heads in captured:
-                    hw = col.shape[-1]
-                    s = int(round(math.sqrt(hw)))
-                    a = col.view(n, heads, s, s).float()
-                    a = torch.nn.functional.interpolate(a, size=(H, W), mode="bilinear", align_corners=False)
-                    accum[cls] = accum[cls] + a.mean(dim=1)
-                    counts[cls] += 1
-        woman_map = accum["woman"] / max(counts["woman"], 1)
-        man_map = accum["man"] / max(counts["man"], 1)
-        common_map = (woman_map + man_map) / 2.0   # == common_attn (mean over prompts too), before normalization
+            for a_i, asp in enumerate(residual_aspects):
+                for cls in ("pos", "neg"):
+                    c = asp[f"{cls}_embeds"].expand(n, -1, -1)
+                    attn_capture_ctx.store = []
+                    attn_capture_ctx.token_idxs = asp[f"{cls}_token_idxs"]
+                    attn_capture_ctx.enabled = True
+                    _ = scoring_unet(zt_in, t_batch, encoder_hidden_states=c).sample
+                    attn_capture_ctx.enabled = False
+                    captured = attn_capture_ctx.store
+                    attn_capture_ctx.store = []
+                    for col, heads in captured:
+                        hw = col.shape[-1]
+                        s = int(round(math.sqrt(hw)))
+                        a = col.view(n, heads, s, s).float()
+                        a = torch.nn.functional.interpolate(a, size=(H, W), mode="bilinear", align_corners=False)
+                        accum[a_i] = accum[a_i] + a.mean(dim=1)
+                        counts[a_i] += 1
 
         def _norm(m):
             return m / (m.sum(dim=(1, 2), keepdim=True) + 1e-8)
-        return _norm(woman_map), _norm(man_map), _norm(common_map)
+        aspect_maps = [_norm(accum[a_i] / max(counts[a_i], 1)) for a_i in range(len(residual_aspects))]
+        common_map = _norm(torch.stack(aspect_maps, dim=0).mean(dim=0))
+        return aspect_maps, common_map
 
-    def save_gender_attmap_panels(z0, images, save_to, max_imgs=16):
-        """Save a grid where each row is [ generated image | woman-attn | man-attn | common-attn ] (overlays)."""
+    def save_aspect_attmap_panels(z0, images, save_to, max_imgs=16):
+        """Save a grid where each row is [ generated image | aspect1..aspect4 attn | common attn ] (overlays)."""
         n = min(z0.shape[0], images.shape[0], max_imgs)
         if n == 0:
             return
-        woman_map, man_map, common_map = compute_gender_attmaps(z0[:n])
+        aspect_maps, common_map = compute_aspect_attmaps(z0[:n])
         imgs = images[:n].detach().cpu()
-        labels = ["generated", "woman-attn", "man-attn", "common-attn"]
+        labels = ["generated"] + [f"{asp['name']}-attn" for asp in residual_aspects] + ["common-attn"]
         rows = []
         for i in range(n):
             base_pil = transforms.ToPILImage()(imgs[i].mul(0.5).add(0.5).clamp(0, 1))
-            panels = [
-                base_pil,
-                attmap_overlay_on_image(woman_map[i], imgs[i]),
-                attmap_overlay_on_image(man_map[i], imgs[i]),
-                attmap_overlay_on_image(common_map[i], imgs[i]),
-            ]
+            panels = (
+                [base_pil]
+                + [attmap_overlay_on_image(m[i], imgs[i]) for m in aspect_maps]
+                + [attmap_overlay_on_image(common_map[i], imgs[i])]
+            )
             w, h = base_pil.size
             row = Image.new("RGB", (w * len(panels), h))
             for j, (p, lab) in enumerate(zip(panels, labels)):
@@ -2472,63 +2666,20 @@ def main(args):
             os.makedirs(os.path.dirname(save_to), exist_ok=True)
         grid.save(save_to, quality=92)
 
-    def save_grad_gate_panels(images, common_attn, attn_gate, scr_grad_mask, release, targets,
-                              preds_gender_ori, save_to, thr, factor2, max_imgs=16):
-        """Save the SCR flip gradient-gate visualization = the min-max-normalized, hard-masked (>= thr)
-        region whose SCR gradient is scaled by factor2. These are the EXACT tensors that gate the gradient
-        in the training loop (already detached), so the panel shows what actually happened this step.
-
-        Each row = [ generated | common-attn (scoring weight, sum-to-1) | min-max gate | hard-mask (>= thr) |
-                     applied damp (x factor2) ].
-          - common-attn: the attention map multiplied into the residual error inside the gender scorer.
-          - min-max gate: (common-attn - min)/(max - min), the value thresholded at thr.
-          - hard-mask: gate >= thr (where damping WOULD apply for a released sample), regardless of release.
-          - applied damp: the region actually multiplied by factor2 this step = (hard-mask AND released);
-            empty for kept (agree) samples. A per-row caption prints t=target, p_ori=pred_gender_ori, release.
-        """
-        n = min(images.shape[0], common_attn.shape[0], max_imgs)
-        if n == 0:
-            return
-        imgs = images[:n].detach().cpu()
-        common = common_attn[:n].detach().float().cpu()
-        gate = attn_gate[:n].detach().float().cpu()
-        hard = (gate >= thr).float()                                        # [n,H,W] min-max hard mask
-        gmask = scr_grad_mask[:n].detach().float().cpu()
-        if gmask.dim() == 4:
-            gmask = gmask[:, 0]                                             # [n,1,H,W] -> [n,H,W]
-        applied = (gmask < (1.0 - 1e-4)).float()                            # damped iff mask < 1 (== factor2 region)
-        labels = ["generated", "common-attn", "min-max gate", f"hard >= {thr:g}", f"applied x{factor2:g}"]
-        rows = []
-        for i in range(n):
-            t = int(targets[i].item()) if targets is not None else -9
-            p = int(preds_gender_ori[i].item()) if preds_gender_ori is not None else -9
-            rel = bool(release[i].item()) if release is not None else False
-            base_pil = transforms.ToPILImage()(imgs[i].mul(0.5).add(0.5).clamp(0, 1))
-            panels = [
-                base_pil,
-                attmap_overlay_on_image(common[i], imgs[i]),
-                attmap_overlay_on_image(gate[i], imgs[i]),
-                mask_overlay_on_image(hard[i], imgs[i], color=(255, 165, 0)),
-                mask_overlay_on_image(applied[i], imgs[i], color=(0, 220, 255)),
-            ]
-            w, h = base_pil.size
-            row = Image.new("RGB", (w * len(panels), h))
-            for jj, (pl, lab) in enumerate(zip(panels, labels)):
-                pl = pl.resize((w, h)).copy()
-                ImageDraw.Draw(pl).text((5, 5), f"{lab} #{i}", fill="white")
-                row.paste(pl, (jj * w, 0))
-            ImageDraw.Draw(row).text((5, h - 14), f"t={t} p_ori={p} release={rel} damp=x{factor2:g}", fill="yellow")
-            rows.append(row)
-        gw, gh = rows[0].size
-        grid = Image.new("RGB", (gw, gh * len(rows)))
-        for i, r in enumerate(rows):
-            grid.paste(r, (0, i * gh))
-        if os.path.dirname(save_to) and not os.path.exists(os.path.dirname(save_to)):
-            os.makedirs(os.path.dirname(save_to), exist_ok=True)
-        grid.save(save_to, quality=92)
+    # MULTIPROMPT: save_grad_gate_panels() is DELETED here. It visualized the SCR spatial
+    # gradient gate (min-max attn >= --attn_gate_thr, damped by --factor2 for flip/uncertain
+    # samples), and that gate no longer exists in this file -- the SCR gradient is unmodified
+    # everywhere so the whole image, not just the subject region, is free to change.
+    # Consequently no "train-<step>_gradgate.jpg" is written and no "train_grad_gate" image is
+    # logged to wandb; the per-aspect attention panels (train-<step>_attmap.jpg) remain.
 
     def get_face_gender_test(face_chips, selector=None, fill_value=-1):
         """for the separately-trained CelebA gender *test* classifier (evaluation only).
+
+        MULTIPROMPT/implicit_aaai: CURRENTLY UNCALLED. This classifier predicts GENDER, which is not
+        the positive/negative axis this run optimizes, so evaluate_process now scores with
+        residual_eval_class_scores instead. Kept (along with get_face / get_face_app / get_face_FR and
+        their loaded models) so a gender A/B can be re-enabled by calling it again.
 
         Identical interface to get_face_gender, but gender_classifier_test outputs 2 logits
         directly (gender only), so there is no 40-attribute reshape / index-20 selection.
@@ -2650,29 +2801,49 @@ def main(args):
                     "CLIP-I": [],
                     "DINO": [],
                 }
+                # MULTIPROMPT eval: pre-finetune baseline from the same estimator, and the per-aspect
+                # error breakdown, so it is visible WHICH aspect (expressions / clothing+actions /
+                # background / overall tone) carries the bias and how far it moved from the baseline.
+                logs_i["gender_gap_ori"] = []
+                logs_i["gender_gap_abs_ori"] = []
+                for _asp in residual_aspects:
+                    logs_i[f"E_pos_{_asp['name']}"] = []
+                    logs_i[f"E_neg_{_asp['name']}"] = []
+                    logs_i[f"Egap_{_asp['name']}"] = []          # E_neg - E_pos, finetuned images
+                    logs_i[f"Egap_ori_{_asp['name']}"] = []      # E_neg - E_pos, original images
                 log_imgs_i = {}
             ################################################
             # step 1: generate all ori images
             images_ori = []
+            z0_ori_list = []
             N = math.ceil(noises_i.shape[0] / args.val_GPU_batch_size)
             for j in range(N):
                 noises_ij = noises_i[args.val_GPU_batch_size*j:args.val_GPU_batch_size*(j+1)]
                 if args.train_text_encoder and args.train_unet:
-                    images_ij = generate_image_no_gradient(prompt_i, noises_ij, num_denoising_steps, which_text_encoder=eval_text_encoder, which_unet=eval_unet, skip_denoise_frac=0.0)
+                    images_ij, z0_ij = generate_image_no_gradient(prompt_i, noises_ij, num_denoising_steps, which_text_encoder=eval_text_encoder, which_unet=eval_unet, return_latents=True, skip_denoise_frac=0.0)
                 elif args.train_text_encoder and not args.train_unet:
-                    images_ij = generate_image_no_gradient(prompt_i, noises_ij, num_denoising_steps, which_text_encoder=eval_text_encoder, which_unet=unet, skip_denoise_frac=0.0)
+                    images_ij, z0_ij = generate_image_no_gradient(prompt_i, noises_ij, num_denoising_steps, which_text_encoder=eval_text_encoder, which_unet=unet, return_latents=True, skip_denoise_frac=0.0)
                 elif not args.train_text_encoder and args.train_unet:
-                    images_ij = generate_image_no_gradient(prompt_i, noises_ij, num_denoising_steps, which_text_encoder=text_encoder, which_unet=eval_unet, skip_denoise_frac=0.0)
+                    images_ij, z0_ij = generate_image_no_gradient(prompt_i, noises_ij, num_denoising_steps, which_text_encoder=text_encoder, which_unet=eval_unet, return_latents=True, skip_denoise_frac=0.0)
                 images_ori.append(images_ij)
+                z0_ori_list.append(z0_ij)
             images_ori = torch.cat(images_ori)
-            face_indicators_ori, face_bboxs_ori, face_chips_ori, face_landmarks_ori, aligned_face_chips_ori = get_face(images_ori)
-            preds_gender_ori, probs_gender_ori, logits_gender_ori = get_face_gender_test(face_chips_ori, selector=face_indicators_ori, fill_value=-1)
+            z0_ori_eval = torch.cat(z0_ori_list)
+            # MULTIPROMPT eval: score with the TRAINING residual estimator at K=--eval_residual_num_timesteps,
+            # NOT the CelebA MobileNet (it predicts gender, which is not this run's axis). No face gating:
+            # every image is scored, so face_indicators is all-True and face_bboxs is a -1 dummy (the bbox
+            # was only ever consumed by plot_in_grid, exactly as in the training branch).
+            preds_gender_ori, probs_gender_ori, logits_gender_ori, E_pos_a_ori, E_neg_a_ori = residual_eval_class_scores(z0_ori_eval)
+            face_indicators_ori = torch.ones([images_ori.shape[0]], dtype=torch.bool, device=images_ori.device)
+            face_bboxs_ori = torch.ones([images_ori.shape[0], 4], dtype=torch.long, device=images_ori.device) * (-1)
 
             images_ori_all = customized_all_gather(images_ori, accelerator, return_tensor_other_processes=False)
             face_indicators_ori_all = customized_all_gather(face_indicators_ori, accelerator, return_tensor_other_processes=False)
             face_bboxs_ori_all = customized_all_gather(face_bboxs_ori, accelerator, return_tensor_other_processes=False)
             preds_gender_ori_all = customized_all_gather(preds_gender_ori, accelerator, return_tensor_other_processes=False)
             probs_gender_ori_all = customized_all_gather(probs_gender_ori, accelerator, return_tensor_other_processes=False)
+            E_pos_a_ori_all = customized_all_gather(E_pos_a_ori, accelerator, return_tensor_other_processes=False)
+            E_neg_a_ori_all = customized_all_gather(E_neg_a_ori, accelerator, return_tensor_other_processes=False)
 
             # keep only the first val_keep gathered images (see --val_images_per_prompt_total)
             images_ori_all = images_ori_all[:val_keep]
@@ -2680,6 +2851,21 @@ def main(args):
             face_bboxs_ori_all = face_bboxs_ori_all[:val_keep]
             preds_gender_ori_all = preds_gender_ori_all[:val_keep]
             probs_gender_ori_all = probs_gender_ori_all[:val_keep]
+            E_pos_a_ori_all = E_pos_a_ori_all[:val_keep]
+            E_neg_a_ori_all = E_neg_a_ori_all[:val_keep]
+
+            if accelerator.is_main_process:
+                # ORIGINAL (pre-finetune) baseline, scored with the SAME residual estimator. This is what
+                # the finetuned numbers above should be compared against: the ori gap is the bias the
+                # frozen model already had for this occupation.
+                probs_ori_tmp = probs_gender_ori_all[(probs_gender_ori_all != -1).all(dim=-1)]
+                gender_gap_ori = (((probs_ori_tmp[:,1]>=0.5)*(probs_ori_tmp[:,1]<=1)).float().mean() - ((probs_ori_tmp[:,1]>=0)*(probs_ori_tmp[:,1]<=0.5)).float().mean()).item()
+                logs_i["gender_gap_ori"].append(gender_gap_ori)
+                logs_i["gender_gap_abs_ori"].append(abs(gender_gap_ori))
+                for a_i, _asp in enumerate(residual_aspects):
+                    logs_i[f"Egap_ori_{_asp['name']}"].append(
+                        (E_neg_a_ori_all[:, a_i].float() - E_pos_a_ori_all[:, a_i].float()).mean().item()
+                    )
 
             if accelerator.is_main_process:
                 save_to = os.path.join(args.imgs_save_dir, f"eval_{name}_{global_step}_{prompt_i}_ori.jpg")
@@ -2695,21 +2881,28 @@ def main(args):
 
             
             images = []
+            z0_list = []
             N = math.ceil(noises_i.shape[0] / args.val_GPU_batch_size)
             for j in range(N):
                 noises_ij = noises_i[args.val_GPU_batch_size*j:args.val_GPU_batch_size*(j+1)]
-                images_ij = generate_image_no_gradient(prompt_i, noises_ij, num_denoising_steps, which_text_encoder=which_text_encoder, which_unet=which_unet, skip_denoise_frac=0.0)
+                images_ij, z0_ij = generate_image_no_gradient(prompt_i, noises_ij, num_denoising_steps, which_text_encoder=which_text_encoder, which_unet=which_unet, return_latents=True, skip_denoise_frac=0.0)
                 images.append(images_ij)
+                z0_list.append(z0_ij)
             images = torch.cat(images)
-            
-            face_indicators, face_bboxs, face_chips, face_landmarks, aligned_face_chips = get_face(images)
-            preds_gender, probs_gender, logits_gender = get_face_gender_test(face_chips, selector=face_indicators, fill_value=-1)
+            z0_eval = torch.cat(z0_list)
+
+            # MULTIPROMPT eval: same residual estimator as above / as training (see residual_eval_class_scores)
+            preds_gender, probs_gender, logits_gender, E_pos_a, E_neg_a = residual_eval_class_scores(z0_eval)
+            face_indicators = torch.ones([images.shape[0]], dtype=torch.bool, device=images.device)
+            face_bboxs = torch.ones([images.shape[0], 4], dtype=torch.long, device=images.device) * (-1)
 
             images_all = customized_all_gather(images, accelerator, return_tensor_other_processes=False)
             face_indicators_all = customized_all_gather(face_indicators, accelerator, return_tensor_other_processes=False)
             face_bboxs_all = customized_all_gather(face_bboxs, accelerator, return_tensor_other_processes=False)
             preds_gender_all = customized_all_gather(preds_gender, accelerator, return_tensor_other_processes=False)
             probs_gender_all = customized_all_gather(probs_gender, accelerator, return_tensor_other_processes=False)
+            E_pos_a_all = customized_all_gather(E_pos_a, accelerator, return_tensor_other_processes=False)
+            E_neg_a_all = customized_all_gather(E_neg_a, accelerator, return_tensor_other_processes=False)
 
             # keep only the first val_keep gathered images (see --val_images_per_prompt_total)
             images_all = images_all[:val_keep]
@@ -2717,6 +2910,8 @@ def main(args):
             face_bboxs_all = face_bboxs_all[:val_keep]
             preds_gender_all = preds_gender_all[:val_keep]
             probs_gender_all = probs_gender_all[:val_keep]
+            E_pos_a_all = E_pos_a_all[:val_keep]
+            E_neg_a_all = E_neg_a_all[:val_keep]
 
             ################################################
             # eval fidelity / text-alignment metrics (CLIP-T, CLIP-I, DINO) are ALL computed on the
@@ -2740,12 +2935,27 @@ def main(args):
                 log_imgs_i["img_generated"] = [save_to]
             
             if accelerator.is_main_process:
+                # NOTE (MULTIPROMPT): these keep their *_gender names for wandb continuity, but they are
+                # now the POSITIVE(0)/NEGATIVE(1) metrics of the residual scorer, not gender. probs[:,1]
+                # is P(negative), so gender_gap = frac(negative) - frac(positive) in [-1,1]; 0 == balanced.
+                # With no face gating every image is scored, so the (!=-1) filter is now a no-op kept for
+                # shape safety.
                 probs_tmp = probs_gender_all[(probs_gender_all!=-1).all(dim=-1)]
                 gender_gap = (((probs_tmp[:,1]>=0.5)*(probs_tmp[:,1]<=1)).float().mean() - ((probs_tmp[:,1]>=0)*(probs_tmp[:,1]<=0.5)).float().mean()).item()
                 gender_pred_between_02_08 = ((probs_tmp[:,1]>=0.2)*(probs_tmp[:,1]<=0.8)).float().mean().item()
                 logs_i["gender_gap"].append(gender_gap)
                 logs_i["gender_gap_abs"].append(abs(gender_gap))
                 logs_i["gender_pred_between_0.2_0.8"].append(abs(gender_pred_between_02_08))
+
+                # per-aspect error breakdown, averaged over this prompt's evaluated images.
+                # Egap_<aspect> = mean(E_neg_a - E_pos_a): > 0 means the images sit CLOSER to that
+                # aspect's POSITIVE prompt (lower positive error), < 0 means closer to its NEGATIVE one.
+                for a_i, _asp in enumerate(residual_aspects):
+                    e_pos_a = E_pos_a_all[:, a_i].float()
+                    e_neg_a = E_neg_a_all[:, a_i].float()
+                    logs_i[f"E_pos_{_asp['name']}"].append(e_pos_a.mean().item())
+                    logs_i[f"E_neg_{_asp['name']}"].append(e_neg_a.mean().item())
+                    logs_i[f"Egap_{_asp['name']}"].append((e_neg_a - e_pos_a).mean().item())
 
                 # CLIP-T / CLIP-I / DINO via open_clip bigG + eval DINOv2 on the MAIN PROCESS ONLY,
                 # over the already all-gathered & val_keep-truncated images_all / images_ori_all
@@ -3074,9 +3284,10 @@ def main(args):
                         log_imgs_i["img_generated"] = [save_to]
 
                         if args.save_attn_maps:
-                            # gender-classification cross-attention maps for this process's generated batch
+                            # MULTIPROMPT: per-aspect cross-attention maps (4 aspects + their mean) for
+                            # this process's generated batch
                             attmap_save_to = os.path.join(args.imgs_save_dir, f"train-{global_step}_attmap.jpg")
-                            save_gender_attmap_panels(z0, images, attmap_save_to)
+                            save_aspect_attmap_panels(z0, images, attmap_save_to)
                             log_imgs_i["attmap_generated"] = [attmap_save_to]
 
                 if accelerator.is_main_process:
@@ -3172,51 +3383,28 @@ def main(args):
                 # bboxes/chips are not used anywhere in this loss path.
                 face_indicators_ij = residual_face_indicators(z0_ij)
                 # Branch B: fused residual scorer on z0_ij (grad flows z0 -> trainable model).
-                #   - logits_gender_ij [n,2]: woman/man residual-error gender logits (SCR fair loss).
+                #   - logits_gender_ij [n,2]: MULTIPROMPT positive/negative residual-error logits, built
+                #     from the 8 aspect x class errors averaged per class (fair loss).
                 #   - loss_SRR_ij [n]: "a photo of a realistic person" residual error (SRR realism loss).
-                #   - common_attn_ij [n,H,W]: sum-to-1 gender localization map, reused by the SCR flip gate
-                #     below (no extra scorer forward). Both losses share the same per-timestep eps/zt.
-                logits_gender_ij, loss_SRR_ij, common_attn_ij = residual_gender_and_realism(z0_ij)
-                # Zero the attn for no-face FINETUNE samples so they are never damped (mirrors debias's
-                # "if no face, skip" / the Face_hspace get_face_gender selector filling non-faces with zeros).
-                common_attn_ij = common_attn_ij * face_indicators_ij.view(-1, 1, 1).to(common_attn_ij.dtype)
+                #   - common_attn_ij [n,H,W]: sum-to-1 localization map (mean of the 4 aspect maps). It is
+                #     used INSIDE the scorer for the SRR gradient mask and is NOT consumed here any more --
+                #     the SCR spatial gradient gate that used to read it is removed (see Branch A).
+                #     All losses share the same per-timestep eps/zt.
+                logits_gender_ij, loss_SRR_ij, common_attn_ij = residual_multiprompt_and_realism(z0_ij)
 
                 # Branch A: SCR image loss (scoring-space, FROZEN feature extractor) -- replaces the CLIP/DINO img loss.
                 #   re-noise the ORIGINAL (z0_ori) and FINETUNE (z0_ij) latents to the SAME zt (shared eps & t)
                 #   and MSE the FROZEN scoring UNet's mid_block (h-space) output under the frozen generation prompt.
                 #   grad: h_ft -> zt_ft -> z0_ij -> generation (reaches up_blocks); h_ori is a detached target.
-                #   FLIP RELEASE: for flip OR uncertain samples, multiply the SCR gradient by --factor2 inside
-                #   the face/gender region (min-max attn >= --attn_gate_thr), x1 else. Applied via a hook on the
-                #   SCR-only tensor zt_ft, so loss_fair/loss_SRR gradients are untouched.
-                #   The release set MATCHES the debias apply_grad_hook_face decision exactly:
-                #     debias damps when {target == -1} OR {target != pred_gender_ori}   (the `if target==-1`
-                #     branch fires first/unconditionally), and keeps only when {target != -1 AND target == pred_ori}.
-                #   So release_ij = (target != pred_ori) | (target == -1). The extra `| (target == -1)` term (vs the
-                #   plain `!=`) covers the {target==-1 AND pred_ori==-1} corner, which `-1 != -1 == False` would
-                #   otherwise (wrongly) treat as "agree -> keep". No-face FINETUNE samples were zeroed above ->
-                #   attn_gate==0 < thr -> no damping.
+                #   MULTIPROMPT: NO SPATIAL GRADIENT GATE. The parent file hooked zt_ft to damp the SCR
+                #   gradient by --factor2 inside the min-max attention region (>= --attn_gate_thr) for
+                #   flip/uncertain samples, which deliberately confined the edit to the subject/face. This
+                #   task wants the WHOLE image to move, so that hook -- and the attn_gate / release_ij /
+                #   scr_grad_mask tensors that fed it -- are gone; zt_ft now receives its gradient
+                #   unmodified everywhere. The PER-SAMPLE dynamic_weights (--factor1) below are unchanged,
+                #   so flip/uncertain samples are still down-weighted as a whole, just not region-wise.
                 z0_ori_ij = z0_ori[idxs_ij]
                 scr_gen_embeds_ij = scr_gen_embeds.expand(len(idxs_ij), -1, -1)
-
-                cmin = common_attn_ij.amin(dim=(1, 2), keepdim=True)
-                cmax = common_attn_ij.amax(dim=(1, 2), keepdim=True)
-                attn_gate = ((common_attn_ij - cmin) / (cmax - cmin + 1e-8)).clamp(0, 1)          # [chunk,64,64] min-max
-                release_ij = (targets_ij != preds_gender_ori_ij) | (targets_ij == -1)               # debias-aligned: flip OR uncertain(-1)
-                scr_grad_mask = torch.ones_like(attn_gate)
-                scr_grad_mask = torch.where((attn_gate >= args.attn_gate_thr) & release_ij[:, None, None],
-                                            torch.full_like(scr_grad_mask, args.factor2), scr_grad_mask)
-                scr_grad_mask = scr_grad_mask[:, None, :, :].to(z0_ij.dtype)                        # [chunk,1,64,64]
-
-                # Visualize/save the flip gradient-gate: min-max normalized attn + hard mask (--attn_gate_thr)
-                # and the region actually damped by --factor2 this step. Uses the exact gating tensors above.
-                if accelerator.is_main_process and args.save_attn_maps and (step % args.train_plot_every_n_iter == 0) and j == 0:
-                    grad_gate_save_to = os.path.join(args.imgs_save_dir, f"train-{global_step}_gradgate.jpg")
-                    save_grad_gate_panels(
-                        images_ij, common_attn_ij, attn_gate, scr_grad_mask, release_ij,
-                        targets_ij, preds_gender_ori_ij, grad_gate_save_to,
-                        thr=args.attn_gate_thr, factor2=args.factor2,
-                    )
-                    log_imgs_i["grad_gate"] = [grad_gate_save_to]
 
                 scr_mid_store = []
                 def _scr_mid_hook(_m, _in, _out):
@@ -3227,7 +3415,7 @@ def main(args):
                     _tb = _t.repeat(len(idxs_ij))
                     _eps = torch.randn_like(z0_ij)
                     zt_ft = noise_scheduler.add_noise(z0_ij, _eps, _tb)                             # grad -> z0_ij
-                    zt_ft.register_hook(lambda g, mm=scr_grad_mask: g * mm)                         # SCR-only spatial gate
+                    # MULTIPROMPT: no zt_ft.register_hook here -- the SCR spatial gradient gate is removed.
                     zt_ori = noise_scheduler.add_noise(z0_ori_ij, _eps, _tb)                        # detached target input
                     scr_mid_store.clear()
                     _ = scoring_unet(zt_ft.to(weight_dtype), _tb, encoder_hidden_states=scr_gen_embeds_ij).sample

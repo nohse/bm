@@ -14,37 +14,6 @@
 # See the License for the specific language governing permissions and
 
 # =====================================================================================
-# ATTMAP = NODETECTOR + a switch on the SPATIAL REDUCTION of the woman/man class error:
-#     --gender_attn_weight {attn, none}     (default: attn == the original NODETECTOR file)
-# The woman/man gender error E_c is the per-pixel squared eps-residual of the frozen scoring UNet
-# under the "woman"/"man" text condition. The original file always reduces it with the COMMON
-# woman/man cross-attention map (sum-to-1 normalized) as a spatial weight, i.e. E_c = sum_{u,v}
-# attn(u,v) * res_c(u,v) -- re-weighting the error toward the gender/person region. This file makes
-# that weighting OPTIONAL:
-#   attn : E_c = sum_{u,v} common_attn(u,v) * res_c(u,v)        (attention-weighted SUM; original)
-#   none : E_c = mean_{u,v} res_c(u,v)                          (the FULL error, uniform over space)
-# The 'none' branch is exactly the 'attn' branch with a FLAT weight map 1/(H*W), which also sums to
-# 1 -- so E_c keeps the same normalization/scale and --tau does NOT need to be re-tuned a priori.
-# HOW BIG IS THE DIFFERENCE? Measured on 8 real generated images (K=15, t 400-800): this gender attn
-# map is DIFFUSE, not a face mask (values 1.7e-4..4.7e-4 around the 2.44e-4 uniform value, ~2.8x
-# max/min, participation ratio ~3900 of 4096 px). So 'attn' is a MILD re-weighting: E_woman
-# none/attn = 1.04, the class GAP |E_man - E_woman| none/attn = 0.83, and the argmax gender preds
-# agree 8/8. The flag mainly rescales the class-error GAP (hence the fair-loss gradient), and does
-# NOT make the z0 gradient uniform (it flows through the scoring UNet's global receptive field:
-# top-10% |grad| energy 0.225 attn -> 0.196 none, vs 0.10 for a truly uniform field).
-# The flag applies to BOTH places the class error is computed: residual_gender_and_realism (the SCR
-# fair loss) and residual_gender_logits (the training-time gender predictor behind get_face_gender).
-# What the flag does NOT change (the cross-attention map is still computed in BOTH modes):
-#   - the SRR realism gradient region  (min-max common_attn >= --attn_gate_thr, input-masked z0)
-#   - the h-space SCR flip gradient gate (same region, scaled by --factor2)
-#   - the attention/grad-gate visualizations (--save_attn_maps)
-# Only the gender-error reduction switches; everything else is byte-for-byte the original file.
-# Run-folder tag: the mode is ALWAYS written into the output folder / wandb run name --
-#   _gAttn-attn = attmap weighting ON (original behaviour) , _gAttn-none = attmap weighting OFF
-# so a run's own folder states whether the attmap multiply was used (an absent tag would be
-# ambiguous with the original _nodetector.py runs, which carry no _gAttn tag at all). Example:
-#   ..._wSRR-4_srr-person_errFD-8-50-950_gAttn-none_skipFrac-0.5_Th-0.2_loraR-50_lr-5e-05_07131530
-# =====================================================================================
 # NODETECTOR = SRR_person_truncated_hspace with the insightface FACE DETECTOR REPLACED -- in the
 # TRAINING branch points ONLY -- by a diffusion residual-error face/no-face classifier:
 #     face  iff  E("a photo of a face") < E("a faceless photo")
@@ -385,6 +354,63 @@ def mask_overlay_on_image(mask, image, alpha=0.5, color=(255, 165, 0)):
     return Image.alpha_composite(base, tint).convert("RGB")
 
 
+def scr_damping_strength(common_attn, mode, thr, p_mid, tau):
+    """Damping-strength field s in [0,1] for the SCR flip gradient gate.  m = 1 - (1-factor2)*s.
+
+    common_attn: [n,H,W] sum-to-1 (detached) gender localization map from the residual scorer.
+    Returns s [n,H,W], float32, detached. s == 1 at the attention peak in EVERY mode, so the
+    multiplier there is exactly factor2 (the damping MAGNITUDE is mode-independent).
+
+    NO-FACE SAMPLES: the caller zeroes common_attn for them. Every branch below must then return
+    s == 0 (no damping) and never NaN -- the guards are load-bearing, not defensive noise:
+      hard:         min-max of an all-zero map -> 0 -> below thr -> 0.            (as today)
+      softmax:      exp((0-1)/tau) = exp(-1/tau) > 0 would damp the WHOLE image; the floor
+                    correction maps g=0 -> s=0 exactly, and `degen` zeroes the constant map.
+      topp/mass_*:  total mass 0 -> cumulative rank forced to 1 -> outside every nucleus -> 0.
+    """
+    a = common_attn.detach().float()
+    n = a.shape[0]
+    flat = a.reshape(n, -1)
+
+    if mode in ("hard", "softmax"):
+        lo = flat.amin(dim=1, keepdim=True)
+        hi = flat.amax(dim=1, keepdim=True)
+        degen = (hi - lo) <= 1e-12
+        g = ((flat - lo) / (hi - lo + 1e-8)).clamp(0, 1)   # +1e-8 == the original expression, verbatim
+        g = torch.where(degen, torch.zeros_like(g), g)
+        if mode == "hard":
+            s = (g >= thr).float()
+        else:
+            t = max(tau, 1e-6)
+            fl = math.exp(-1.0 / t)                       # background floor: MUST be removed
+            s = ((torch.exp((g - 1.0) / t) - fl) / (1.0 - fl)).clamp(0, 1)
+        s = torch.where(degen, torch.zeros_like(s), s)
+        return s.reshape_as(a)
+
+    prob = flat / flat.sum(dim=1, keepdim=True).clamp_min(1e-12)      # all-zero map -> stays 0
+    if mode == "topp":
+        srt, _ = prob.sort(dim=1, descending=True)
+        k = (srt.cumsum(dim=1) < p_mid).sum(dim=1, keepdim=True).clamp(max=prob.shape[1] - 1)
+        a_p = srt.gather(1, k)                                        # nucleus cutoff value
+        a_max = srt[:, :1]
+        s = ((prob - a_p) / (a_max - a_p).clamp_min(1e-12)).clamp(0, 1)
+        return s.reshape_as(a)
+
+    if mode == "mass_sigmoid":
+        order = prob.argsort(dim=1, descending=True)
+        csum = prob.gather(1, order).cumsum(dim=1)
+        C = torch.empty_like(csum).scatter_(1, order, csum)           # cumulative mass rank per pixel
+        C = torch.where(prob.sum(dim=1, keepdim=True) <= 1e-12, torch.ones_like(C), C)
+        t = max(tau, 1e-6)
+        s0 = torch.sigmoid(torch.tensor(p_mid / t, device=a.device))          # value at C=0 (peak)
+        s1 = torch.sigmoid(torch.tensor((p_mid - 1.0) / t, device=a.device))  # value at C=1
+        s = torch.sigmoid((p_mid - C) / t)
+        s = ((s - s1) / (s0 - s1).clamp_min(1e-12)).clamp(0, 1)        # C=0 -> 1, C=1 -> 0 exactly
+        return s.reshape_as(a)
+
+    raise ValueError(f"unknown scr_mask_mode: {mode}")
+
+
 def make_grad_hook(coef):
     return lambda x: coef * x
 
@@ -563,7 +589,7 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--resume_from_checkpoint",
         type=str,
-        default="./outputs/gender-debias-text-encoder-again/BS-24_TE_tau-0.0001_resT-15-400-800_scrT-15-400-800_wSCR-4-0.2-0.2_wSRR-4_srr-person_errFD-8-50-950_gAttn-none_Th-0.2_loraR-50_lr-5e-05_07132336/ckpts/checkpoint_tmp-1720",
+        default="",
         help="provide the checkpoint path to resume from checkpoint. NOTE: kept None for the SRR_person "
              "experiment so it starts fresh from pretrained SD -- resuming from a face-prompt SRR checkpoint "
              "would carry over weights trained on the old 'a photo of a realistic face' prompt and "
@@ -680,28 +706,6 @@ def parse_args(input_args=None):
              "over the same --residual_t_min/max and --residual_num_timesteps (no separate timestep args).",
     )
     parser.add_argument(
-        '--gender_attn_weight',
-        default="none",
-        type=str,
-        choices=["attn", "none"],
-        help="spatial reduction of the woman/man class error E_c (the per-pixel squared eps-residual of "
-             "the frozen scoring UNet under the woman/man text condition). 'attn' (default, identical to "
-             "the original NODETECTOR file): weight the residual by the sum-to-1 common woman/man "
-             "cross-attention map and spatially SUM, i.e. re-weight pixels toward the gender/person region. "
-             "'none': use the FULL error, a UNIFORM spatial mean over all H*W pixels -- i.e. the same "
-             "weighted sum with a FLAT 1/(H*W) map, which also sums to 1, so E_c keeps the same scale and "
-             "--tau needs no a-priori re-tuning. MEASURED (8 real gen. images, K=15, t400-800): the gender "
-             "attn map is DIFFUSE, not a face mask (1.7e-4..4.7e-4 vs the 2.44e-4 uniform value, ~2.8x "
-             "max/min, participation ratio ~3900/4096 px), so 'attn' is a MILD re-weighting, not a hard "
-             "localization: E_woman none/attn = 1.04, |E_man - E_woman| none/attn = 0.83, argmax preds "
-             "agree 8/8. Expect the two modes to differ mostly in the class-error GAP (hence the fair-loss "
-             "gradient scale), not in the predicted labels. Applies to BOTH the SCR fair loss "
-             "(residual_gender_and_realism) and the training-time gender predictor (residual_gender_logits "
-             "-> get_face_gender). The attention map is still computed in BOTH modes: it keeps driving the "
-             "SRR realism gradient region and the h-space SCR flip gate (--attn_gate_thr/--factor2) and the "
-             "attmap visualizations, which are unaffected by this flag.",
-    )
-    parser.add_argument(
         '--attn_gate_thr',
         default=0.15,
         help="min-max-normalized gender (woman/man) cross-attention threshold defining the person/subject "
@@ -720,6 +724,49 @@ def parse_args(input_args=None):
         )
     parser.add_argument('--factor1', help="train, val, test batch size", type=float, default=0.2)
     parser.add_argument('--factor2', help="train, val, test batch size", type=float, default=0.2)
+
+    # ---- SCR flip gradient-gate shape -----------------------------------------------------------
+    # The gate damps the SCR (image-preservation) gradient by factor2 inside the person region for
+    # flip/uncertain samples. `hard` (the default) is the CURRENT behaviour, bit-identical.
+    #
+    # MEASURED on 50 real scoring-time woman/man attn maps (scr_softmask_experiment.py):
+    #   the `hard` gate thresholds an attention VALUE, and because the map is nearly uniform
+    #   (normalized entropy 0.996) the region it selects swings from 25% to 90% of the image and
+    #   releases 39%..92% of the gender-attention mass, sample to sample (CV of the released
+    #   gradient energy = 0.19).
+    #   `mass_sigmoid` cuts on cumulative attention MASS instead of value, so the released budget is
+    #   the same for every sample (CV 0.193 -> 0.031, a 6.2x reduction) at the same average SCR
+    #   strength (<m> 0.463 -> 0.466 at the default p_mid=0.80, so weight_loss_scr does NOT need
+    #   re-tuning), and the gate is 24-33% more stable when the attention source is perturbed.
+    parser.add_argument(
+        '--scr_mask_mode',
+        type=str, default="hard", choices=["hard", "softmax", "topp", "mass_sigmoid"],
+        help="shape of the SCR flip gradient gate. 'hard' = CURRENT: s = 1[minmax(attn) >= "
+             "--attn_gate_thr] (bit-identical default). 'softmax' = peak-normalized, floor-corrected "
+             "exp((minmax(attn)-1)/tau) (temperature in the VALUE domain; measured to be far too weak "
+             "-- cannot reach the hard gate's strength at ANY tau -- kept only for the ablation). "
+             "'topp' = soft ramp inside the top --scr_mask_pmid attention-MASS nucleus, exactly 0 "
+             "outside. 'mass_sigmoid' = RECOMMENDED: sigmoid((p_mid - cumulative_mass)/tau), i.e. a "
+             "top-p cut with a temperature-controlled soft edge. In every mode the multiplier at the "
+             "attention peak is exactly --factor2, so the DAMPING MAGNITUDE is unchanged.",
+    )
+    parser.add_argument(
+        '--scr_mask_pmid',
+        type=float, default=0.80,
+        help="cumulative attention MASS released by the gate (modes topp / mass_sigmoid). MEASURED: "
+             "p_mid=0.80 reproduces the current hard gate's AVERAGE SCR strength almost exactly "
+             "(<m> 0.466 vs 0.463, i.e. weight_loss_scr needs NO re-tune) while cutting the "
+             "per-sample swing 6x (CV 0.19 -> 0.03) -- the clean A/B where only the mask SHAPE changes. "
+             "p_mid=0.65 releases less and leaks much less onto the background, but the SCR then acts "
+             "~1.2x stronger, so scale weight_loss_scr by ~0.82 to keep the fidelity/debias balance.",
+    )
+    parser.add_argument(
+        '--scr_mask_tau',
+        type=float, default=0.12,
+        help="softness of the gate edge. mass_sigmoid: temperature in cumulative-mass units "
+             "(tau->0 = hard nucleus; 0.12 is a good compromise; larger = softer/more stable but less "
+             "localized). softmax: temperature on the min-max attention value. topp: unused.",
+    )
 
     # batch size, properly set to max out GPU
     parser.add_argument(
@@ -1098,14 +1145,12 @@ def main(args):
         f"_resT-{args.residual_num_timesteps}-{args.residual_t_min}-{args.residual_t_max}"
         f"_scrT-{args.scr_num_timesteps}-{args.scr_t_min}-{args.scr_t_max}"
         f"_wSCR-{args.weight_loss_scr}-{args.factor1}-{args.factor2}"
+        f"_scrMask-{args.scr_mask_mode}"
+        f"{('-p'+format(args.scr_mask_pmid, 'g')) if args.scr_mask_mode in ('topp','mass_sigmoid') else ''}"
+        f"{('-t'+format(args.scr_mask_tau, 'g')) if args.scr_mask_mode in ('softmax','mass_sigmoid') else ''}"
         f"_wSRR-{args.weight_loss_face}"
         f"_srr-{_srr_tag}"
         f"_errFD-{args.face_residual_num_timesteps}-{args.face_residual_t_min}-{args.face_residual_t_max}"
-        # gender class-error spatial reduction, ALWAYS tagged (both modes) so a run's folder says outright
-        # whether the attmap weighting was on: _gAttn-attn = attention-weighted, _gAttn-none = full error.
-        # Deliberately not a "tag only when non-default" suffix like _skipFrac: an absent tag would be
-        # ambiguous with the original _nodetector.py runs, which have no _gAttn at all.
-        f"_gAttn-{args.gender_attn_weight}"
         f"{('_skipFrac-'+format(args.skip_denoise_frac, 'g')) if args.skip_denoise_frac>0 else ''}"
         f"_Th-{args.uncertainty_threshold}"
         f"_loraR-{args.rank}_lr-{args.learning_rate}"
@@ -2063,23 +2108,6 @@ def main(args):
         
         return face_indicators_app, face_bboxs_app, face_chips_app, face_landmarks_app, aligned_face_chips_app
                 
-    def reduce_gender_residual(residual_map, common_attn):
-        """Spatially reduce a per-pixel woman/man squared residual [n,K,H,W] to a per-image error [n].
-
-        Controlled by --gender_attn_weight:
-          'attn' (default): weighted SUM with the sum-to-1 common woman/man cross-attention map,
-              E_c = sum_{u,v} common_attn(u,v) * res_c(u,v)  -- the error only counts the gender/person
-              region. This is the original NODETECTOR behaviour.
-          'none': UNIFORM spatial MEAN over all H*W pixels, E_c = mean_{u,v} res_c(u,v) -- the FULL error,
-              every pixel counts equally. Identical to the 'attn' formula with a FLAT weight map 1/(H*W),
-              which ALSO sums to 1, so E_c keeps the same normalization/scale as 'attn' (--tau comparable).
-        The timestep axis K is always reduced by a uniform mean, in both modes. common_attn is detached in
-        both callers, so this only changes WHERE the gradient d E_c / d z0 is weighted, never the graph.
-        """
-        if args.gender_attn_weight == "none":
-            return residual_map.mean(dim=(2, 3)).mean(dim=1)                                    # [n]
-        return (common_attn.unsqueeze(1) * residual_map).sum(dim=(2, 3)).mean(dim=1)            # [n]
-
     def residual_gender_logits(z0):
         """Prompt-conditioned diffusion residual-error gender scorer with cross-attention spatial weighting.
 
@@ -2163,10 +2191,9 @@ def main(args):
         common_attn = common_attn / (common_attn.sum(dim=(1, 2), keepdim=True) + 1e-8)
         common_attn = common_attn.detach()                                             # weighting mask only
 
-        # spatial reduction per --gender_attn_weight: 'attn' = attention-weighted SUM (original),
-        # 'none' = uniform mean over all pixels (the FULL error). Then uniform mean over timesteps.
-        E_woman = reduce_gender_residual(residual_maps["woman"], common_attn)           # [n]
-        E_man = reduce_gender_residual(residual_maps["man"], common_attn)               # [n]
+        # attention-weighted spatial SUM per timestep, then uniform mean over timesteps
+        E_woman = (common_attn.unsqueeze(1) * residual_maps["woman"]).sum(dim=(2, 3)).mean(dim=1)   # [n]
+        E_man = (common_attn.unsqueeze(1) * residual_maps["man"]).sum(dim=(2, 3)).mean(dim=1)       # [n]
 
         logits_gender = torch.stack([-E_woman / args.tau, -E_man / args.tau], dim=1)    # [n, 2]
         return logits_gender
@@ -2305,12 +2332,8 @@ def main(args):
         common_attn = attn_accum / max(attn_count, 1)                                   # [n,H,W]
         common_attn = common_attn / (common_attn.sum(dim=(1, 2), keepdim=True) + 1e-8)
         common_attn = common_attn.detach()
-        # spatial reduction per --gender_attn_weight: 'attn' = attention-weighted SUM (original),
-        # 'none' = uniform mean over all pixels (the FULL error). common_attn is still computed above
-        # regardless, because the SRR region mask below (and the h-space SCR flip gate, via the returned
-        # map) use it in BOTH modes -- only the CLASS-ERROR weighting is switched off by 'none'.
-        E_woman = reduce_gender_residual(residual_maps["woman"], common_attn)           # [n]
-        E_man = reduce_gender_residual(residual_maps["man"], common_attn)               # [n]
+        E_woman = (common_attn.unsqueeze(1) * residual_maps["woman"]).sum(dim=(2, 3)).mean(dim=1)   # [n]
+        E_man = (common_attn.unsqueeze(1) * residual_maps["man"]).sum(dim=(2, 3)).mean(dim=1)       # [n]
         logits_gender = torch.stack([-E_woman / args.tau, -E_man / args.tau], dim=1)    # [n, 2]
 
         # -------- SRR realism: VALUE over the WHOLE image, GRADIENT only in the person/gender region --------
@@ -2492,12 +2515,12 @@ def main(args):
         imgs = images[:n].detach().cpu()
         common = common_attn[:n].detach().float().cpu()
         gate = attn_gate[:n].detach().float().cpu()
-        hard = (gate >= thr).float()                                        # [n,H,W] min-max hard mask
+        hard = (gate > 0).float()                                           # [n,H,W] support of the mask
         gmask = scr_grad_mask[:n].detach().float().cpu()
         if gmask.dim() == 4:
             gmask = gmask[:, 0]                                             # [n,1,H,W] -> [n,H,W]
         applied = (gmask < (1.0 - 1e-4)).float()                            # damped iff mask < 1 (== factor2 region)
-        labels = ["generated", "common-attn", "min-max gate", f"hard >= {thr:g}", f"applied x{factor2:g}"]
+        labels = ["generated", "common-attn", "mask s (strength)", "mask support", f"applied damp (min x{factor2:g})"]
         rows = []
         for i in range(n):
             t = int(targets[i].item()) if targets is not None else -9
@@ -3019,6 +3042,8 @@ def main(args):
                     "loss_fair": [],
                     "loss_SRR": [],
                     "loss_SCR": [],
+                    "scr_grad_mask_mean": [],
+                    "scr_release_frac": [],
                     "loss": [],
                     "gender_gap": [],
                     "gender_gap_abs": [],
@@ -3146,6 +3171,11 @@ def main(args):
             loss_fair_i = torch.ones(targets.shape, dtype=weight_dtype, device=accelerator.device) *(-1)
             loss_SRR_i = torch.ones(targets.shape, dtype=weight_dtype, device=accelerator.device) *(-1)
             loss_SCR_i = torch.ones(targets.shape, dtype=weight_dtype, device=accelerator.device) *(-1)
+            # gate diagnostics (the gate is gradient-only, so loss_SCR cannot distinguish the modes):
+            #   scr_mask_i    = mean SCR gradient multiplier <m> -> the effective SCR strength this step
+            #   scr_release_i = fraction of samples the gate fires on (flip/uncertain)
+            scr_mask_i = torch.ones(targets.shape, dtype=weight_dtype, device=accelerator.device) *(-1)
+            scr_release_i = torch.ones(targets.shape, dtype=weight_dtype, device=accelerator.device) *(-1)
             loss_i = torch.ones(targets.shape, dtype=weight_dtype, device=accelerator.device) *(-1)
 
             idxs_i = list(range(targets.shape[0]))
@@ -3198,13 +3228,24 @@ def main(args):
                 z0_ori_ij = z0_ori[idxs_ij]
                 scr_gen_embeds_ij = scr_gen_embeds.expand(len(idxs_ij), -1, -1)
 
-                cmin = common_attn_ij.amin(dim=(1, 2), keepdim=True)
-                cmax = common_attn_ij.amax(dim=(1, 2), keepdim=True)
-                attn_gate = ((common_attn_ij - cmin) / (cmax - cmin + 1e-8)).clamp(0, 1)          # [chunk,64,64] min-max
+                # Damping-strength field s in [0,1] (mode-selectable; 'hard' == the original gate,
+                # bit-identical: s = 1[minmax(attn) >= thr] -> m = {factor2, 1}). s == 1 at the
+                # attention peak in every mode, so the damping MAGNITUDE stays factor2.
+                attn_gate = scr_damping_strength(
+                    common_attn_ij, args.scr_mask_mode, args.attn_gate_thr,
+                    args.scr_mask_pmid, args.scr_mask_tau,
+                )                                                                                  # [chunk,64,64]
                 release_ij = (targets_ij != preds_gender_ori_ij) | (targets_ij == -1)               # debias-aligned: flip OR uncertain(-1)
-                scr_grad_mask = torch.ones_like(attn_gate)
-                scr_grad_mask = torch.where((attn_gate >= args.attn_gate_thr) & release_ij[:, None, None],
-                                            torch.full_like(scr_grad_mask, args.factor2), scr_grad_mask)
+                # m = 1 - (1 - factor2) * s, applied only to released samples. For mode 'hard' this is
+                # EXACTLY the previous torch.where(gate >= thr & release, factor2, 1).
+                s_ij = attn_gate * release_ij[:, None, None].to(attn_gate.dtype)
+                if args.scr_mask_mode == "hard":
+                    # keep the ORIGINAL expression verbatim so the default run is bit-identical
+                    # (1 - (1-0.2)*1 = 0.19999998807907104 != float32(0.2); a 1.5e-8 drift otherwise)
+                    scr_grad_mask = torch.where(s_ij > 0.5, torch.full_like(s_ij, args.factor2),
+                                                torch.ones_like(s_ij))
+                else:
+                    scr_grad_mask = 1.0 - (1.0 - args.factor2) * s_ij
                 scr_grad_mask = scr_grad_mask[:, None, :, :].to(z0_ij.dtype)                        # [chunk,1,64,64]
 
                 # Visualize/save the flip gradient-gate: min-max normalized attn + hard mask (--attn_gate_thr)
@@ -3254,6 +3295,8 @@ def main(args):
                 accelerator.backward(loss_ij.mean())
 
                 with torch.no_grad():
+                    scr_mask_i[idxs_ij] = scr_grad_mask.mean(dim=(1, 2, 3)).to(scr_mask_i.dtype)
+                    scr_release_i[idxs_ij] = release_ij.to(scr_release_i.dtype)
                     loss_fair_i[idxs_ij] = loss_fair_ij.to(loss_fair_i.dtype)
                     loss_SRR_i[idxs_ij] = loss_SRR_ij.to(loss_SRR_i.dtype)
                     loss_SCR_i[idxs_ij] = loss_SCR_ij.to(loss_SCR_i.dtype)
@@ -3264,6 +3307,8 @@ def main(args):
             loss_fair_all = customized_all_gather(loss_fair_i, accelerator)
             loss_SRR_all = customized_all_gather(loss_SRR_i, accelerator)
             loss_SCR_all = customized_all_gather(loss_SCR_i, accelerator)
+            scr_mask_all = customized_all_gather(scr_mask_i, accelerator)
+            scr_release_all = customized_all_gather(scr_release_i, accelerator)
             loss_all = customized_all_gather(loss_i, accelerator)
 
             loss_all = loss_all[loss_fair_all!=-1]
@@ -3274,11 +3319,14 @@ def main(args):
                 logs_i["loss_fair"].append(loss_fair_all)
                 logs_i["loss_SRR"].append(loss_SRR_all)
                 logs_i["loss_SCR"].append(loss_SCR_all)
+                logs_i["scr_grad_mask_mean"].append(scr_mask_all)
+                logs_i["scr_release_frac"].append(scr_release_all)
                 logs_i["loss"].append(loss_all)
 
             # process logs
             if accelerator.is_main_process:
-                for key in ["loss_fair", "loss_SRR", "loss_SCR", "loss"]:
+                for key in ["loss_fair", "loss_SRR", "loss_SCR", "loss",
+                            "scr_grad_mask_mean", "scr_release_frac"]:
                     if logs_i[key] == []:
                         logs_i.pop(key)
                     else:

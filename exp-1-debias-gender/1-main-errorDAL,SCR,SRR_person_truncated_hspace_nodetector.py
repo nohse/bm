@@ -493,7 +493,7 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--seed", 
         type=int, 
-        default="5991", 
+        default="15991", 
         help="A seed for reproducible training."
     )
     parser.add_argument(
@@ -532,7 +532,7 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--resume_from_checkpoint",
         type=str,
-        default="./outputs/gender-debias-text-encoder-again/BS-24_TE_tau-0.0001_resT-15-400-800_scrT-15-400-800_wSCR-4-0.2-0.2_wSRR-4_srr-person_errFD-8-50-950_skipFrac-0.5_Th-0.2_loraR-50_lr-5e-05_07130937/ckpts/checkpoint_tmp-440",
+        default="",
         help="provide the checkpoint path to resume from checkpoint. NOTE: kept None for the SRR_person "
              "experiment so it starts fresh from pretrained SD -- resuming from a face-prompt SRR checkpoint "
              "would carry over weights trained on the old 'a photo of a realistic face' prompt and "

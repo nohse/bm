@@ -14,37 +14,6 @@
 # See the License for the specific language governing permissions and
 
 # =====================================================================================
-# ATTMAP = NODETECTOR + a switch on the SPATIAL REDUCTION of the woman/man class error:
-#     --gender_attn_weight {attn, none}     (default: attn == the original NODETECTOR file)
-# The woman/man gender error E_c is the per-pixel squared eps-residual of the frozen scoring UNet
-# under the "woman"/"man" text condition. The original file always reduces it with the COMMON
-# woman/man cross-attention map (sum-to-1 normalized) as a spatial weight, i.e. E_c = sum_{u,v}
-# attn(u,v) * res_c(u,v) -- re-weighting the error toward the gender/person region. This file makes
-# that weighting OPTIONAL:
-#   attn : E_c = sum_{u,v} common_attn(u,v) * res_c(u,v)        (attention-weighted SUM; original)
-#   none : E_c = mean_{u,v} res_c(u,v)                          (the FULL error, uniform over space)
-# The 'none' branch is exactly the 'attn' branch with a FLAT weight map 1/(H*W), which also sums to
-# 1 -- so E_c keeps the same normalization/scale and --tau does NOT need to be re-tuned a priori.
-# HOW BIG IS THE DIFFERENCE? Measured on 8 real generated images (K=15, t 400-800): this gender attn
-# map is DIFFUSE, not a face mask (values 1.7e-4..4.7e-4 around the 2.44e-4 uniform value, ~2.8x
-# max/min, participation ratio ~3900 of 4096 px). So 'attn' is a MILD re-weighting: E_woman
-# none/attn = 1.04, the class GAP |E_man - E_woman| none/attn = 0.83, and the argmax gender preds
-# agree 8/8. The flag mainly rescales the class-error GAP (hence the fair-loss gradient), and does
-# NOT make the z0 gradient uniform (it flows through the scoring UNet's global receptive field:
-# top-10% |grad| energy 0.225 attn -> 0.196 none, vs 0.10 for a truly uniform field).
-# The flag applies to BOTH places the class error is computed: residual_gender_and_realism (the SCR
-# fair loss) and residual_gender_logits (the training-time gender predictor behind get_face_gender).
-# What the flag does NOT change (the cross-attention map is still computed in BOTH modes):
-#   - the SRR realism gradient region  (min-max common_attn >= --attn_gate_thr, input-masked z0)
-#   - the h-space SCR flip gradient gate (same region, scaled by --factor2)
-#   - the attention/grad-gate visualizations (--save_attn_maps)
-# Only the gender-error reduction switches; everything else is byte-for-byte the original file.
-# Run-folder tag: the mode is ALWAYS written into the output folder / wandb run name --
-#   _gAttn-attn = attmap weighting ON (original behaviour) , _gAttn-none = attmap weighting OFF
-# so a run's own folder states whether the attmap multiply was used (an absent tag would be
-# ambiguous with the original _nodetector.py runs, which carry no _gAttn tag at all). Example:
-#   ..._wSRR-4_srr-person_errFD-8-50-950_gAttn-none_skipFrac-0.5_Th-0.2_loraR-50_lr-5e-05_07131530
-# =====================================================================================
 # NODETECTOR = SRR_person_truncated_hspace with the insightface FACE DETECTOR REPLACED -- in the
 # TRAINING branch points ONLY -- by a diffusion residual-error face/no-face classifier:
 #     face  iff  E("a photo of a face") < E("a faceless photo")
@@ -62,6 +31,22 @@
 # EVALUATION (evaluate_process) still uses the real insightface detector + the external test
 # classifier, so eval metrics stay comparable to all baselines.
 # The output folder name gets an extra tag: _errFD-<K>-<tmin>-<tmax>  (e.g. _errFD-8-50-950).
+# =====================================================================================
+# matd = nodetector + an ARBITRARY TARGET GENDER DISTRIBUTION via --target_male_ratio, and the
+# MATD (Mean Absolute Target Deviation) metric logged to wandb alongside the existing ones.
+#   --target_male_ratio r  (default 0.5, i.e. bit-identical to the nodetector file) sets
+#   P(a_n=male | c). It drives BOTH the DAL dynamic targets and the new metric, so e.g.
+#   --target_male_ratio 0.75 trains toward and measures against Male 75%/Female 25%.
+#   MATD = (1/|C|) sum_c (1/|A|) sum_{a_n} | P_phi(attribute(x_0)=a_n | p_c) - P(a_n | c) |
+#   with A={male,female}; the inner term reduces exactly to |m - r|. Logged as `train_matd`
+#   and `eval_*_matd` (per-prompt and prompt-averaged). The pre-existing gender_gap and
+#   gender_gap_abs keep their ORIGINAL definitions (2m-1 and |2m-1|) so historical wandb
+#   curves stay comparable -- note matd == gender_gap_abs/2 when r=0.5.
+#   Two polarity traps handled here: generate_dynamic_targets()'s `target_ratio` argument is
+#   the FEMALE fraction (its old docstring said male), so the call site passes 1-r; and its
+#   targets==1 binomial-uncertainty branch used p=1-target_ratio, which is a no-op at 0.5 but
+#   saturates to 1.0 at r=0.75 and would drop every male-target sample via
+#   --uncertainty_threshold. Both are corrected here; both are exact no-ops at r=0.5.
 # =====================================================================================
 # SRR_person_truncated_hspace = SRR_person_truncated with the image-semantics loss REPLACED by the
 # h-space SCR image loss (ported from 1-main-errorDAL,SCR,Face_hspace_truncated.py). The fairness
@@ -524,7 +509,7 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--seed", 
         type=int, 
-        default="5991", 
+        default="15991", 
         help="A seed for reproducible training."
     )
     parser.add_argument(
@@ -563,7 +548,7 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--resume_from_checkpoint",
         type=str,
-        default="./outputs/gender-debias-text-encoder-again/BS-24_TE_tau-0.0001_resT-15-400-800_scrT-15-400-800_wSCR-4-0.2-0.2_wSRR-4_srr-person_errFD-8-50-950_gAttn-none_Th-0.2_loraR-50_lr-5e-05_07132336/ckpts/checkpoint_tmp-1720",
+        default="",
         help="provide the checkpoint path to resume from checkpoint. NOTE: kept None for the SRR_person "
              "experiment so it starts fresh from pretrained SD -- resuming from a face-prompt SRR checkpoint "
              "would carry over weights trained on the old 'a photo of a realistic face' prompt and "
@@ -680,28 +665,6 @@ def parse_args(input_args=None):
              "over the same --residual_t_min/max and --residual_num_timesteps (no separate timestep args).",
     )
     parser.add_argument(
-        '--gender_attn_weight',
-        default="none",
-        type=str,
-        choices=["attn", "none"],
-        help="spatial reduction of the woman/man class error E_c (the per-pixel squared eps-residual of "
-             "the frozen scoring UNet under the woman/man text condition). 'attn' (default, identical to "
-             "the original NODETECTOR file): weight the residual by the sum-to-1 common woman/man "
-             "cross-attention map and spatially SUM, i.e. re-weight pixels toward the gender/person region. "
-             "'none': use the FULL error, a UNIFORM spatial mean over all H*W pixels -- i.e. the same "
-             "weighted sum with a FLAT 1/(H*W) map, which also sums to 1, so E_c keeps the same scale and "
-             "--tau needs no a-priori re-tuning. MEASURED (8 real gen. images, K=15, t400-800): the gender "
-             "attn map is DIFFUSE, not a face mask (1.7e-4..4.7e-4 vs the 2.44e-4 uniform value, ~2.8x "
-             "max/min, participation ratio ~3900/4096 px), so 'attn' is a MILD re-weighting, not a hard "
-             "localization: E_woman none/attn = 1.04, |E_man - E_woman| none/attn = 0.83, argmax preds "
-             "agree 8/8. Expect the two modes to differ mostly in the class-error GAP (hence the fair-loss "
-             "gradient scale), not in the predicted labels. Applies to BOTH the SCR fair loss "
-             "(residual_gender_and_realism) and the training-time gender predictor (residual_gender_logits "
-             "-> get_face_gender). The attention map is still computed in BOTH modes: it keeps driving the "
-             "SRR realism gradient region and the h-space SCR flip gate (--attn_gate_thr/--factor2) and the "
-             "attmap visualizations, which are unaffected by this flag.",
-    )
-    parser.add_argument(
         '--attn_gate_thr',
         default=0.15,
         help="min-max-normalized gender (woman/man) cross-attention threshold defining the person/subject "
@@ -714,9 +677,19 @@ def parse_args(input_args=None):
     )
     parser.add_argument(
         '--uncertainty_threshold',
-        help="the uncertainty threshold used in distributional alignment loss", 
-        type=float, 
+        help="the uncertainty threshold used in distributional alignment loss",
+        type=float,
         default=0.2
+        )
+    parser.add_argument(
+        '--target_male_ratio',
+        help="target fraction of generated images classified MALE (class index 1), i.e. P(a_n=male|c) "
+             "in the MATD formula. 0.5 (the default) reproduces the original 50:50 target exactly. "
+             "Set 0.75 for Male 75%%/Female 25%%, 0.25 for Male 25%%/Female 75%%. Drives BOTH the DAL "
+             "dynamic targets and the logged matd metric. NOTE: generate_dynamic_targets()'s internal "
+             "`target_ratio` argument is the FEMALE fraction, so the call site passes 1-target_male_ratio.",
+        type=float,
+        default=0.25,
         )
     parser.add_argument('--factor1', help="train, val, test batch size", type=float, default=0.2)
     parser.add_argument('--factor2', help="train, val, test batch size", type=float, default=0.2)
@@ -1027,6 +1000,10 @@ def parse_args(input_args=None):
     if env_local_rank != -1 and env_local_rank != args.local_rank:
         args.local_rank = env_local_rank
 
+    # checked AFTER the config merge so a --config-supplied value is validated too
+    assert 0.0 <= args.target_male_ratio <= 1.0, \
+        f"--target_male_ratio must be in [0,1], got {args.target_male_ratio}"
+
     return args
 
 logger = get_logger(__name__)
@@ -1101,13 +1078,10 @@ def main(args):
         f"_wSRR-{args.weight_loss_face}"
         f"_srr-{_srr_tag}"
         f"_errFD-{args.face_residual_num_timesteps}-{args.face_residual_t_min}-{args.face_residual_t_max}"
-        # gender class-error spatial reduction, ALWAYS tagged (both modes) so a run's folder says outright
-        # whether the attmap weighting was on: _gAttn-attn = attention-weighted, _gAttn-none = full error.
-        # Deliberately not a "tag only when non-default" suffix like _skipFrac: an absent tag would be
-        # ambiguous with the original _nodetector.py runs, which have no _gAttn at all.
-        f"_gAttn-{args.gender_attn_weight}"
         f"{('_skipFrac-'+format(args.skip_denoise_frac, 'g')) if args.skip_denoise_frac>0 else ''}"
         f"_Th-{args.uncertainty_threshold}"
+        # only tagged when non-uniform, so default 50:50 runs keep the original folder names
+        f"{('_tgtM-'+format(args.target_male_ratio, 'g')) if args.target_male_ratio != 0.5 else ''}"
         f"_loraR-{args.rank}_lr-{args.learning_rate}"
         f"_{timestring}"
     )
@@ -2063,23 +2037,6 @@ def main(args):
         
         return face_indicators_app, face_bboxs_app, face_chips_app, face_landmarks_app, aligned_face_chips_app
                 
-    def reduce_gender_residual(residual_map, common_attn):
-        """Spatially reduce a per-pixel woman/man squared residual [n,K,H,W] to a per-image error [n].
-
-        Controlled by --gender_attn_weight:
-          'attn' (default): weighted SUM with the sum-to-1 common woman/man cross-attention map,
-              E_c = sum_{u,v} common_attn(u,v) * res_c(u,v)  -- the error only counts the gender/person
-              region. This is the original NODETECTOR behaviour.
-          'none': UNIFORM spatial MEAN over all H*W pixels, E_c = mean_{u,v} res_c(u,v) -- the FULL error,
-              every pixel counts equally. Identical to the 'attn' formula with a FLAT weight map 1/(H*W),
-              which ALSO sums to 1, so E_c keeps the same normalization/scale as 'attn' (--tau comparable).
-        The timestep axis K is always reduced by a uniform mean, in both modes. common_attn is detached in
-        both callers, so this only changes WHERE the gradient d E_c / d z0 is weighted, never the graph.
-        """
-        if args.gender_attn_weight == "none":
-            return residual_map.mean(dim=(2, 3)).mean(dim=1)                                    # [n]
-        return (common_attn.unsqueeze(1) * residual_map).sum(dim=(2, 3)).mean(dim=1)            # [n]
-
     def residual_gender_logits(z0):
         """Prompt-conditioned diffusion residual-error gender scorer with cross-attention spatial weighting.
 
@@ -2163,10 +2120,9 @@ def main(args):
         common_attn = common_attn / (common_attn.sum(dim=(1, 2), keepdim=True) + 1e-8)
         common_attn = common_attn.detach()                                             # weighting mask only
 
-        # spatial reduction per --gender_attn_weight: 'attn' = attention-weighted SUM (original),
-        # 'none' = uniform mean over all pixels (the FULL error). Then uniform mean over timesteps.
-        E_woman = reduce_gender_residual(residual_maps["woman"], common_attn)           # [n]
-        E_man = reduce_gender_residual(residual_maps["man"], common_attn)               # [n]
+        # attention-weighted spatial SUM per timestep, then uniform mean over timesteps
+        E_woman = (common_attn.unsqueeze(1) * residual_maps["woman"]).sum(dim=(2, 3)).mean(dim=1)   # [n]
+        E_man = (common_attn.unsqueeze(1) * residual_maps["man"]).sum(dim=(2, 3)).mean(dim=1)       # [n]
 
         logits_gender = torch.stack([-E_woman / args.tau, -E_man / args.tau], dim=1)    # [n, 2]
         return logits_gender
@@ -2305,12 +2261,8 @@ def main(args):
         common_attn = attn_accum / max(attn_count, 1)                                   # [n,H,W]
         common_attn = common_attn / (common_attn.sum(dim=(1, 2), keepdim=True) + 1e-8)
         common_attn = common_attn.detach()
-        # spatial reduction per --gender_attn_weight: 'attn' = attention-weighted SUM (original),
-        # 'none' = uniform mean over all pixels (the FULL error). common_attn is still computed above
-        # regardless, because the SRR region mask below (and the h-space SCR flip gate, via the returned
-        # map) use it in BOTH modes -- only the CLASS-ERROR weighting is switched off by 'none'.
-        E_woman = reduce_gender_residual(residual_maps["woman"], common_attn)           # [n]
-        E_man = reduce_gender_residual(residual_maps["man"], common_attn)               # [n]
+        E_woman = (common_attn.unsqueeze(1) * residual_maps["woman"]).sum(dim=(2, 3)).mean(dim=1)   # [n]
+        E_man = (common_attn.unsqueeze(1) * residual_maps["man"]).sum(dim=(2, 3)).mean(dim=1)       # [n]
         logits_gender = torch.stack([-E_woman / args.tau, -E_man / args.tau], dim=1)    # [n, 2]
 
         # -------- SRR realism: VALUE over the WHOLE image, GRADIENT only in the person/gender region --------
@@ -2586,7 +2538,13 @@ def main(args):
 
         Args:
             probs (torch.tensor): shape [N,2], N points in a probability simplex of 2 dims
-            target_ratio (float): target distribution, the percentage of class 1 (male)
+            target_ratio (float): target fraction of class 0 (FEMALE) -- NOT of class 1.
+                Mind the polarity: `rank` below is ASCENDING in probs[:,1] = P(male), and
+                `rank >= N*target_ratio` labels only the TOP N*(1-target_ratio) samples as
+                class 1 (male). So target_ratio=0.75 yields 25% male, and the realized MALE
+                fraction is 1-target_ratio. Callers pass 1-args.target_male_ratio.
+                (The original docstring claimed this was the male fraction; it was wrong.
+                The error was invisible because the split is symmetric at the 0.5 default.)
             w_uncertainty (True/False): whether return uncertainty measures
         
         Returns:
@@ -2604,11 +2562,20 @@ def main(args):
         
         if w_uncertainty:
             uncertainty = torch.ones([probs_2_rank.shape[0]], dtype=probs.dtype, device=probs.device) * (-1)
+            # BOTH branches must use p = target_ratio (the FEMALE fraction). Derivation: with
+            # K ~ Binom(N, p_female) = #females, and females occupying the lowest ranks, the
+            # sample at rank r is truly female iff K > r. Hence for a male-assigned sample
+            # P(assignment wrong) = P(K > r) = 1 - cdf(r, N, p_female), and for a female-assigned
+            # sample P(wrong) = P(K <= r) = cdf(r, N, p_female).
+            # This was `1-target_ratio`, which is bit-identical at the 0.5 default but wrong for
+            # any skewed ratio: at target_male_ratio=0.75 it saturates to 1.0, so the
+            # `uncertainty > --uncertainty_threshold` filter below would drop EVERY male-target
+            # sample and silently remove half the DAL supervision.
             uncertainty[targets==1] = torch.tensor(
                 1 - scipy.stats.binom.cdf(
-                    (rank[targets==1]).cpu().numpy(), 
-                    probs_2_rank.shape[0], 
-                    1-target_ratio
+                    (rank[targets==1]).cpu().numpy(),
+                    probs_2_rank.shape[0],
+                    target_ratio
                     )
                 ).to(probs.dtype).to(probs.device)
             uncertainty[targets==0] = torch.tensor(
@@ -2625,6 +2592,36 @@ def main(args):
             return targets_all, uncertainty_all
         else:
             return targets_all
+
+    def compute_gender_metrics(probs_tmp, target_male_ratio):
+        """gender-distribution metrics for one prompt's generated batch.
+
+        Args:
+            probs_tmp (torch.tensor): [N,2] gender-classifier softmax rows with a detected
+                face (class order [woman=0, man=1]), already filtered of the -1 fill rows.
+            target_male_ratio (float): P(a_n=male | c), the target male fraction.
+
+        Returns:
+            (gender_gap, matd) floats.
+
+        gender_gap keeps its ORIGINAL definition, frac_male - frac_female = 2*m - 1, so it stays
+        comparable with every earlier run.
+
+        matd is the per-prompt inner term of the Mean Absolute Target Deviation,
+            (1/|A|) * sum_{a_n in A} | P_phi(attribute(x_0)=a_n | p_c) - P(a_n | c) |
+        with A = {male, female}. Since the two attribute probabilities each sum to 1,
+            (1/2)*( |m - r| + |(1-m) - (1-r)| ) = |m - r|
+        so the closed form below is exact, not an approximation. The outer (1/|C|) average over
+        prompts is taken by the existing np.mean over the per-prompt logs.
+
+        NOTE ON SCALE: at target_male_ratio=0.5, matd == gender_gap_abs / 2 exactly. matd is
+        logged as its own key so the historical gender_gap_abs curves stay directly comparable.
+        """
+        m = ((probs_tmp[:,1]>=0.5)*(probs_tmp[:,1]<=1)).float().mean().item()
+        f = ((probs_tmp[:,1]>=0)*(probs_tmp[:,1]<=0.5)).float().mean().item()
+        gender_gap = m - f
+        matd = 0.5 * (abs(m - target_male_ratio) + abs(f - (1.0 - target_male_ratio)))
+        return gender_gap, matd
 
     @torch.no_grad()
     def evaluate_process(which_text_encoder, which_unet, name, prompts, noises, current_global_step):
@@ -2645,6 +2642,7 @@ def main(args):
                 logs_i = {
                     "gender_gap": [],
                     "gender_gap_abs": [],
+                    "matd": [],
                     "gender_pred_between_0.2_0.8": [],
                     "CLIP-T": [],
                     "CLIP-I": [],
@@ -2741,10 +2739,11 @@ def main(args):
             
             if accelerator.is_main_process:
                 probs_tmp = probs_gender_all[(probs_gender_all!=-1).all(dim=-1)]
-                gender_gap = (((probs_tmp[:,1]>=0.5)*(probs_tmp[:,1]<=1)).float().mean() - ((probs_tmp[:,1]>=0)*(probs_tmp[:,1]<=0.5)).float().mean()).item()
+                gender_gap, matd = compute_gender_metrics(probs_tmp, args.target_male_ratio)
                 gender_pred_between_02_08 = ((probs_tmp[:,1]>=0.2)*(probs_tmp[:,1]<=0.8)).float().mean().item()
                 logs_i["gender_gap"].append(gender_gap)
                 logs_i["gender_gap_abs"].append(abs(gender_gap))
+                logs_i["matd"].append(matd)
                 logs_i["gender_pred_between_0.2_0.8"].append(abs(gender_pred_between_02_08))
 
                 # CLIP-T / CLIP-I / DINO via open_clip bigG + eval DINOv2 on the MAIN PROCESS ONLY,
@@ -3022,6 +3021,7 @@ def main(args):
                     "loss": [],
                     "gender_gap": [],
                     "gender_gap_abs": [],
+                    "matd": [],
                     "gender_pred_between_0.2_0.8": [],
                 }
                 log_imgs_i = {}
@@ -3081,16 +3081,23 @@ def main(args):
 
                 if accelerator.is_main_process:
                     probs_tmp = probs_gender_all[(probs_gender_all!=-1).all(dim=-1)]
-                    gender_gap = (((probs_tmp[:,1]>=0.5)*(probs_tmp[:,1]<=1)).float().mean() - ((probs_tmp[:,1]>=0)*(probs_tmp[:,1]<=0.5)).float().mean()).item()
+                    gender_gap, matd = compute_gender_metrics(probs_tmp, args.target_male_ratio)
                     gender_pred_between_02_08 = ((probs_tmp[:,1]>=0.2)*(probs_tmp[:,1]<=0.8)).float().mean().item()
                     logs_i["gender_gap"].append(gender_gap)
                     logs_i["gender_gap_abs"].append(abs(gender_gap))
+                    logs_i["matd"].append(matd)
                     logs_i["gender_pred_between_0.2_0.8"].append(gender_pred_between_02_08)
 
                 ################################################
                 # Step 2: generate dynamic targets 
                 # also broadcast from process idx 0, just in case targets_all computed might be different on different processes
-                targets_all, uncertainty_all = generate_dynamic_targets(probs_gender_all, w_uncertainty=True)
+                # target_ratio is the FEMALE fraction (see generate_dynamic_targets docstring),
+                # so the male target is passed as its complement.
+                targets_all, uncertainty_all = generate_dynamic_targets(
+                    probs_gender_all,
+                    target_ratio=1.0 - args.target_male_ratio,
+                    w_uncertainty=True,
+                    )
                 torch.distributed.broadcast(targets_all, src=0)
                 torch.distributed.broadcast(uncertainty_all, src=0)
 
@@ -3283,7 +3290,7 @@ def main(args):
                         logs_i.pop(key)
                     else:
                         logs_i[key] = torch.cat(logs_i[key])
-                for key in ["gender_gap", "gender_gap_abs", "gender_pred_between_0.2_0.8"]:
+                for key in ["gender_gap", "gender_gap_abs", "matd", "gender_pred_between_0.2_0.8"]:
                     if logs_i[key] == []:
                         logs_i.pop(key)
 

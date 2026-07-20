@@ -14,36 +14,29 @@
 # See the License for the specific language governing permissions and
 
 # =====================================================================================
-# ATTMAP = NODETECTOR + a switch on the SPATIAL REDUCTION of the woman/man class error:
-#     --gender_attn_weight {attn, none}     (default: attn == the original NODETECTOR file)
-# The woman/man gender error E_c is the per-pixel squared eps-residual of the frozen scoring UNet
-# under the "woman"/"man" text condition. The original file always reduces it with the COMMON
-# woman/man cross-attention map (sum-to-1 normalized) as a spatial weight, i.e. E_c = sum_{u,v}
-# attn(u,v) * res_c(u,v) -- re-weighting the error toward the gender/person region. This file makes
-# that weighting OPTIONAL:
-#   attn : E_c = sum_{u,v} common_attn(u,v) * res_c(u,v)        (attention-weighted SUM; original)
-#   none : E_c = mean_{u,v} res_c(u,v)                          (the FULL error, uniform over space)
-# The 'none' branch is exactly the 'attn' branch with a FLAT weight map 1/(H*W), which also sums to
-# 1 -- so E_c keeps the same normalization/scale and --tau does NOT need to be re-tuned a priori.
-# HOW BIG IS THE DIFFERENCE? Measured on 8 real generated images (K=15, t 400-800): this gender attn
-# map is DIFFUSE, not a face mask (values 1.7e-4..4.7e-4 around the 2.44e-4 uniform value, ~2.8x
-# max/min, participation ratio ~3900 of 4096 px). So 'attn' is a MILD re-weighting: E_woman
-# none/attn = 1.04, the class GAP |E_man - E_woman| none/attn = 0.83, and the argmax gender preds
-# agree 8/8. The flag mainly rescales the class-error GAP (hence the fair-loss gradient), and does
-# NOT make the z0 gradient uniform (it flows through the scoring UNet's global receptive field:
-# top-10% |grad| energy 0.225 attn -> 0.196 none, vs 0.10 for a truly uniform field).
-# The flag applies to BOTH places the class error is computed: residual_gender_and_realism (the SCR
-# fair loss) and residual_gender_logits (the training-time gender predictor behind get_face_gender).
-# What the flag does NOT change (the cross-attention map is still computed in BOTH modes):
-#   - the SRR realism gradient region  (min-max common_attn >= --attn_gate_thr, input-masked z0)
-#   - the h-space SCR flip gradient gate (same region, scaled by --factor2)
-#   - the attention/grad-gate visualizations (--save_attn_maps)
-# Only the gender-error reduction switches; everything else is byte-for-byte the original file.
-# Run-folder tag: the mode is ALWAYS written into the output folder / wandb run name --
-#   _gAttn-attn = attmap weighting ON (original behaviour) , _gAttn-none = attmap weighting OFF
-# so a run's own folder states whether the attmap multiply was used (an absent tag would be
-# ambiguous with the original _nodetector.py runs, which carry no _gAttn tag at all). Example:
-#   ..._wSRR-4_srr-person_errFD-8-50-950_gAttn-none_skipFrac-0.5_Th-0.2_loraR-50_lr-5e-05_07131530
+# NOFLIP = NODETECTOR with EVERY face-presence gate and the factor2 flip gradient-gate REMOVED from
+# the TRAINING loss/gradient. The SOLE remaining loss/grad modulation is the per-sample scalar
+# `dynamic_weights` on the SCR loss: agree (target == pred_gender_ori) -> x1, flip (target != pred)
+# OR uncertain (target == -1) -> x--factor1 (default 0.2). Concretely, vs the nodetector base:
+#   (1) NO factor2 spatial flip gate on the SCR h-space gradient. The old code damped the SCR
+#       gradient by --factor2 inside the min-max gender-attn region for flip/uncertain samples (a
+#       per-pixel "person-region" gradient scale); that whole gate (attn_gate / release_ij /
+#       scr_grad_mask + the zt_ft register_hook + its gradgate.jpg viz) is deleted. The SCR h-space
+#       gradient now flows UNMODULATED over the whole image.
+#   (2) NO face-presence gating of the FAIR loss. get_face_gender is called with selector=None at
+#       BOTH training sites (steps 1 & 3), so all samples are gender-scored and fair-loss
+#       participation is decided purely by the uncertainty threshold (targets != -1 = core DAL
+#       target validity, NOT a face gate). The step-4 idxs_w_face_loss `face_indicators_ij == True`
+#       conjunct is dropped (only `targets != -1` remains).
+#   (3) NO face-presence gating of the SCR loss. The `common_attn *= face_indicators_ij` zero-out is
+#       deleted, and gen_dynamic_weights no longer takes/uses face_indicators (flip decision only).
+# KEPT UNCHANGED: the SRR realism loss and its INTERNAL person-region gradient mask (z0_srr in
+# residual_gender_and_realism: value = whole image, gradient hard-detached outside the attn region).
+# That mask is a hard detach (not a factor-0.2 scale) and is the defining feature of the _person
+# variant, so it is intentionally left in place. residual_face_indicators is still computed at steps
+# 1 & 3 (used ONLY for plot_in_grid / save_noface_images, never to gate loss or gradient); at step 4
+# it is dropped entirely, since nothing in the backward loss path consumes face presence anymore.
+# EVALUATION (evaluate_process) is untouched. The output folder name gets an extra tag: _NOFLIP.
 # =====================================================================================
 # NODETECTOR = SRR_person_truncated_hspace with the insightface FACE DETECTOR REPLACED -- in the
 # TRAINING branch points ONLY -- by a diffusion residual-error face/no-face classifier:
@@ -55,9 +48,11 @@
 # face_error_exp/exp100 (50 genuine-face vs 50 genuine-noface occupation images): this exact pair
 # scores 88/100 at K=8 over t50-950, equal to its K=15 score (K<8 degrades).
 # REPLACED SITES (all three TRAINING uses of get_face; NOTHING else is touched):
-#   step 1: face_indicators     -> gates get_face_gender -> targets(-1) -> fair-loss participation
-#   step 3: face_indicators_ori -> gates preds/probs_gender_ori -> SCR release gate + dyn. weight
-#   step 4: face_indicators_ij  -> fair-loss idxs_w_face_loss, SCR attn zero-out, gen_dynamic_weights
+#   step 1: face_indicators     -> [NOFLIP: no longer gates get_face_gender; selector=None]
+#   step 3: face_indicators_ori -> [NOFLIP: no longer gates preds/probs_gender_ori; selector=None]
+#   step 4: face_indicators_ij  -> [NOFLIP: no longer gates fair loss / SCR attn / dyn. weight]
+#   In NOFLIP all three face_indicators are still COMPUTED but consumed only by plot_in_grid /
+#   save_noface_images (display); they no longer touch any loss or gradient.
 #   face_bboxs at steps 1/3 become fill_value(-1) dummies (they were only used by plot_in_grid).
 # EVALUATION (evaluate_process) still uses the real insightface detector + the external test
 # classifier, so eval metrics stay comparable to all baselines.
@@ -563,7 +558,7 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--resume_from_checkpoint",
         type=str,
-        default="./outputs/gender-debias-text-encoder-again/BS-24_TE_tau-0.0001_resT-15-400-800_scrT-15-400-800_wSCR-4-0.2-0.2_wSRR-4_srr-person_errFD-8-50-950_gAttn-none_Th-0.2_loraR-50_lr-5e-05_07132336/ckpts/checkpoint_tmp-1720",
+        default="",
         help="provide the checkpoint path to resume from checkpoint. NOTE: kept None for the SRR_person "
              "experiment so it starts fresh from pretrained SD -- resuming from a face-prompt SRR checkpoint "
              "would carry over weights trained on the old 'a photo of a realistic face' prompt and "
@@ -680,28 +675,6 @@ def parse_args(input_args=None):
              "over the same --residual_t_min/max and --residual_num_timesteps (no separate timestep args).",
     )
     parser.add_argument(
-        '--gender_attn_weight',
-        default="none",
-        type=str,
-        choices=["attn", "none"],
-        help="spatial reduction of the woman/man class error E_c (the per-pixel squared eps-residual of "
-             "the frozen scoring UNet under the woman/man text condition). 'attn' (default, identical to "
-             "the original NODETECTOR file): weight the residual by the sum-to-1 common woman/man "
-             "cross-attention map and spatially SUM, i.e. re-weight pixels toward the gender/person region. "
-             "'none': use the FULL error, a UNIFORM spatial mean over all H*W pixels -- i.e. the same "
-             "weighted sum with a FLAT 1/(H*W) map, which also sums to 1, so E_c keeps the same scale and "
-             "--tau needs no a-priori re-tuning. MEASURED (8 real gen. images, K=15, t400-800): the gender "
-             "attn map is DIFFUSE, not a face mask (1.7e-4..4.7e-4 vs the 2.44e-4 uniform value, ~2.8x "
-             "max/min, participation ratio ~3900/4096 px), so 'attn' is a MILD re-weighting, not a hard "
-             "localization: E_woman none/attn = 1.04, |E_man - E_woman| none/attn = 0.83, argmax preds "
-             "agree 8/8. Expect the two modes to differ mostly in the class-error GAP (hence the fair-loss "
-             "gradient scale), not in the predicted labels. Applies to BOTH the SCR fair loss "
-             "(residual_gender_and_realism) and the training-time gender predictor (residual_gender_logits "
-             "-> get_face_gender). The attention map is still computed in BOTH modes: it keeps driving the "
-             "SRR realism gradient region and the h-space SCR flip gate (--attn_gate_thr/--factor2) and the "
-             "attmap visualizations, which are unaffected by this flag.",
-    )
-    parser.add_argument(
         '--attn_gate_thr',
         default=0.15,
         help="min-max-normalized gender (woman/man) cross-attention threshold defining the person/subject "
@@ -720,6 +693,19 @@ def parse_args(input_args=None):
         )
     parser.add_argument('--factor1', help="train, val, test batch size", type=float, default=0.2)
     parser.add_argument('--factor2', help="train, val, test batch size", type=float, default=0.2)
+    parser.add_argument(
+        '--scr_uniform_weight',
+        action="store_true",
+        default=False,
+        help="if set, the per-sample SCR scalar dynamic_weights is FORCED to 1 for EVERY sample "
+             "(agree / flip / uncertain alike), so the SCR h-space loss AND its gradient are applied "
+             "at full strength (x1) over the whole image in ALL cases -- --factor1 is ignored for the "
+             "SCR weight. In this NOFLIP variant the factor2 spatial gradient-gate is already removed "
+             "(the SCR gradient already flows unmodulated across the image), so this flag only drops "
+             "the remaining 0.2 flip/uncertain scalar damping, making SCR a plain uniform loss. "
+             "Default False keeps the flip/uncertain=--factor1 (0.2), agree=1 dynamic weighting. "
+             "Folder name gets an extra _scrUNI tag when set.",
+    )
 
     # batch size, properly set to max out GPU
     parser.add_argument(
@@ -1101,11 +1087,8 @@ def main(args):
         f"_wSRR-{args.weight_loss_face}"
         f"_srr-{_srr_tag}"
         f"_errFD-{args.face_residual_num_timesteps}-{args.face_residual_t_min}-{args.face_residual_t_max}"
-        # gender class-error spatial reduction, ALWAYS tagged (both modes) so a run's folder says outright
-        # whether the attmap weighting was on: _gAttn-attn = attention-weighted, _gAttn-none = full error.
-        # Deliberately not a "tag only when non-default" suffix like _skipFrac: an absent tag would be
-        # ambiguous with the original _nodetector.py runs, which have no _gAttn at all.
-        f"_gAttn-{args.gender_attn_weight}"
+        f"_NOFLIP"
+        f"{'_scrUNI' if args.scr_uniform_weight else ''}"
         f"{('_skipFrac-'+format(args.skip_denoise_frac, 'g')) if args.skip_denoise_frac>0 else ''}"
         f"_Th-{args.uncertainty_threshold}"
         f"_loraR-{args.rank}_lr-{args.learning_rate}"
@@ -2063,23 +2046,6 @@ def main(args):
         
         return face_indicators_app, face_bboxs_app, face_chips_app, face_landmarks_app, aligned_face_chips_app
                 
-    def reduce_gender_residual(residual_map, common_attn):
-        """Spatially reduce a per-pixel woman/man squared residual [n,K,H,W] to a per-image error [n].
-
-        Controlled by --gender_attn_weight:
-          'attn' (default): weighted SUM with the sum-to-1 common woman/man cross-attention map,
-              E_c = sum_{u,v} common_attn(u,v) * res_c(u,v)  -- the error only counts the gender/person
-              region. This is the original NODETECTOR behaviour.
-          'none': UNIFORM spatial MEAN over all H*W pixels, E_c = mean_{u,v} res_c(u,v) -- the FULL error,
-              every pixel counts equally. Identical to the 'attn' formula with a FLAT weight map 1/(H*W),
-              which ALSO sums to 1, so E_c keeps the same normalization/scale as 'attn' (--tau comparable).
-        The timestep axis K is always reduced by a uniform mean, in both modes. common_attn is detached in
-        both callers, so this only changes WHERE the gradient d E_c / d z0 is weighted, never the graph.
-        """
-        if args.gender_attn_weight == "none":
-            return residual_map.mean(dim=(2, 3)).mean(dim=1)                                    # [n]
-        return (common_attn.unsqueeze(1) * residual_map).sum(dim=(2, 3)).mean(dim=1)            # [n]
-
     def residual_gender_logits(z0):
         """Prompt-conditioned diffusion residual-error gender scorer with cross-attention spatial weighting.
 
@@ -2163,10 +2129,9 @@ def main(args):
         common_attn = common_attn / (common_attn.sum(dim=(1, 2), keepdim=True) + 1e-8)
         common_attn = common_attn.detach()                                             # weighting mask only
 
-        # spatial reduction per --gender_attn_weight: 'attn' = attention-weighted SUM (original),
-        # 'none' = uniform mean over all pixels (the FULL error). Then uniform mean over timesteps.
-        E_woman = reduce_gender_residual(residual_maps["woman"], common_attn)           # [n]
-        E_man = reduce_gender_residual(residual_maps["man"], common_attn)               # [n]
+        # attention-weighted spatial SUM per timestep, then uniform mean over timesteps
+        E_woman = (common_attn.unsqueeze(1) * residual_maps["woman"]).sum(dim=(2, 3)).mean(dim=1)   # [n]
+        E_man = (common_attn.unsqueeze(1) * residual_maps["man"]).sum(dim=(2, 3)).mean(dim=1)       # [n]
 
         logits_gender = torch.stack([-E_woman / args.tau, -E_man / args.tau], dim=1)    # [n, 2]
         return logits_gender
@@ -2305,12 +2270,8 @@ def main(args):
         common_attn = attn_accum / max(attn_count, 1)                                   # [n,H,W]
         common_attn = common_attn / (common_attn.sum(dim=(1, 2), keepdim=True) + 1e-8)
         common_attn = common_attn.detach()
-        # spatial reduction per --gender_attn_weight: 'attn' = attention-weighted SUM (original),
-        # 'none' = uniform mean over all pixels (the FULL error). common_attn is still computed above
-        # regardless, because the SRR region mask below (and the h-space SCR flip gate, via the returned
-        # map) use it in BOTH modes -- only the CLASS-ERROR weighting is switched off by 'none'.
-        E_woman = reduce_gender_residual(residual_maps["woman"], common_attn)           # [n]
-        E_man = reduce_gender_residual(residual_maps["man"], common_attn)               # [n]
+        E_woman = (common_attn.unsqueeze(1) * residual_maps["woman"]).sum(dim=(2, 3)).mean(dim=1)   # [n]
+        E_man = (common_attn.unsqueeze(1) * residual_maps["man"]).sum(dim=(2, 3)).mean(dim=1)       # [n]
         logits_gender = torch.stack([-E_woman / args.tau, -E_man / args.tau], dim=1)    # [n, 2]
 
         # -------- SRR realism: VALUE over the WHOLE image, GRADIENT only in the person/gender region --------
@@ -2841,18 +2802,24 @@ def main(args):
         images_new = torch.cat(images_new)
         return images_new
     
-    def gen_dynamic_weights(face_indicators, targets, preds_gender_ori, probs_gender_ori, factor=0.2):
+    def gen_dynamic_weights(targets, preds_gender_ori, probs_gender_ori, factor=0.2, uniform=False):
+        # NOFLIP: this per-sample SCR scalar weight is the ONLY loss/grad modulation retained, and it is
+        # NO LONGER gated on face detection. It depends purely on the flip decision:
+        #   agree (target == pred_gender_ori) -> 1 ;  flip (target != pred) OR uncertain (target == -1) -> factor.
+        # uniform=True (--scr_uniform_weight): bypass the flip decision entirely and return 1 for EVERY
+        # sample, so the SCR loss/gradient is applied at full strength (x1) over the whole image in all cases.
+        if uniform:
+            return torch.ones(
+                [probs_gender_ori.shape[0]], dtype=probs_gender_ori.dtype, device=probs_gender_ori.device
+            )
         weights = []
-        for face_indicator, target, pred_gender_ori, prob_gender_ori in itertools.zip_longest(face_indicators, targets, preds_gender_ori, probs_gender_ori):
-            if (face_indicator == False).all():
+        for target, pred_gender_ori, prob_gender_ori in itertools.zip_longest(targets, preds_gender_ori, probs_gender_ori):
+            if target==-1:
+                weights.append(factor)
+            elif target==pred_gender_ori:
                 weights.append(1)
-            else:
-                if target==-1:
-                    weights.append(factor)
-                elif target==pred_gender_ori:
-                    weights.append(1)
-                elif target!=pred_gender_ori:
-                    weights.append(factor)
+            elif target!=pred_gender_ori:
+                weights.append(factor)
 
         weights = torch.tensor(weights, dtype=probs_gender_ori.dtype, device=probs_gender_ori.device)
         return weights
@@ -3048,7 +3015,9 @@ def main(args):
                 # face_bboxs become fill_value(-1) dummies -- they were only consumed by plot_in_grid.
                 face_indicators = residual_face_indicators(z0)
                 face_bboxs = torch.ones([face_indicators.shape[0], 4], dtype=torch.long, device=images.device) * (-1)
-                preds_gender, probs_gender, logits_gender = get_face_gender(z0, selector=face_indicators, fill_value=-1)
+                # NOFLIP: no face gating of gender scoring -- ALL samples are scored (selector=None), so
+                # fair-loss participation is decided purely by the uncertainty threshold, not by face/no-face.
+                preds_gender, probs_gender, logits_gender = get_face_gender(z0, selector=None, fill_value=-1)
 
                 face_indicators_all, face_indicators_others = customized_all_gather(face_indicators, accelerator, return_tensor_other_processes=True)
                 accelerator.print(f"\tNum faces detected (residual errFD, no detector): {face_indicators_all.sum().item()}/{face_indicators_all.shape[0]}.")
@@ -3122,7 +3091,9 @@ def main(args):
                 # NODETECTOR: residual-error face indicator on z0_ori replaces insightface get_face(images_ori).
                 face_indicators_ori = residual_face_indicators(z0_ori)
                 face_bboxs_ori = torch.ones([face_indicators_ori.shape[0], 4], dtype=torch.long, device=images_ori.device) * (-1)
-                preds_gender_ori, probs_gender_ori, logits_gender_ori = get_face_gender(z0_ori, selector=face_indicators_ori, fill_value=-1)
+                # NOFLIP: no face gating of gender scoring on the ORIGINAL images either (selector=None), so
+                # preds_gender_ori is a real gender prediction for every sample (feeds the flip dynamic weight).
+                preds_gender_ori, probs_gender_ori, logits_gender_ori = get_face_gender(z0_ori, selector=None, fill_value=-1)
 
                 # SCR: the image loss no longer uses CLIP/DINO features; it is computed in Step 4 from the
                 # FROZEN scoring UNet's mid_block (h-space) on re-noised z0_ori vs z0_ft. (CLIP-I / DINO-I are
@@ -3167,56 +3138,30 @@ def main(args):
                 face_bboxs_ori_ij = face_bboxs_ori[idxs_ij]
 
                 images_ij, z0_ij = generate_image_w_gradient(prompt_i, noises_ij, num_denoising_steps, which_text_encoder=text_encoder, which_unet=unet, return_latents=True)
-                # NODETECTOR: residual-error face indicator on z0_ij replaces insightface get_face(images_ij).
-                # Runs under no_grad inside (the detector it replaces was equally non-differentiable);
-                # bboxes/chips are not used anywhere in this loss path.
-                face_indicators_ij = residual_face_indicators(z0_ij)
+                # NOFLIP: residual_face_indicators(z0_ij) is NOT computed here anymore. In the nodetector base
+                # it fed the SCR attn zero-out, idxs_w_face_loss and gen_dynamic_weights -- all of which no
+                # longer use face presence -- so there is nothing left to compute it for. Dropping it saves the
+                # per-chunk scoring-UNet forwards the face/no-face classifier ran every backward step.
                 # Branch B: fused residual scorer on z0_ij (grad flows z0 -> trainable model).
                 #   - logits_gender_ij [n,2]: woman/man residual-error gender logits (SCR fair loss).
                 #   - loss_SRR_ij [n]: "a photo of a realistic person" residual error (SRR realism loss).
-                #   - common_attn_ij [n,H,W]: sum-to-1 gender localization map, reused by the SCR flip gate
-                #     below (no extra scorer forward). Both losses share the same per-timestep eps/zt.
+                #   - common_attn_ij [n,H,W]: sum-to-1 gender localization map. In NOFLIP it no longer gates
+                #     the SCR gradient here; it is still used INSIDE residual_gender_and_realism for the SRR
+                #     realism region mask (intentionally kept). Both losses share the same per-timestep eps/zt.
                 logits_gender_ij, loss_SRR_ij, common_attn_ij = residual_gender_and_realism(z0_ij)
-                # Zero the attn for no-face FINETUNE samples so they are never damped (mirrors debias's
-                # "if no face, skip" / the Face_hspace get_face_gender selector filling non-faces with zeros).
-                common_attn_ij = common_attn_ij * face_indicators_ij.view(-1, 1, 1).to(common_attn_ij.dtype)
+                # NOFLIP: the face-based attn zero-out (common_attn *= face_indicators_ij) is REMOVED --
+                # face presence no longer modulates the SCR loss/gradient in any way.
 
                 # Branch A: SCR image loss (scoring-space, FROZEN feature extractor) -- replaces the CLIP/DINO img loss.
                 #   re-noise the ORIGINAL (z0_ori) and FINETUNE (z0_ij) latents to the SAME zt (shared eps & t)
                 #   and MSE the FROZEN scoring UNet's mid_block (h-space) output under the frozen generation prompt.
                 #   grad: h_ft -> zt_ft -> z0_ij -> generation (reaches up_blocks); h_ori is a detached target.
-                #   FLIP RELEASE: for flip OR uncertain samples, multiply the SCR gradient by --factor2 inside
-                #   the face/gender region (min-max attn >= --attn_gate_thr), x1 else. Applied via a hook on the
-                #   SCR-only tensor zt_ft, so loss_fair/loss_SRR gradients are untouched.
-                #   The release set MATCHES the debias apply_grad_hook_face decision exactly:
-                #     debias damps when {target == -1} OR {target != pred_gender_ori}   (the `if target==-1`
-                #     branch fires first/unconditionally), and keeps only when {target != -1 AND target == pred_ori}.
-                #   So release_ij = (target != pred_ori) | (target == -1). The extra `| (target == -1)` term (vs the
-                #   plain `!=`) covers the {target==-1 AND pred_ori==-1} corner, which `-1 != -1 == False` would
-                #   otherwise (wrongly) treat as "agree -> keep". No-face FINETUNE samples were zeroed above ->
-                #   attn_gate==0 < thr -> no damping.
+                #   NOFLIP: the factor2 spatial flip gradient-gate is REMOVED. There is NO per-pixel / person-
+                #   region scaling of the SCR gradient -- it flows unmodulated over the whole image. The only
+                #   SCR modulation kept is the per-sample scalar dynamic_weights (flip -> factor1, agree -> 1),
+                #   multiplied onto loss_SCR_ij after the loop.
                 z0_ori_ij = z0_ori[idxs_ij]
                 scr_gen_embeds_ij = scr_gen_embeds.expand(len(idxs_ij), -1, -1)
-
-                cmin = common_attn_ij.amin(dim=(1, 2), keepdim=True)
-                cmax = common_attn_ij.amax(dim=(1, 2), keepdim=True)
-                attn_gate = ((common_attn_ij - cmin) / (cmax - cmin + 1e-8)).clamp(0, 1)          # [chunk,64,64] min-max
-                release_ij = (targets_ij != preds_gender_ori_ij) | (targets_ij == -1)               # debias-aligned: flip OR uncertain(-1)
-                scr_grad_mask = torch.ones_like(attn_gate)
-                scr_grad_mask = torch.where((attn_gate >= args.attn_gate_thr) & release_ij[:, None, None],
-                                            torch.full_like(scr_grad_mask, args.factor2), scr_grad_mask)
-                scr_grad_mask = scr_grad_mask[:, None, :, :].to(z0_ij.dtype)                        # [chunk,1,64,64]
-
-                # Visualize/save the flip gradient-gate: min-max normalized attn + hard mask (--attn_gate_thr)
-                # and the region actually damped by --factor2 this step. Uses the exact gating tensors above.
-                if accelerator.is_main_process and args.save_attn_maps and (step % args.train_plot_every_n_iter == 0) and j == 0:
-                    grad_gate_save_to = os.path.join(args.imgs_save_dir, f"train-{global_step}_gradgate.jpg")
-                    save_grad_gate_panels(
-                        images_ij, common_attn_ij, attn_gate, scr_grad_mask, release_ij,
-                        targets_ij, preds_gender_ori_ij, grad_gate_save_to,
-                        thr=args.attn_gate_thr, factor2=args.factor2,
-                    )
-                    log_imgs_i["grad_gate"] = [grad_gate_save_to]
 
                 scr_mid_store = []
                 def _scr_mid_hook(_m, _in, _out):
@@ -3227,7 +3172,7 @@ def main(args):
                     _tb = _t.repeat(len(idxs_ij))
                     _eps = torch.randn_like(z0_ij)
                     zt_ft = noise_scheduler.add_noise(z0_ij, _eps, _tb)                             # grad -> z0_ij
-                    zt_ft.register_hook(lambda g, mm=scr_grad_mask: g * mm)                         # SCR-only spatial gate
+                    # NOFLIP: no SCR-only spatial gate hook here -- the SCR gradient is unmodulated over the image.
                     zt_ori = noise_scheduler.add_noise(z0_ori_ij, _eps, _tb)                        # detached target input
                     scr_mid_store.clear()
                     _ = scoring_unet(zt_ft.to(weight_dtype), _tb, encoder_hidden_states=scr_gen_embeds_ij).sample
@@ -3241,15 +3186,18 @@ def main(args):
                 loss_SCR_ij = torch.stack(scr_per_t, dim=0).mean(dim=0).to(weight_dtype)
                 
                 loss_fair_ij = torch.ones(len(idxs_ij), dtype=weight_dtype, device=accelerator.device) *(-1)
-                idxs_w_face_loss = ((face_indicators_ij == True) * (targets_ij != -1)).nonzero().view([-1])
-                loss_fair_ij_w_face_loss = CE_loss(logits_gender_ij[idxs_w_face_loss], targets_ij[idxs_w_face_loss])
-                loss_fair_ij[idxs_w_face_loss] = loss_fair_ij_w_face_loss.to(loss_fair_ij.dtype)
+                # NOFLIP: fair-loss participation is NO LONGER gated on face detection. Every sample with a
+                # VALID target (targets_ij != -1, i.e. not cut by the uncertainty threshold -- this is the core
+                # DAL target-validity filter, NOT a face gate) contributes to the fair loss.
+                idxs_w_fair_loss = (targets_ij != -1).nonzero().view([-1])
+                loss_fair_ij_w_fair_loss = CE_loss(logits_gender_ij[idxs_w_fair_loss], targets_ij[idxs_w_fair_loss])
+                loss_fair_ij[idxs_w_fair_loss] = loss_fair_ij_w_fair_loss.to(loss_fair_ij.dtype)
 
                 # SRR realism loss: raw residual error of args.srr_prompt (no 1/tau). Applies to ALL
                 # generated samples (like the old CLIP/DINO), not gated on face detection or target validity.
                 loss_SRR_ij = loss_SRR_ij.to(weight_dtype)
 
-                dynamic_weights = gen_dynamic_weights(face_indicators_ij, targets_ij, preds_gender_ori_ij, probs_gender_ori_ij, factor=args.factor1)
+                dynamic_weights = gen_dynamic_weights(targets_ij, preds_gender_ori_ij, probs_gender_ori_ij, factor=args.factor1, uniform=args.scr_uniform_weight)
                 loss_ij = loss_fair_ij + args.weight_loss_scr * dynamic_weights * loss_SCR_ij + args.weight_loss_face * loss_SRR_ij
                 accelerator.backward(loss_ij.mean())
 

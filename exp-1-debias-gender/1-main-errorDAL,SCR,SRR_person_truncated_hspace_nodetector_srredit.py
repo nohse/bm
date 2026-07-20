@@ -14,36 +14,48 @@
 # See the License for the specific language governing permissions and
 
 # =====================================================================================
-# ATTMAP = NODETECTOR + a switch on the SPATIAL REDUCTION of the woman/man class error:
-#     --gender_attn_weight {attn, none}     (default: attn == the original NODETECTOR file)
-# The woman/man gender error E_c is the per-pixel squared eps-residual of the frozen scoring UNet
-# under the "woman"/"man" text condition. The original file always reduces it with the COMMON
-# woman/man cross-attention map (sum-to-1 normalized) as a spatial weight, i.e. E_c = sum_{u,v}
-# attn(u,v) * res_c(u,v) -- re-weighting the error toward the gender/person region. This file makes
-# that weighting OPTIONAL:
-#   attn : E_c = sum_{u,v} common_attn(u,v) * res_c(u,v)        (attention-weighted SUM; original)
-#   none : E_c = mean_{u,v} res_c(u,v)                          (the FULL error, uniform over space)
-# The 'none' branch is exactly the 'attn' branch with a FLAT weight map 1/(H*W), which also sums to
-# 1 -- so E_c keeps the same normalization/scale and --tau does NOT need to be re-tuned a priori.
-# HOW BIG IS THE DIFFERENCE? Measured on 8 real generated images (K=15, t 400-800): this gender attn
-# map is DIFFUSE, not a face mask (values 1.7e-4..4.7e-4 around the 2.44e-4 uniform value, ~2.8x
-# max/min, participation ratio ~3900 of 4096 px). So 'attn' is a MILD re-weighting: E_woman
-# none/attn = 1.04, the class GAP |E_man - E_woman| none/attn = 0.83, and the argmax gender preds
-# agree 8/8. The flag mainly rescales the class-error GAP (hence the fair-loss gradient), and does
-# NOT make the z0 gradient uniform (it flows through the scoring UNet's global receptive field:
-# top-10% |grad| energy 0.225 attn -> 0.196 none, vs 0.10 for a truly uniform field).
-# The flag applies to BOTH places the class error is computed: residual_gender_and_realism (the SCR
-# fair loss) and residual_gender_logits (the training-time gender predictor behind get_face_gender).
-# What the flag does NOT change (the cross-attention map is still computed in BOTH modes):
-#   - the SRR realism gradient region  (min-max common_attn >= --attn_gate_thr, input-masked z0)
-#   - the h-space SCR flip gradient gate (same region, scaled by --factor2)
-#   - the attention/grad-gate visualizations (--save_attn_maps)
-# Only the gender-error reduction switches; everything else is byte-for-byte the original file.
-# Run-folder tag: the mode is ALWAYS written into the output folder / wandb run name --
-#   _gAttn-attn = attmap weighting ON (original behaviour) , _gAttn-none = attmap weighting OFF
-# so a run's own folder states whether the attmap multiply was used (an absent tag would be
-# ambiguous with the original _nodetector.py runs, which carry no _gAttn tag at all). Example:
-#   ..._wSRR-4_srr-person_errFD-8-50-950_gAttn-none_skipFrac-0.5_Th-0.2_loraR-50_lr-5e-05_07131530
+# SRREDIT = NODETECTOR with the SRR (score-distillation realism/regularization) term REDEFINED on
+# two axes. Everything else -- the SCR h-space image loss, the fair/DAL gender loss, the errFD
+# face classifier, truncated denoising -- is untouched.
+#
+#   (1) SRR PROMPT  --srr_prompt_mode {gen,fixed}   [default: gen  <-- NEW behaviour]
+#       gen:   the SRR residual is conditioned on the ACTUAL GENERATION PROMPT of the step
+#              (prompt_i, e.g. "a photo of the face of a firefighter, a person"), encoded by the
+#              FROZEN scoring text encoder. It reuses scr_gen_embeds -- the very same [1,L,D]
+#              frozen-TE embedding the h-space SCR loss already computes once per step -- so this
+#              costs NO extra text-encoder forward and is guaranteed to be the same prompt the
+#              images were generated from.
+#       fixed: the old behaviour -- a single fixed prompt from --srr_prompt ("a photo of a
+#              realistic person"), encoded once at setup.
+#       WHAT THIS CHANGES SEMANTICALLY: with `gen`, SRR is no longer a generic "is this a
+#       realistic person" prior; it is a plain (CFG-free) SDS term on the generation prompt, i.e.
+#       it pulls z0 back toward the FROZEN model's high-density region FOR THAT PROMPT. That is a
+#       stronger, more targeted fidelity/regularization pull -- and it points more directly against
+#       the fair loss (which is trying to move z0 off the frozen model's biased mode). It also now
+#       overlaps in intent with the h-space SCR loss (same frozen prompt embedding), though the two
+#       differ in what they measure (SRR = raw eps-residual at t 400-800; SCR = mid_block h-space
+#       MSE vs the z0_ori reference at t 100-400) -- SRR has no reference image, SCR does.
+#       => RE-TUNE --weight_loss_face (the SRR weight). Its old value was tuned against a fixed,
+#       weak, whole-image realism prompt and will not transfer.
+#
+#   (2) SRR GRADIENT REGION  --srr_grad_region {full,person}   [default: full  <-- NEW behaviour]
+#       full:   NO spatial restriction. d(E_SRR)/dz0 is nonzero over the WHOLE image, exactly
+#               matching E_SRR's whole-image value. The realism pass reuses the SAME zt_all tensor
+#               as the woman/man passes (identical value AND unmasked gradient path), so it also
+#               drops the extra add_noise stack the person-masked path needed.
+#       person: the old behaviour -- z0 is input-masked to the person region (min-max-normalized
+#               gender attn >= --attn_gate_thr) before the realism UNet pass, so the SRR value
+#               stayed whole-image but its gradient was zero outside the person region.
+#       The `person` restriction was a design carried over from the face-identity loss it replaced;
+#       for a prompt-level SDS term there is no reason to gate it spatially (background realism is
+#       just as much part of the prompt), so `full` is the default here.
+#
+#   --attn_gate_thr is UNCHANGED and still drives the SCR flip gradient-gate (x --factor2). Under
+#   the default --srr_grad_region full it no longer affects SRR at all.
+#   Folder/wandb name is ALWAYS tagged _srr-<gen|lastword> and _srrGrad-<full|person> (both modes),
+#   so an srredit run is never confusable with a base-nodetector run.
+#   Setting `--srr_prompt_mode fixed --srr_grad_region person` reproduces the base nodetector file
+#   bit-for-bit (same prompt embeds, same masked zt), modulo RNG.
 # =====================================================================================
 # NODETECTOR = SRR_person_truncated_hspace with the insightface FACE DETECTOR REPLACED -- in the
 # TRAINING branch points ONLY -- by a diffusion residual-error face/no-face classifier:
@@ -83,14 +95,15 @@
 # (current-model, original/frozen, gradient) so reference and trained images stay comparable.
 # EVALUATION always passes skip_denoise_frac=0.0 (full denoising) so metrics match baselines.
 #
-# INTERACTION NOTE (truncated z0 x SRR realism): with frac>0, z0 is a blurrier x0 estimate.
-# The SRR realism loss (residual_gender_and_realism) scores this z0 with "a photo of a
-# realistic person"; because E_realistic is a RAW eps-residual, part of it now reflects the
-# truncation blur rather than gender-induced unrealism, so the realism gradient partly fights
-# the truncation. The SCR gender logits (a woman-vs-man DIFFERENCE) are more robust to this
-# shared blur. If the SRR term misbehaves under truncation, try a smaller skip_denoise_frac
-# or re-tune weight_loss_face. This is inherent to putting any z0-based loss on a truncated
-# trajectory, not a bug.
+# INTERACTION NOTE (truncated z0 x SRR): with frac>0, z0 is a blurrier x0 estimate. The SRR loss
+# (residual_gender_and_realism) scores this z0 with the SRR prompt -- under SRREDIT's default that
+# is the generation prompt itself; because E_srr is a RAW eps-residual, part of it now reflects the
+# truncation blur rather than gender-induced unrealism, so the SRR gradient partly fights the
+# truncation. The SCR gender logits (a woman-vs-man DIFFERENCE) are more robust to this shared
+# blur. If the SRR term misbehaves under truncation, try a smaller skip_denoise_frac or re-tune
+# weight_loss_face. This is inherent to putting any z0-based loss on a truncated trajectory, not a
+# bug -- and it is if anything MORE pronounced with the gen prompt, whose residual is dominated by
+# whole-image reconstruction quality now that the gradient is no longer person-masked.
 # =====================================================================================
 
 import os, sys
@@ -563,7 +576,7 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--resume_from_checkpoint",
         type=str,
-        default="./outputs/gender-debias-text-encoder-again/BS-24_TE_tau-0.0001_resT-15-400-800_scrT-15-400-800_wSCR-4-0.2-0.2_wSRR-4_srr-person_errFD-8-50-950_gAttn-none_Th-0.2_loraR-50_lr-5e-05_07132336/ckpts/checkpoint_tmp-1720",
+        default="",
         help="provide the checkpoint path to resume from checkpoint. NOTE: kept None for the SRR_person "
              "experiment so it starts fresh from pretrained SD -- resuming from a face-prompt SRR checkpoint "
              "would carry over weights trained on the old 'a photo of a realistic face' prompt and "
@@ -672,43 +685,44 @@ def parse_args(input_args=None):
         type=float,
     )
     parser.add_argument(
+        '--srr_prompt_mode',
+        default="gen",
+        type=str,
+        choices=["gen", "fixed"],
+        help="SRREDIT: which text condition the SRR residual is scored under. 'gen' (default) = the ACTUAL "
+             "GENERATION PROMPT of the step (prompt_i), encoded by the frozen scoring text encoder -- it "
+             "reuses the scr_gen_embeds the h-space SCR loss already computes, so no extra TE forward. This "
+             "turns SRR into a CFG-free SDS term on the generation prompt (a prompt-fidelity pull toward the "
+             "FROZEN model), not a generic realism prior -- RE-TUNE --weight_loss_face. 'fixed' = the old "
+             "behaviour: the single fixed --srr_prompt, encoded once at setup.",
+    )
+    parser.add_argument(
         '--srr_prompt',
         default="a photo of a realistic person",
         type=str,
-        help="text prompt whose frozen-SD diffusion residual error is used directly as the SRR realism "
-             "loss. Scored by the fused residual scorer, sharing eps/zt with the woman/man gender scorer "
-             "over the same --residual_t_min/max and --residual_num_timesteps (no separate timestep args).",
+        help="text prompt whose frozen-SD diffusion residual error is used directly as the SRR loss. ONLY "
+             "USED WHEN --srr_prompt_mode fixed (the default 'gen' mode ignores this and uses the generation "
+             "prompt instead). Scored by the fused residual scorer, sharing eps/zt with the woman/man gender "
+             "scorer over the same --residual_t_min/max and --residual_num_timesteps (no separate timestep args).",
     )
     parser.add_argument(
-        '--gender_attn_weight',
-        default="none",
+        '--srr_grad_region',
+        default="full",
         type=str,
-        choices=["attn", "none"],
-        help="spatial reduction of the woman/man class error E_c (the per-pixel squared eps-residual of "
-             "the frozen scoring UNet under the woman/man text condition). 'attn' (default, identical to "
-             "the original NODETECTOR file): weight the residual by the sum-to-1 common woman/man "
-             "cross-attention map and spatially SUM, i.e. re-weight pixels toward the gender/person region. "
-             "'none': use the FULL error, a UNIFORM spatial mean over all H*W pixels -- i.e. the same "
-             "weighted sum with a FLAT 1/(H*W) map, which also sums to 1, so E_c keeps the same scale and "
-             "--tau needs no a-priori re-tuning. MEASURED (8 real gen. images, K=15, t400-800): the gender "
-             "attn map is DIFFUSE, not a face mask (1.7e-4..4.7e-4 vs the 2.44e-4 uniform value, ~2.8x "
-             "max/min, participation ratio ~3900/4096 px), so 'attn' is a MILD re-weighting, not a hard "
-             "localization: E_woman none/attn = 1.04, |E_man - E_woman| none/attn = 0.83, argmax preds "
-             "agree 8/8. Expect the two modes to differ mostly in the class-error GAP (hence the fair-loss "
-             "gradient scale), not in the predicted labels. Applies to BOTH the SCR fair loss "
-             "(residual_gender_and_realism) and the training-time gender predictor (residual_gender_logits "
-             "-> get_face_gender). The attention map is still computed in BOTH modes: it keeps driving the "
-             "SRR realism gradient region and the h-space SCR flip gate (--attn_gate_thr/--factor2) and the "
-             "attmap visualizations, which are unaffected by this flag.",
+        choices=["full", "person"],
+        help="SRREDIT: the spatial region the SRR gradient is allowed to flow in. 'full' (default) = the WHOLE "
+             "image -- d(E_srr)/dz0 is nonzero everywhere, matching E_srr's whole-image value; the realism pass "
+             "reuses the woman/man zt_all tensor directly (no extra add_noise). 'person' = the old behaviour: "
+             "z0 is input-masked to the person region (min-max gender attn >= --attn_gate_thr) before the "
+             "realism UNet pass, so the value stays whole-image but the gradient is zero outside that region.",
     )
     parser.add_argument(
         '--attn_gate_thr',
         default=0.15,
         help="min-max-normalized gender (woman/man) cross-attention threshold defining the person/subject "
-             "region (region = gate >= this). The SRR realism loss keeps its VALUE over the WHOLE image "
-             "(every pixel contributes to E_realistic), but its GRADIENT is restricted to this region by "
-             "input-masking z0 outside it (non-region z0 is detached), so d(E_realistic)/dz0 is exactly "
-             "zero outside the region while the value stays the true whole-image residual "
+             "region (region = gate >= this). Drives the SCR flip gradient-gate (the region scaled by "
+             "--factor2 on flip/uncertain samples). It ALSO defines the SRR gradient region, but ONLY under "
+             "--srr_grad_region person; under the default --srr_grad_region full it does not affect SRR at all "
              "(attmap reused from the woman/man scorer, min-max-normalized as in the hspace SCR gate).",
         type=float,
     )
@@ -1023,6 +1037,15 @@ def parse_args(input_args=None):
             args_dict[key] = type(args_dict[key])(value)
         args = argparse.Namespace(**args_dict)
 
+    # SRREDIT: the yaml merge above bypasses argparse's `choices` (it just casts to the default's type),
+    # so a typo'd config value would silently fall through to the non-default branch (e.g. an unrecognised
+    # srr_grad_region would behave as 'person'). Re-validate both SRR enums here so a bad config FAILS
+    # instead of quietly training the wrong objective.
+    for _enum_key, _allowed in (("srr_prompt_mode", ("gen", "fixed")), ("srr_grad_region", ("full", "person"))):
+        _v = getattr(args, _enum_key)
+        if _v not in _allowed:
+            raise ValueError(f"--{_enum_key} must be one of {list(_allowed)}, got {_v!r}")
+
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
     if env_local_rank != -1 and env_local_rank != args.local_rank:
         args.local_rank = env_local_rank
@@ -1088,9 +1111,16 @@ def main(args):
     now = datetime.now(my_timezone)
     timestring = f"{now.month:02}{now.day:02}{now.hour:02}{now.minute:02}"
     _model_tag = f"{'TE' if args.train_text_encoder else ''}{'UNet' if args.train_unet else ''}"
-    # short SRR-prompt slug (last word of --srr_prompt) so person-vs-face SRR runs are distinguishable
-    # by folder name, not just timestamp: "a photo of a realistic person" -> srr-person, ...face -> srr-face.
-    _srr_tag = args.srr_prompt.strip().split()[-1] if args.srr_prompt.strip() else "none"
+    # SRREDIT: short SRR-condition slug so runs are distinguishable by folder name, not just timestamp.
+    #   --srr_prompt_mode gen   -> "gen"   (SRR scored under the step's generation prompt)
+    #   --srr_prompt_mode fixed -> last word of --srr_prompt ("...realistic person" -> "person", ...face
+    #                              -> "face"), i.e. the base-nodetector tagging.
+    # Always emitted together with _srrGrad-<full|person> (the SRR gradient region), so both SRR axes
+    # are readable off the folder name in BOTH modes.
+    _srr_tag = (
+        "gen" if args.srr_prompt_mode == "gen"
+        else (args.srr_prompt.strip().split()[-1] if args.srr_prompt.strip() else "none")
+    )
     folder_name = (
         f"BS-{args.train_images_per_prompt_GPU*accelerator.num_processes}"
         f"_{_model_tag}"
@@ -1100,12 +1130,8 @@ def main(args):
         f"_wSCR-{args.weight_loss_scr}-{args.factor1}-{args.factor2}"
         f"_wSRR-{args.weight_loss_face}"
         f"_srr-{_srr_tag}"
+        f"_srrGrad-{args.srr_grad_region}"
         f"_errFD-{args.face_residual_num_timesteps}-{args.face_residual_t_min}-{args.face_residual_t_max}"
-        # gender class-error spatial reduction, ALWAYS tagged (both modes) so a run's folder says outright
-        # whether the attmap weighting was on: _gAttn-attn = attention-weighted, _gAttn-none = full error.
-        # Deliberately not a "tag only when non-default" suffix like _skipFrac: an absent tag would be
-        # ambiguous with the original _nodetector.py runs, which have no _gAttn at all.
-        f"_gAttn-{args.gender_attn_weight}"
         f"{('_skipFrac-'+format(args.skip_denoise_frac, 'g')) if args.skip_denoise_frac>0 else ''}"
         f"_Th-{args.uncertainty_threshold}"
         f"_loraR-{args.rank}_lr-{args.learning_rate}"
@@ -1233,7 +1259,11 @@ def main(args):
         return emb.to(weight_dtype)
     residual_woman_embeds = _encode_scoring_prompt(args.residual_woman_prompt)  # [1, L, D]
     residual_man_embeds = _encode_scoring_prompt(args.residual_man_prompt)      # [1, L, D]
-    residual_realistic_embeds = _encode_scoring_prompt(args.srr_prompt)         # [1, L, D], SRR realism prompt
+    # SRREDIT: the FIXED SRR prompt embedding. Used as the SRR condition ONLY under
+    # --srr_prompt_mode fixed; under the default 'gen' mode the SRR condition is the step's
+    # generation-prompt embedding (scr_gen_embeds), passed into residual_gender_and_realism per step.
+    # Encoded unconditionally (one TE forward at setup, negligible) so 'fixed' stays a pure flag flip.
+    residual_realistic_embeds = _encode_scoring_prompt(args.srr_prompt)         # [1, L, D], fixed SRR prompt
     # NODETECTOR: frozen-TE embeddings of the face/no-face classifier prompts (replaces the
     # insightface detector in the training branch points; see residual_face_indicators).
     # IMPORTANT: encoded WITHOUT attention_mask -- the standard SD text-encoding convention.
@@ -2063,23 +2093,6 @@ def main(args):
         
         return face_indicators_app, face_bboxs_app, face_chips_app, face_landmarks_app, aligned_face_chips_app
                 
-    def reduce_gender_residual(residual_map, common_attn):
-        """Spatially reduce a per-pixel woman/man squared residual [n,K,H,W] to a per-image error [n].
-
-        Controlled by --gender_attn_weight:
-          'attn' (default): weighted SUM with the sum-to-1 common woman/man cross-attention map,
-              E_c = sum_{u,v} common_attn(u,v) * res_c(u,v)  -- the error only counts the gender/person
-              region. This is the original NODETECTOR behaviour.
-          'none': UNIFORM spatial MEAN over all H*W pixels, E_c = mean_{u,v} res_c(u,v) -- the FULL error,
-              every pixel counts equally. Identical to the 'attn' formula with a FLAT weight map 1/(H*W),
-              which ALSO sums to 1, so E_c keeps the same normalization/scale as 'attn' (--tau comparable).
-        The timestep axis K is always reduced by a uniform mean, in both modes. common_attn is detached in
-        both callers, so this only changes WHERE the gradient d E_c / d z0 is weighted, never the graph.
-        """
-        if args.gender_attn_weight == "none":
-            return residual_map.mean(dim=(2, 3)).mean(dim=1)                                    # [n]
-        return (common_attn.unsqueeze(1) * residual_map).sum(dim=(2, 3)).mean(dim=1)            # [n]
-
     def residual_gender_logits(z0):
         """Prompt-conditioned diffusion residual-error gender scorer with cross-attention spatial weighting.
 
@@ -2163,10 +2176,9 @@ def main(args):
         common_attn = common_attn / (common_attn.sum(dim=(1, 2), keepdim=True) + 1e-8)
         common_attn = common_attn.detach()                                             # weighting mask only
 
-        # spatial reduction per --gender_attn_weight: 'attn' = attention-weighted SUM (original),
-        # 'none' = uniform mean over all pixels (the FULL error). Then uniform mean over timesteps.
-        E_woman = reduce_gender_residual(residual_maps["woman"], common_attn)           # [n]
-        E_man = reduce_gender_residual(residual_maps["man"], common_attn)               # [n]
+        # attention-weighted spatial SUM per timestep, then uniform mean over timesteps
+        E_woman = (common_attn.unsqueeze(1) * residual_maps["woman"]).sum(dim=(2, 3)).mean(dim=1)   # [n]
+        E_man = (common_attn.unsqueeze(1) * residual_maps["man"]).sum(dim=(2, 3)).mean(dim=1)       # [n]
 
         logits_gender = torch.stack([-E_woman / args.tau, -E_man / args.tau], dim=1)    # [n, 2]
         return logits_gender
@@ -2214,40 +2226,56 @@ def main(args):
 
         return E["face"] < E["faceless"]                                              # bool [n]
 
-    def residual_gender_and_realism(z0):
-        """Fused residual-error scorer used by the training loss (SCR gender + SRR realism).
+    def residual_gender_and_realism(z0, srr_embeds=None):
+        """Fused residual-error scorer used by the training loss (SCR gender + SRR).
 
         A single eps/zt is sampled per timestep and scored under THREE frozen-SD text conditions:
-        woman / man (the SCR gender fair loss) and args.srr_prompt = "a photo of a realistic person"
-        (the SRR realism loss). The three passes share the same per-timestep eps (and identical zt
-        VALUES); the realism pass additionally masks the z0 gradient to the person region (see E_realistic).
-        Gradient flows z0 -> trainable model; the scorer (scoring_unet / scoring_text_encoder) stays
-        frozen, so E_realistic pulls z0 onto the frozen model's "realistic person" manifold (score
-        distillation on the realism prompt).
+        woman / man (the SCR gender fair loss) and the SRR condition (the SRR loss). All three passes
+        share the same per-timestep eps and identical zt VALUES. Gradient flows z0 -> trainable model;
+        the scorer (scoring_unet / scoring_text_encoder) stays frozen, so E_srr is score distillation
+        that pulls z0 onto the FROZEN model's manifold for the SRR condition.
+
+        SRREDIT -- the two SRR axes this file changes (both flag-controlled, new behaviour by default):
+          * CONDITION (--srr_prompt_mode): 'gen' (default) scores SRR under the step's ACTUAL GENERATION
+            PROMPT -- the caller passes srr_embeds=scr_gen_embeds, the frozen-TE embedding of prompt_i
+            that the h-space SCR loss already computed. 'fixed' falls back to residual_realistic_embeds
+            (--srr_prompt, "a photo of a realistic person"), the base-nodetector behaviour.
+          * GRADIENT REGION (--srr_grad_region): 'full' (default) lets d(E_srr)/dz0 be nonzero over the
+            WHOLE image, matching E_srr's whole-image value -- the SRR pass then reuses zt_all itself,
+            so it is bit-identical in value to the woman/man input and needs no second add_noise stack.
+            'person' restores the base-nodetector input-masking (see below).
 
         z0: [n,4,H,W] clean latent in the scheduler/UNet scale (NOT detached).
+        srr_embeds: [1,L,D] frozen-TE embedding to condition the SRR pass on. None -> the fixed
+            residual_realistic_embeds. The caller decides per --srr_prompt_mode; the scorer just uses
+            whatever it is handed (it is expanded over the n*K batch, so one prompt per call).
 
         Returns:
           logits_gender [n,2], class order [woman=0, man=1], logit_c = -E_c / tau. Woman/man use the
               same attention-weighted spatial reduction as residual_gender_logits (identical estimator,
-              modulo the fresh random eps draw).
-          E_realistic [n], the SRR loss per sample: squared residual for the realism prompt, meaned over
-              the WHOLE image (every pixel contributes to the VALUE), then averaged over timesteps. RAW
-              error -- NOT divided by tau. The GRADIENT is localized to the person/gender region by masking
-              the SCORER INPUT: non-region z0 pixels are detached before the realism UNet pass, so
-              d(E_realistic)/dz0 is exactly zero outside the min-max-normalized common_attn >=
-              args.attn_gate_thr region, while the value stays the true whole-image residual. (Masking the
-              residual instead would leave the value region-limited AND still leak z0 gradient through the
-              UNet's global receptive field, so INPUT masking is used to actually localize the gradient.)
-          common_attn [n,H,W], the sum-to-1 (detached) gender localization map used internally for the SRR
-              region mask, returned so the h-space SCR image loss can reuse it for its flip gradient-gate
-              (min-max normalized >= args.attn_gate_thr) without a second scorer forward.
+              modulo the fresh random eps draw). UNCHANGED by SRREDIT.
+          E_srr [n], the SRR loss per sample: squared residual for the SRR condition, meaned over the
+              WHOLE image (every pixel contributes to the VALUE), then averaged over timesteps. RAW
+              error -- NOT divided by tau.
+              GRADIENT, --srr_grad_region full (default): whole-image, i.e. d(E_srr)/dz0 is nonzero at
+                  every pixel -- the gradient now matches the value's support. Nothing is masked.
+              GRADIENT, --srr_grad_region person: localized to the person/gender region by masking the
+                  SCORER INPUT -- non-region z0 pixels are detached before the SRR UNet pass, so
+                  d(E_srr)/dz0 is exactly zero outside the min-max-normalized common_attn >=
+                  args.attn_gate_thr region while the value stays the true whole-image residual.
+                  (Masking the residual instead would leave the value region-limited AND still leak z0
+                  gradient through the UNet's global receptive field, so INPUT masking is what actually
+                  localizes the gradient.)
+          common_attn [n,H,W], the sum-to-1 (detached) gender localization map, returned so the h-space
+              SCR image loss can reuse it for its flip gradient-gate (min-max normalized >=
+              args.attn_gate_thr) without a second scorer forward. Still computed and returned in BOTH
+              srr_grad_region modes -- the SCR gate depends on it regardless of what SRR does with it.
 
         [PERF] The `--residual_num_timesteps` timesteps are folded into the batch dimension, so the
-        scoring UNet runs ONCE per prompt (woman/man on zt_all; realism on a gradient-masked zt of the
-        SAME value) on an [n*K, ...] batch instead of K sequential [n, ...] forwards. The woman/man gender
-        logits are unchanged vs residual_gender_logits (verified numerically equal, logits + grad); only
-        E_realistic's reduction and gradient-localization intentionally differ.
+        scoring UNet runs ONCE per prompt on an [n*K, ...] batch instead of K sequential [n, ...]
+        forwards. The woman/man gender logits are unchanged vs residual_gender_logits (verified
+        numerically equal, logits + grad); only E_srr's reduction and (in 'person' mode) gradient
+        localization intentionally differ.
         """
         n = z0.shape[0]
         H, W = z0.shape[-2], z0.shape[-1]
@@ -2267,8 +2295,9 @@ def main(args):
         zt_all = torch.stack(zt_list, dim=1).reshape(n * K, *z0.shape[1:]).to(weight_dtype)
         t_all = timesteps.repeat(n)
 
-        # Gender prompts (attention-weighted). The realism (SRR) prompt is scored SEPARATELY below,
-        # after the face-region mask is known, so its z0 gradient can be restricted to that region.
+        # Gender prompts (attention-weighted). The SRR prompt is scored SEPARATELY below: under
+        # --srr_grad_region person it must wait until the attn region mask is known (it masks the
+        # scorer input); under 'full' it simply reuses zt_all with no mask.
         gender_prompts_cfg = [
             ("woman", residual_woman_embeds, residual_woman_token_idxs),
             ("man", residual_man_embeds, residual_man_token_idxs),
@@ -2305,41 +2334,51 @@ def main(args):
         common_attn = attn_accum / max(attn_count, 1)                                   # [n,H,W]
         common_attn = common_attn / (common_attn.sum(dim=(1, 2), keepdim=True) + 1e-8)
         common_attn = common_attn.detach()
-        # spatial reduction per --gender_attn_weight: 'attn' = attention-weighted SUM (original),
-        # 'none' = uniform mean over all pixels (the FULL error). common_attn is still computed above
-        # regardless, because the SRR region mask below (and the h-space SCR flip gate, via the returned
-        # map) use it in BOTH modes -- only the CLASS-ERROR weighting is switched off by 'none'.
-        E_woman = reduce_gender_residual(residual_maps["woman"], common_attn)           # [n]
-        E_man = reduce_gender_residual(residual_maps["man"], common_attn)               # [n]
+        E_woman = (common_attn.unsqueeze(1) * residual_maps["woman"]).sum(dim=(2, 3)).mean(dim=1)   # [n]
+        E_man = (common_attn.unsqueeze(1) * residual_maps["man"]).sum(dim=(2, 3)).mean(dim=1)       # [n]
         logits_gender = torch.stack([-E_woman / args.tau, -E_man / args.tau], dim=1)    # [n, 2]
 
-        # -------- SRR realism: VALUE over the WHOLE image, GRADIENT only in the person/gender region --------
-        # Person/gender region = min-max-normalized common_attn hard-thresholded at args.attn_gate_thr.
-        cmin = common_attn.amin(dim=(1, 2), keepdim=True)                               # [n,1,1]
-        cmax = common_attn.amax(dim=(1, 2), keepdim=True)                               # [n,1,1]
-        attn_gate = ((common_attn - cmin) / (cmax - cmin + 1e-8)).clamp(0, 1)           # [n,H,W] min-max, detached
-        face_mask = (attn_gate >= args.attn_gate_thr).to(z0.dtype)                      # [n,H,W] hard region, detached
+        # -------- SRR: VALUE over the WHOLE image; GRADIENT per --srr_grad_region --------
+        # SRREDIT (1): the SRR condition is whatever the caller handed in -- under --srr_prompt_mode gen
+        # that is the step's GENERATION-prompt embedding (frozen TE), under 'fixed' the --srr_prompt one.
+        srr_c = residual_realistic_embeds if srr_embeds is None else srr_embeds         # [1,L,D]
 
-        # Localize the gradient on the SCORER INPUT (not the residual). The scoring UNet has a global
-        # receptive field, so masking the residual would still leak z0 gradient through the UNet; masking
-        # the input does not. z0_srr equals z0 in VALUE (detach keeps the forward), so the realism residual
-        # is the TRUE whole-image residual, but d/dz0 is exactly zero outside the region (non-region z0 is
-        # detached). Region z0 pixels still drive -- and receive gradient from -- the whole-image value.
-        face_mask_c = face_mask.unsqueeze(1)                                            # [n,1,H,W] over channels
-        z0_srr = face_mask_c * z0 + (1.0 - face_mask_c) * z0.detach()                   # value == z0; grad only in region
-        zt_srr_all = torch.stack(
-            [noise_scheduler.add_noise(z0_srr, eps_list[k], timesteps[k].repeat(n)) for k in range(K)],
-            dim=1,
-        ).reshape(n * K, *z0.shape[1:]).to(weight_dtype)                                # same VALUE as zt_all, grad masked
-        c_real = residual_realistic_embeds.expand(n * K, -1, -1)
-        eps_pred_real = scoring_unet(zt_srr_all, t_all, encoder_hidden_states=c_real).sample
-        residual_realistic = (eps_pred_real.float() - eps_all.float()).pow(2).mean(dim=1).view(n, K, H, W)
+        # SRREDIT (2): the SRR gradient region.
+        if args.srr_grad_region == "full":
+            # WHOLE-IMAGE gradient: no masking at all, so d(E_srr)/dz0 is nonzero at every pixel and the
+            # gradient's support finally matches the value's (whole-image mean). zt_all IS the unmasked
+            # re-noised z0 the woman/man passes already used -- same eps, same t, same value, full grad
+            # path -- so we reuse it directly instead of rebuilding an identical stack via add_noise.
+            zt_srr_all = zt_all
+        else:
+            # 'person' (base-nodetector behaviour): localize the gradient on the SCORER INPUT (not the
+            # residual). The scoring UNet has a global receptive field, so masking the residual would still
+            # leak z0 gradient through the UNet; masking the input does not. z0_srr equals z0 in VALUE
+            # (detach keeps the forward), so the SRR residual is the TRUE whole-image residual, but d/dz0 is
+            # exactly zero outside the region (non-region z0 is detached). Region z0 pixels still drive --
+            # and receive gradient from -- the whole-image value.
+            # Person/gender region = min-max-normalized common_attn hard-thresholded at args.attn_gate_thr.
+            cmin = common_attn.amin(dim=(1, 2), keepdim=True)                           # [n,1,1]
+            cmax = common_attn.amax(dim=(1, 2), keepdim=True)                           # [n,1,1]
+            attn_gate = ((common_attn - cmin) / (cmax - cmin + 1e-8)).clamp(0, 1)       # [n,H,W] min-max, detached
+            face_mask = (attn_gate >= args.attn_gate_thr).to(z0.dtype)                  # [n,H,W] hard region, detached
+            face_mask_c = face_mask.unsqueeze(1)                                        # [n,1,H,W] over channels
+            z0_srr = face_mask_c * z0 + (1.0 - face_mask_c) * z0.detach()               # value == z0; grad only in region
+            zt_srr_all = torch.stack(
+                [noise_scheduler.add_noise(z0_srr, eps_list[k], timesteps[k].repeat(n)) for k in range(K)],
+                dim=1,
+            ).reshape(n * K, *z0.shape[1:]).to(weight_dtype)                            # same VALUE as zt_all, grad masked
+
+        c_srr = srr_c.expand(n * K, -1, -1)
+        eps_pred_srr = scoring_unet(zt_srr_all, t_all, encoder_hidden_states=c_srr).sample
+        residual_srr = (eps_pred_srr.float() - eps_all.float()).pow(2).mean(dim=1).view(n, K, H, W)
         # WHOLE-image mean over all H*W pixels (no region restriction on the value), then mean over K -> [n].
-        E_realistic = residual_realistic.mean(dim=(2, 3)).mean(dim=1)                   # [n]
+        E_srr = residual_srr.mean(dim=(2, 3)).mean(dim=1)                               # [n]
 
         # common_attn [n,H,W] (sum-to-1, detached) is also returned so the h-space SCR flip gate can reuse
         # the SAME gender localization map (min-max normalized >= attn_gate_thr) without a second scorer pass.
-        return logits_gender, E_realistic, common_attn
+        # This is returned in BOTH srr_grad_region modes -- the SCR gate needs it regardless of SRR.
+        return logits_gender, E_srr, common_attn
     def get_face_gender(z0, selector=None, fill_value=-1):
         """Drop-in replacement for the removed mnet classifier, now scoring the clean latent z0.
 
@@ -3158,6 +3197,14 @@ def main(args):
             scr_timesteps = torch.linspace(
                 args.scr_t_min, args.scr_t_max, steps=args.scr_num_timesteps, device=accelerator.device
             ).round().long()
+            # SRREDIT (1): the SRR text condition for THIS step.
+            #   'gen'   -> the ACTUAL generation prompt (prompt_i) the images above were sampled from,
+            #              encoded by the FROZEN scoring TE. This is literally scr_gen_embeds -- same prompt,
+            #              same encoder, same masked-encode convention -- so reusing it costs no extra TE
+            #              forward and guarantees the SRR condition can never drift from the generation prompt.
+            #   'fixed' -> the setup-time --srr_prompt embedding (base-nodetector behaviour).
+            # Both are [1,L,D] and get expanded over the n*K scorer batch inside residual_gender_and_realism.
+            srr_embeds_i = scr_gen_embeds if args.srr_prompt_mode == "gen" else residual_realistic_embeds
             for j in range(N_backward):
                 idxs_ij = idxs_i[j*args.train_GPU_batch_size:(j+1)*args.train_GPU_batch_size]
                 noises_ij = noises_i[idxs_ij]
@@ -3173,10 +3220,13 @@ def main(args):
                 face_indicators_ij = residual_face_indicators(z0_ij)
                 # Branch B: fused residual scorer on z0_ij (grad flows z0 -> trainable model).
                 #   - logits_gender_ij [n,2]: woman/man residual-error gender logits (SCR fair loss).
-                #   - loss_SRR_ij [n]: "a photo of a realistic person" residual error (SRR realism loss).
+                #   - loss_SRR_ij [n]: SRR residual error under srr_embeds_i -- SRREDIT default: the step's
+                #     GENERATION prompt (--srr_prompt_mode gen), whole-image gradient (--srr_grad_region full).
                 #   - common_attn_ij [n,H,W]: sum-to-1 gender localization map, reused by the SCR flip gate
                 #     below (no extra scorer forward). Both losses share the same per-timestep eps/zt.
-                logits_gender_ij, loss_SRR_ij, common_attn_ij = residual_gender_and_realism(z0_ij)
+                logits_gender_ij, loss_SRR_ij, common_attn_ij = residual_gender_and_realism(
+                    z0_ij, srr_embeds=srr_embeds_i
+                )
                 # Zero the attn for no-face FINETUNE samples so they are never damped (mirrors debias's
                 # "if no face, skip" / the Face_hspace get_face_gender selector filling non-faces with zeros).
                 common_attn_ij = common_attn_ij * face_indicators_ij.view(-1, 1, 1).to(common_attn_ij.dtype)
@@ -3245,8 +3295,11 @@ def main(args):
                 loss_fair_ij_w_face_loss = CE_loss(logits_gender_ij[idxs_w_face_loss], targets_ij[idxs_w_face_loss])
                 loss_fair_ij[idxs_w_face_loss] = loss_fair_ij_w_face_loss.to(loss_fair_ij.dtype)
 
-                # SRR realism loss: raw residual error of args.srr_prompt (no 1/tau). Applies to ALL
-                # generated samples (like the old CLIP/DINO), not gated on face detection or target validity.
+                # SRR loss: raw residual error under the SRR condition (no 1/tau). Applies to ALL generated
+                # samples (like the old CLIP/DINO), not gated on face detection or target validity.
+                # SRREDIT: that condition is the GENERATION prompt by default (--srr_prompt_mode gen) and its
+                # gradient covers the WHOLE image (--srr_grad_region full), so this term is now a plain
+                # CFG-free SDS pull back toward the frozen model -- re-tune --weight_loss_face accordingly.
                 loss_SRR_ij = loss_SRR_ij.to(weight_dtype)
 
                 dynamic_weights = gen_dynamic_weights(face_indicators_ij, targets_ij, preds_gender_ori_ij, probs_gender_ori_ij, factor=args.factor1)

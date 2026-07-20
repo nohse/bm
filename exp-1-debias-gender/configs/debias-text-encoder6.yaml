@@ -1,0 +1,15 @@
+proj_name: gender-debias-text-encoder-again
+train_text_encoder: True
+train_unet: False
+weight_loss_img: 4
+weight_loss_face: 4
+factor1: 0.2
+factor2: 0.2
+uncertainty_threshold: 0.2
+train_images_per_prompt_GPU: 4
+train_GPU_batch_size: 4
+val_images_per_prompt_GPU: 10
+val_GPU_batch_size: 5
+val_images_per_prompt_total: 60   # 8 GPU * 8 = 64 generated, keep exactly 60 per occupation
+learning_rate: 5e-5
+max_train_steps: 10000
